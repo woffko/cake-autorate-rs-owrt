@@ -355,7 +355,12 @@ mod timer_ownership_tests {
         let mut allowed = match module {
             "autotune_apply_openwrt" => vec!["thread::sleep(VERIFY_INTERVAL);"; 2],
             "autotune_apply_runtime" => vec!["std::thread::sleep(timeout);"; 2],
-            "full_autotune" => vec!["thread::sleep(RUNTIME_ACK_POLL);"; 12],
+            "full_autotune" => {
+                let mut sleeps = vec!["thread::sleep(RUNTIME_ACK_POLL);"; 12];
+                // Measurement pacing before retrying a failed server run.
+                sleeps.push("thread::sleep(SERVER_FAILURE_COOLDOWN_POLL);");
+                sleeps
+            }
             "process" => vec![
                 "thread::sleep(WAIT_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));",
             ],

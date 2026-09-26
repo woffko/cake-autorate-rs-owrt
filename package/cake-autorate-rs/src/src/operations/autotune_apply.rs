@@ -2408,6 +2408,7 @@ mod tests {
             },
             traffic_policy_explicit: false,
             traffic_plan: None,
+            server_failure_retries: None,
         }
     }
 

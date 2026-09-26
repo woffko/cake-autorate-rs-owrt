@@ -116,6 +116,7 @@ impl ScheduledInstanceConfig {
             traffic_budget: traffic_budget.into(),
             traffic_policy_explicit: true,
             traffic_plan: None,
+            server_failure_retries: None,
         })
     }
 }

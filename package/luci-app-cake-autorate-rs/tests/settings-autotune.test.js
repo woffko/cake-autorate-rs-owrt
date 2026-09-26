@@ -1999,6 +1999,18 @@ async function testNativeAutotuneTransport() {
 		assert(launchArgs.includes('--allow-active-traffic'));
 		assert(!launchArgs.includes('--mwan3-member'),
 			'main routing must not carry an empty mwan3 member');
+		assert(!launchArgs.includes('--server-failure-retries'),
+			'a policy without retries keeps the daemon default');
+		const retryArgs = helpers.nativeAutotuneLaunchArgs(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'main', '',
+			'variable_link', true, 'full_raw', access, true, 'cake_wan_sqm',
+			Object.assign({}, explicitTrafficPolicy, { server_failure_retries: 4 }));
+		assert.equal(retryArgs[retryArgs.indexOf('--server-failure-retries') + 1], '4');
+		for (const bad of [ -1, 6, 1.5, '2' ])
+			assert.throws(() => helpers.nativeAutotuneLaunchArgs(
+				'wan_sqm', 'pppoe-wan', 'speedtest-go', 'main', '',
+				'variable_link', true, 'full_raw', access, true, 'cake_wan_sqm',
+				Object.assign({}, explicitTrafficPolicy, { server_failure_retries: bad })), /retries/);
 		assert(!launchArgs.some(arg => /token|fingerprint|job-id/i.test(arg)),
 			'LuCI launch intent must contain no capability, job ID, or attestation hash');
 		{

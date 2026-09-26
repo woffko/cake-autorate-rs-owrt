@@ -12749,25 +12749,48 @@ enum DirectionalLoadErrorDisposition {
     Fatal,
 }
 
+/// Transient server-side failures: the backend exited with an error, timed
+/// out, or produced output without a usable rate. The route-counter wrapper
+/// has already stopped the backend and charged its exact traffic, so a
+/// bounded retry cannot hide spent bytes. Deadline, route, accounting and
+/// authority failures stay fatal.
+fn directional_load_failure_is_transient(error: &str) -> bool {
+    completed_speedtest_output_is_unmeasurable(error)
+        || error == "speedtest-timeout"
+        || error == "speedtest-backend-failed"
+}
+
 fn directional_load_error_disposition(
     error: &str,
-    prior_unmeasurable_runs: u8,
+    prior_failures: u8,
+    retry_limit: u8,
 ) -> DirectionalLoadErrorDisposition {
-    // The outer route-counter wrapper has already stopped/reaped the backend,
-    // read the closing counters, charged the exact traffic debit and invoked
-    // the durable debit callback before this error is interpreted.  A bounded
-    // backend timeout therefore proves spent traffic but no usable rate, just
-    // like completed malformed output.  Keep deadline, route, accounting and
-    // authority failures fatal; only this exact timeout joins the existing
-    // one-retry then TransferUnmeasurable path.
-    if !completed_speedtest_output_is_unmeasurable(error) && error != "speedtest-timeout" {
+    if !directional_load_failure_is_transient(error) {
         return DirectionalLoadErrorDisposition::Fatal;
     }
-    let unmeasurable_runs = prior_unmeasurable_runs.saturating_add(1);
-    if unmeasurable_runs >= MAX_DIRECTIONAL_RESULT_UNAVAILABLE_RUNS {
-        DirectionalLoadErrorDisposition::TransferUnmeasurable { unmeasurable_runs }
+    let failures = prior_failures.saturating_add(1);
+    if failures > retry_limit {
+        DirectionalLoadErrorDisposition::TransferUnmeasurable {
+            unmeasurable_runs: failures,
+        }
     } else {
-        DirectionalLoadErrorDisposition::Retry { unmeasurable_runs }
+        DirectionalLoadErrorDisposition::Retry {
+            unmeasurable_runs: failures,
+        }
+    }
+}
+
+/// Wait before retrying a failed server run: 3 s, 6 s, then 10 s at most.
+/// Cancellation ends the wait immediately.
+/// Measurement pacing: the pause between a failed server run and its retry is
+/// polled in short steps so cancellation is honoured promptly.
+const SERVER_FAILURE_COOLDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn server_failure_cooldown(failures: u8, terminate: &AtomicBool) {
+    let seconds = u64::from(failures).saturating_mul(3).min(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline && !terminate.load(Ordering::Relaxed) {
+        thread::sleep(SERVER_FAILURE_COOLDOWN_POLL);
     }
 }
 
@@ -14675,7 +14698,14 @@ fn run_directional_capture_load_with_session(
     let mut thresholds_met = false;
     let mut last_progress = None;
     let mut unmeasurable_runs = 0u8;
-    for run_index in 0..MAX_DIRECTIONAL_LOAD_RUNS {
+    let retry_limit = operation.effective_server_failure_retries();
+    let mut completed_runs = 0u8;
+    // Failed server runs do not use one of the measurement slots; each gets
+    // its own scratch file and evidence sequence.
+    let mut attempt_index = 0u16;
+    while completed_runs < MAX_DIRECTIONAL_LOAD_RUNS {
+        attempt_index = attempt_index.saturating_add(1);
+        let run_index = attempt_index - 1;
         let run_started_boot_ms = monotonic_boot_ms()?;
         let mut bounded_request = operation.clone();
         bounded_request.traffic_budget = *remaining_traffic_budget;
@@ -14711,26 +14741,38 @@ fn run_directional_capture_load_with_session(
         );
         let (terminal, sample) = match speedtest_outcome {
             Ok(value) => value,
-            Err(error) => match directional_load_error_disposition(&error, unmeasurable_runs) {
-                DirectionalLoadErrorDisposition::Retry {
-                    unmeasurable_runs: count,
-                } => {
-                    unmeasurable_runs = count;
-                    continue;
+            Err(error) => {
+                match directional_load_error_disposition(&error, unmeasurable_runs, retry_limit) {
+                    DirectionalLoadErrorDisposition::Retry {
+                        unmeasurable_runs: count,
+                    } => {
+                        unmeasurable_runs = count;
+                        eprintln!(
+                        "autotune-server-failure-retry direction={} failures={count} limit={retry_limit} code={error}",
+                        direction.as_str()
+                    );
+                        server_failure_cooldown(count, terminate);
+                        if terminate.load(Ordering::Relaxed) {
+                            return Err(CaptureWaitError::Failure(
+                                "native Auto-Tune controlled load was cancelled".to_string(),
+                            ));
+                        }
+                        continue;
+                    }
+                    DirectionalLoadErrorDisposition::TransferUnmeasurable {
+                        unmeasurable_runs: count,
+                    } => {
+                        return Err(CaptureWaitError::TransferUnmeasurable {
+                            topology: request.topology,
+                            direction,
+                            run_count: count,
+                        });
+                    }
+                    DirectionalLoadErrorDisposition::Fatal => {
+                        return Err(CaptureWaitError::Failure(error));
+                    }
                 }
-                DirectionalLoadErrorDisposition::TransferUnmeasurable {
-                    unmeasurable_runs: count,
-                } => {
-                    return Err(CaptureWaitError::TransferUnmeasurable {
-                        topology: request.topology,
-                        direction,
-                        run_count: count,
-                    });
-                }
-                DirectionalLoadErrorDisposition::Fatal => {
-                    return Err(CaptureWaitError::Failure(error));
-                }
-            },
+            }
         };
         let result = match terminal {
             SpeedtestTerminal::Complete(result) => result,
@@ -14749,6 +14791,7 @@ fn run_directional_capture_load_with_session(
             "native Auto-Tune controlled load returned no private byte evidence".to_string()
         })?;
         aggregate.add(&result, &sample)?;
+        completed_runs = completed_runs.saturating_add(1);
         let progress = wait_for_capture_progress(
             session,
             &capture.snapshot_path,
@@ -18564,55 +18607,64 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn backend_measurement_gaps_use_all_three_bounded_attempts() {
+    fn transient_server_failures_retry_up_to_the_requested_limit() {
+        for error in [
+            "speedtest-json-missing",
+            "speedtest-direction-result-unavailable",
+            "speedtest-timeout",
+            "speedtest-backend-failed",
+        ] {
+            assert_eq!(
+                directional_load_error_disposition(error, 0, 2),
+                DirectionalLoadErrorDisposition::Retry {
+                    unmeasurable_runs: 1
+                },
+                "{error}"
+            );
+            assert_eq!(
+                directional_load_error_disposition(error, 1, 2),
+                DirectionalLoadErrorDisposition::Retry {
+                    unmeasurable_runs: 2
+                },
+                "{error}"
+            );
+            assert_eq!(
+                directional_load_error_disposition(error, 2, 2),
+                DirectionalLoadErrorDisposition::TransferUnmeasurable {
+                    unmeasurable_runs: 3
+                },
+                "the default keeps the previous three-attempt bound for {error}"
+            );
+            assert_eq!(
+                directional_load_error_disposition(error, 0, 0),
+                DirectionalLoadErrorDisposition::TransferUnmeasurable {
+                    unmeasurable_runs: 1
+                },
+                "zero retries reports the first failure for {error}"
+            );
+            assert_eq!(
+                directional_load_error_disposition(error, 4, 5),
+                DirectionalLoadErrorDisposition::Retry {
+                    unmeasurable_runs: 5
+                }
+            );
+            assert_eq!(
+                directional_load_error_disposition(error, 5, 5),
+                DirectionalLoadErrorDisposition::TransferUnmeasurable {
+                    unmeasurable_runs: 6
+                }
+            );
+        }
         assert_eq!(
-            directional_load_error_disposition("speedtest-json-missing", 0),
-            DirectionalLoadErrorDisposition::Retry {
-                unmeasurable_runs: 1
-            }
-        );
-        assert_eq!(
-            directional_load_error_disposition("speedtest-json-missing", 1),
-            DirectionalLoadErrorDisposition::Retry {
-                unmeasurable_runs: 2
-            }
-        );
-        assert_eq!(
-            directional_load_error_disposition("speedtest-json-missing", 2),
-            DirectionalLoadErrorDisposition::TransferUnmeasurable {
-                unmeasurable_runs: 3
-            }
-        );
-        assert_eq!(
-            directional_load_error_disposition("speedtest-direction-result-unavailable", 0),
-            DirectionalLoadErrorDisposition::Retry {
-                unmeasurable_runs: 1
-            }
-        );
-        assert_eq!(
-            directional_load_error_disposition("speedtest-timeout", 0),
-            DirectionalLoadErrorDisposition::Retry {
-                unmeasurable_runs: 1
-            }
-        );
-        assert_eq!(
-            directional_load_error_disposition("speedtest-timeout", 1),
-            DirectionalLoadErrorDisposition::Retry {
-                unmeasurable_runs: 2
-            }
-        );
-        assert_eq!(
-            directional_load_error_disposition("speedtest-timeout", 2),
-            DirectionalLoadErrorDisposition::TransferUnmeasurable {
-                unmeasurable_runs: 3
-            }
+            super::super::protocol::DEFAULT_SERVER_FAILURE_RETRIES,
+            2,
+            "older requests keep the previous bound"
         );
     }
 
     #[test]
     fn apparatus_and_authority_failures_never_enter_measurement_retry() {
         for error in [
-            "speedtest-backend-failed",
             "speedtest-deadline-expired",
             "speedtest-route-drift",
             "speedtest-server-identity-mismatch",
@@ -18622,7 +18674,7 @@ mod tests {
             SPEEDTEST_TRAFFIC_LIMIT_REACHED,
         ] {
             assert_eq!(
-                directional_load_error_disposition(error, 0),
+                directional_load_error_disposition(error, 0, 10),
                 DirectionalLoadErrorDisposition::Fatal,
                 "unsafe Full Auto-Tune retry for {error}"
             );
@@ -18678,6 +18730,7 @@ mod tests {
             },
             traffic_policy_explicit: false,
             traffic_plan: None,
+            server_failure_retries: None,
         }
     }
 

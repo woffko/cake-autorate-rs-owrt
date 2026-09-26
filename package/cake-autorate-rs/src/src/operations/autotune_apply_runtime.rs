@@ -3052,6 +3052,7 @@ mod tests {
             },
             traffic_policy_explicit: false,
             traffic_plan: None,
+            server_failure_retries: None,
         };
         let proposal = build_proposal_for_profile_with_context(
             &[100_000.0, 101_000.0],

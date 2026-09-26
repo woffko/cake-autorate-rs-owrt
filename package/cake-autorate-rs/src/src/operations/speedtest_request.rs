@@ -325,6 +325,7 @@ fn build_bootstrap_speedtest_request_from_context(
         traffic_budget: traffic.policy,
         traffic_policy_explicit: traffic.explicit,
         traffic_plan: None,
+        server_failure_retries: None,
     };
     request.validate()?;
     context.absence_identity.ensure_request_binding(
@@ -427,6 +428,7 @@ fn build_speedtest_request(
         traffic_budget: traffic.policy,
         traffic_policy_explicit: traffic.explicit,
         traffic_plan: None,
+        server_failure_retries: None,
     };
     request.validate()?;
     Ok(request)

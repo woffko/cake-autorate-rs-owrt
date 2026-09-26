@@ -37,6 +37,41 @@ const DNS_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t19\trequest";
 const DNS_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t20\trequest";
 const DNS_PLANNED_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t21\trequest";
 const DNS_PLANNED_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t22\trequest";
+/// Schemas 23..=41 are schemas 4..=22 plus a trailing `server_failure_retries`.
+const RETRY_SCHEMA_OFFSET: u8 = 19;
+/// Upper bound for the per-measurement server failure retries a caller may request.
+pub const MAX_SERVER_FAILURE_RETRIES: u8 = 10;
+/// Retries applied when a request carries no explicit value.
+pub const DEFAULT_SERVER_FAILURE_RETRIES: u8 = 2;
+
+fn retry_request_header(schema: u8) -> String {
+    format!("cake-autorate-operation\t{schema}\trequest")
+}
+
+fn legacy_request_header(schema: u8) -> Result<&'static str, String> {
+    Ok(match schema {
+        4 => PUBLIC_EXISTING_REQUEST_HEADER,
+        5 => MANAGED_REQUEST_HEADER,
+        6 => REQUEST_HEADER,
+        7 => EXPLICIT_MANAGED_REQUEST_HEADER,
+        8 => EXPLICIT_BOOTSTRAP_REQUEST_HEADER,
+        9 => PLANNED_MANAGED_REQUEST_HEADER,
+        10 => PLANNED_BOOTSTRAP_REQUEST_HEADER,
+        11 => MASKED_MANAGED_REQUEST_HEADER,
+        12 => MASKED_BOOTSTRAP_REQUEST_HEADER,
+        13 => MASKED_PLANNED_MANAGED_REQUEST_HEADER,
+        14 => MASKED_PLANNED_BOOTSTRAP_REQUEST_HEADER,
+        15 => LINKED_MANAGED_REQUEST_HEADER,
+        16 => LINKED_BOOTSTRAP_REQUEST_HEADER,
+        17 => LINKED_PLANNED_MANAGED_REQUEST_HEADER,
+        18 => LINKED_PLANNED_BOOTSTRAP_REQUEST_HEADER,
+        19 => DNS_MANAGED_REQUEST_HEADER,
+        20 => DNS_BOOTSTRAP_REQUEST_HEADER,
+        21 => DNS_PLANNED_MANAGED_REQUEST_HEADER,
+        22 => DNS_PLANNED_BOOTSTRAP_REQUEST_HEADER,
+        _ => return Err("unsupported operation request schema".into()),
+    })
+}
 const CONTROL_HEADER: &str = "cake-autorate-operation\t2\tcontrol";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -729,10 +764,24 @@ pub struct OperationRequest {
     /// Preserve legacy request bytes on decode; new launchers opt into v7/v8.
     pub traffic_policy_explicit: bool,
     pub traffic_plan: Option<AutotuneTrafficPlan>,
+    /// Full Auto-Tune only: how many transient server failures (backend error,
+    /// timeout, unusable output) one directional measurement may retry before
+    /// it is reported as unmeasurable. `None` is an older request (default).
+    pub server_failure_retries: Option<u8>,
 }
 
 impl OperationRequest {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(retries) = self.server_failure_retries {
+            if retries > MAX_SERVER_FAILURE_RETRIES {
+                return Err(format!(
+                    "server failure retries must be between 0 and {MAX_SERVER_FAILURE_RETRIES}"
+                ));
+            }
+            if self.identity.operation != OperationKind::FullAutotune {
+                return Err("only Full Auto-Tune may carry server failure retries".into());
+            }
+        }
         self.identity.validate()?;
         self.route.validate()?;
         require_safe_identifier("backend", &self.backend, 1, 32, b"_-")?;
@@ -1039,6 +1088,21 @@ impl OperationRequest {
     }
 
     pub fn encode(&self) -> Result<String, String> {
+        let legacy = self.encode_legacy_schema();
+        self.encode_for_schema(if self.server_failure_retries.is_some() {
+            legacy + RETRY_SCHEMA_OFFSET
+        } else {
+            legacy
+        })
+    }
+
+    /// Transient server failures one directional measurement may retry.
+    pub fn effective_server_failure_retries(&self) -> u8 {
+        self.server_failure_retries
+            .unwrap_or(DEFAULT_SERVER_FAILURE_RETRIES)
+    }
+
+    fn encode_legacy_schema(&self) -> u8 {
         if self.route.fwmark_mask.is_some() {
             let schema = match (self.target_state, self.traffic_plan.is_some()) {
                 (OperationTargetState::ExistingManaged, false) => 11,
@@ -1046,34 +1110,49 @@ impl OperationRequest {
                 (OperationTargetState::ExistingManaged, true) => 13,
                 (OperationTargetState::AbsentBootstrap, true) => 14,
             };
-            return self.encode_for_schema(if self.route.dns_server.is_some() {
+            return if self.route.dns_server.is_some() {
                 schema + 8
             } else if self.route.device_ifindex.is_some() {
                 schema + 4
             } else {
                 schema
-            });
+            };
         }
         if self.traffic_plan.is_some() {
-            return self.encode_for_schema(
-                if self.target_state == OperationTargetState::AbsentBootstrap {
-                    10
-                } else {
-                    9
-                },
-            );
+            return if self.target_state == OperationTargetState::AbsentBootstrap {
+                10
+            } else {
+                9
+            };
         }
         if self.target_state == OperationTargetState::AbsentBootstrap {
-            self.encode_for_schema(if self.traffic_policy_explicit { 8 } else { 6 })
+            if self.traffic_policy_explicit {
+                8
+            } else {
+                6
+            }
+        } else if self.traffic_policy_explicit {
+            7
         } else {
-            self.encode_for_schema(if self.traffic_policy_explicit { 7 } else { 5 })
+            5
         }
     }
 
-    fn encode_for_schema(&self, schema: u8) -> Result<String, String> {
-        if !(4..=22).contains(&schema) {
+    fn encode_for_schema(&self, full_schema: u8) -> Result<String, String> {
+        if !(4..=22).contains(&full_schema)
+            && !(4 + RETRY_SCHEMA_OFFSET..=22 + RETRY_SCHEMA_OFFSET).contains(&full_schema)
+        {
             return Err("unsupported operation request schema".to_string());
         }
+        let retry_schema = full_schema > 22;
+        if retry_schema != self.server_failure_retries.is_some() {
+            return Err("request server retry encoding downgrade or mismatch".into());
+        }
+        let schema = if retry_schema {
+            full_schema - RETRY_SCHEMA_OFFSET
+        } else {
+            full_schema
+        };
         let base_schema = if schema >= 19 {
             schema - 12
         } else if schema >= 15 {
@@ -1288,6 +1367,10 @@ impl OperationRequest {
         if let Some(server) = self.route.dns_server {
             fields.push(("route_dns_ipv4", server.to_string()));
         }
+        if let Some(retries) = self.server_failure_retries {
+            fields.push(("server_failure_retries", retries.to_string()));
+            return encode_record(&retry_request_header(full_schema), &fields);
+        }
         let header = match schema {
             4 => PUBLIC_EXISTING_REQUEST_HEADER,
             5 => MANAGED_REQUEST_HEADER,
@@ -1319,7 +1402,48 @@ impl OperationRequest {
     }
 
     pub fn decode(input: &str) -> Result<Self, String> {
-        let schema = match input.lines().next() {
+        let first_line = input.lines().next();
+        let retry_schema = (4 + RETRY_SCHEMA_OFFSET..=22 + RETRY_SCHEMA_OFFSET)
+            .find(|schema| first_line == Some(retry_request_header(*schema).as_str()));
+        if let Some(full_schema) = retry_schema {
+            let legacy = full_schema - RETRY_SCHEMA_OFFSET;
+            let mut lines = input.lines();
+            lines.next();
+            let rest: Vec<&str> = lines.collect();
+            let last = rest
+                .iter()
+                .rposition(|line| !line.is_empty())
+                .ok_or("operation request is empty")?;
+            let retries = rest[last]
+                .strip_prefix("server_failure_retries=")
+                .ok_or("operation request server retries field missing")?;
+            if retries.is_empty()
+                || retries.len() > 2
+                || !retries.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err("invalid server failure retries".into());
+            }
+            let retries = retries
+                .parse::<u8>()
+                .map_err(|_| "invalid server failure retries")?;
+            let legacy_header = legacy_request_header(legacy)?;
+            let mut legacy_text = String::from(legacy_header);
+            for line in rest[..last].iter().chain(rest[last + 1..].iter()) {
+                legacy_text.push('\n');
+                legacy_text.push_str(line);
+            }
+            if input.ends_with('\n') {
+                legacy_text.push('\n');
+            }
+            let mut request = Self::decode(&legacy_text)?;
+            request.server_failure_retries = Some(retries);
+            request.validate()?;
+            if request.encode()? != input {
+                return Err("operation request is not canonical".into());
+            }
+            return Ok(request);
+        }
+        let schema = match first_line {
             Some(REQUEST_HEADER) => 6,
             Some(MANAGED_REQUEST_HEADER) => 5,
             Some(PUBLIC_EXISTING_REQUEST_HEADER) => 4,
@@ -1570,6 +1694,7 @@ impl OperationRequest {
             traffic_budget,
             traffic_policy_explicit,
             traffic_plan,
+            server_failure_retries: None,
         };
         request.validate()?;
         if request.encode_for_schema(schema)? != input {
@@ -1839,6 +1964,70 @@ mod tests {
     }
 
     #[test]
+    fn server_failure_retries_round_trip_in_their_own_schema_family() {
+        let mut value = request();
+        value.identity.operation = OperationKind::FullAutotune;
+        let legacy = value.encode().unwrap();
+        let legacy_schema: u8 = legacy
+            .lines()
+            .next()
+            .unwrap()
+            .split('\t')
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        for retries in [0u8, 2, MAX_SERVER_FAILURE_RETRIES] {
+            value.server_failure_retries = Some(retries);
+            let encoded = value.encode().unwrap();
+            assert!(encoded.starts_with(&format!(
+                "cake-autorate-operation\t{}\trequest\n",
+                legacy_schema + RETRY_SCHEMA_OFFSET
+            )));
+            assert!(encoded
+                .trim_end()
+                .ends_with(&format!("server_failure_retries={retries}")));
+            assert_eq!(OperationRequest::decode(&encoded).unwrap(), value);
+            assert_eq!(value.effective_server_failure_retries(), retries);
+            // A retry-family header cannot be read without its field, and the
+            // field cannot be smuggled into a legacy header.
+            assert!(OperationRequest::decode(
+                &encoded.replace(&format!("server_failure_retries={retries}\n"), "")
+            )
+            .is_err());
+            assert!(OperationRequest::decode(&format!(
+                "{legacy}server_failure_retries={retries}\n"
+            ))
+            .is_err());
+            assert!(value.encode_for_test_schema(legacy_schema).is_err());
+        }
+        let valid = value.encode().unwrap();
+        for bad in ["11", "-1", "+2", "02", "x", ""] {
+            assert!(
+                OperationRequest::decode(&valid.replace(
+                    &format!("server_failure_retries={MAX_SERVER_FAILURE_RETRIES}"),
+                    &format!("server_failure_retries={bad}")
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+        value.server_failure_retries = None;
+        assert_eq!(
+            value.effective_server_failure_retries(),
+            DEFAULT_SERVER_FAILURE_RETRIES
+        );
+        let mut speedtest = request();
+        speedtest.server_failure_retries = Some(1);
+        if speedtest.identity.operation != OperationKind::FullAutotune {
+            assert!(
+                speedtest.validate().is_err(),
+                "only Full Auto-Tune carries retries"
+            );
+        }
+    }
+
+    #[test]
     fn r6_explicit_route_wire_requires_complete_independent_authority() {
         let mut value = request();
         value.route.mode = OperationRouteMode::Explicit;
@@ -1978,6 +2167,7 @@ mod tests {
             },
             traffic_policy_explicit: false,
             traffic_plan: None,
+            server_failure_retries: None,
         }
     }
 

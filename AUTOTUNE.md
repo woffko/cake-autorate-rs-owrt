@@ -446,6 +446,21 @@ policy, traffic budget and existing/bootstrap state are attested together.
 Job-specific commands accept only the public job ID returned by Start. The
 coordinator and all calibration verbs are absent from Lite.
 
+## Server failure retries
+
+A directional measurement whose speedtest-go run exits with an error, times out
+or returns no usable rate is repeated after a short cancellable pause (3 s,
+6 s, then at most 10 s). The request field `server_failure_retries` (CLI
+`--server-failure-retries 0..10`, LuCI 0–5) bounds these retries per
+measurement; requests without it use 2, which matches the earlier fixed
+bound. Failed attempts do not use a measurement slot, and the route-counter
+wrapper has already charged their exact traffic before the retry decision.
+When the retries are exhausted the measurement becomes `TransferUnmeasurable`
+instead of a terminal failure. Deadline, route, accounting, identity and
+budget failures remain fatal. The field uses request schemas 23–41 (schemas
+4–22 plus the trailing field); the daemon advertises
+`native_server_failure_retry_version=1`.
+
 ## Background traffic and conservative continuation
 
 Retrying on a quiet link is the preferred action. **Continue conservatively**

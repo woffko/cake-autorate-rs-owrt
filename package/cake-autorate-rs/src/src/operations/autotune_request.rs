@@ -53,6 +53,7 @@ pub struct AutotuneLaunchIntent {
     pub traffic_budget: TrafficPolicy,
     pub traffic_policy_explicit: bool,
     pub traffic_plan: Option<AutotuneTrafficPlan>,
+    pub server_failure_retries: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +116,7 @@ where
     let mut traffic_policy = None;
     let mut planning_dl_kbps = None;
     let mut planning_ul_kbps = None;
+    let mut server_failure_retries = None;
     let mut args = args.peekable();
 
     while let Some(flag) = args.next() {
@@ -195,6 +197,22 @@ where
             "--planning-ul-kbps" if planning_ul_kbps.is_none() => {
                 planning_ul_kbps = Some(parse_positive_u64(&value(&mut args)?, &flag)?);
             }
+            "--server-failure-retries" if server_failure_retries.is_none() => {
+                let raw = value(&mut args)?;
+                if raw.is_empty() || raw.len() > 2 || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err("--server-failure-retries must be a small integer".into());
+                }
+                let retries = raw
+                    .parse::<u8>()
+                    .map_err(|_| "--server-failure-retries must be a small integer".to_string())?;
+                if retries > super::protocol::MAX_SERVER_FAILURE_RETRIES {
+                    return Err(format!(
+                        "--server-failure-retries must be between 0 and {}",
+                        super::protocol::MAX_SERVER_FAILURE_RETRIES
+                    ));
+                }
+                server_failure_retries = Some(retries);
+            }
             "--traffic-budget-bytes" if traffic_budget.is_none() => {
                 traffic_budget = Some(parse_positive_u64(&value(&mut args)?, &flag)?);
             }
@@ -258,6 +276,7 @@ where
             }),
             _ => return Err("both planning download and upload rates are required".into()),
         },
+        server_failure_retries,
     };
     validate_intent(&intent)?;
     Ok(intent)
@@ -389,6 +408,7 @@ fn build_request(
         traffic_budget: intent.traffic_budget,
         traffic_policy_explicit: intent.traffic_policy_explicit,
         traffic_plan,
+        server_failure_retries: intent.server_failure_retries,
     };
     request.validate()?;
     Ok(request)
@@ -443,6 +463,7 @@ fn build_bootstrap_request(
         traffic_budget: intent.traffic_budget,
         traffic_policy_explicit: intent.traffic_policy_explicit,
         traffic_plan,
+        server_failure_retries: intent.server_failure_retries,
     };
     request.validate()?;
     context.absence_identity.ensure_request_binding(
@@ -1274,6 +1295,41 @@ mod tests {
         context: BootstrapRequestContext,
     ) -> Result<OperationRequest, String> {
         build_bootstrap_request(intent, context, "4".repeat(32), "5".repeat(64), 1_000)
+    }
+
+    #[test]
+    fn server_failure_retries_flag_is_bounded_and_reaches_the_request() {
+        assert_eq!(
+            parse_launch_intent(intent_args().into_iter())
+                .unwrap()
+                .server_failure_retries,
+            None
+        );
+        for (raw, expected) in [("0", Some(0u8)), ("3", Some(3)), ("10", Some(10))] {
+            let mut argv = intent_args();
+            argv.extend(args(&["--server-failure-retries", raw]));
+            let intent = parse_launch_intent(argv.into_iter()).unwrap();
+            assert_eq!(intent.server_failure_retries, expected);
+            let context = bootstrap_context(&intent, "cake_wan_sqm");
+            let request = build_test_bootstrap_request(&intent, context).unwrap();
+            assert_eq!(request.server_failure_retries, expected);
+        }
+        for bad in ["11", "-1", "x", "", "003"] {
+            let mut argv = intent_args();
+            argv.extend(args(&["--server-failure-retries", bad]));
+            assert!(parse_launch_intent(argv.into_iter()).is_err(), "{bad}");
+        }
+        let mut argv = intent_args();
+        argv.extend(args(&[
+            "--server-failure-retries",
+            "1",
+            "--server-failure-retries",
+            "2",
+        ]));
+        assert!(
+            parse_launch_intent(argv.into_iter()).is_err(),
+            "duplicate flag"
+        );
     }
 
     #[test]

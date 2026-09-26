@@ -336,6 +336,16 @@ of a retained, verified comparable same-boot raw reference blocks a new Apply;
 this guard does not invent a historical reference after reboot. Reviewing or
 rejecting a proposal does not apply its rates.
 
+### Retries after a server failure
+
+Public speed-test servers occasionally refuse a connection or stop mid-test.
+**Retries after a server failure** (0–5, default 2) sets how many times one
+measurement is repeated after such a failure, with a short pause, before that
+measurement is marked unavailable. Failed attempts do not count as
+measurements, and their traffic is still counted in the test budget. Route,
+traffic-accounting and deadline failures still stop the test immediately.
+Scheduled runs use the default.
+
 ## Explicit policy route
 
 `route_mode=explicit` (Full package only) pins probes, Speed Test and Full

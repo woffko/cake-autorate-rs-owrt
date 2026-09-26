@@ -3744,6 +3744,8 @@ function nativeAutotuneIntentSupported(backend, routeMode, existingInstance,
 }
 
 var AUTOTUNE_TRAFFIC_PRESET_GB = [ 1, 5, 10, 25, 50, 100 ];
+var AUTOTUNE_DEFAULT_SERVER_RETRIES = 2;
+var AUTOTUNE_MAX_SERVER_RETRIES = 5;
 
 function validatedAutotuneTrafficPolicy(policy) {
 	if (policy && (policy.version == null || policy.version === 1)) {
@@ -3889,6 +3891,15 @@ function autotuneTrafficPolicyControl(state, instance, disabled) {
 			'input': function(ev) { state[key] = ev.currentTarget.value; updateEstimate(); }
 		});
 	});
+	if (state._server_failure_retries == null)
+		state._server_failure_retries = String(AUTOTUNE_DEFAULT_SERVER_RETRIES);
+	var retrySelect = E('select', { 'class': 'cbi-input-select cake-autotune-server-retries',
+		'style': 'width:auto', 'disabled': disabled ? '' : null,
+		'change': function(ev) { state._server_failure_retries = ev.currentTarget.value; }
+	}, Array.from({ length: AUTOTUNE_MAX_SERVER_RETRIES + 1 }, function(_unused, count) {
+		return E('option', { 'value': String(count) }, String(count));
+	}));
+	retrySelect.value = state._server_failure_retries;
 	var planningRow = E('div', { 'class': 'cake-autotune-planning',
 		'style': 'display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;margin:6px 0' }, [
 		E('label', { 'style': 'display:flex;align-items:center;gap:6px' }, [ cakeUi.text(_('Planning download (Mbit/s)')), rateInputs[0] ]),
@@ -3907,6 +3918,11 @@ function autotuneTrafficPolicyControl(state, instance, disabled) {
 		E('p', { 'class': 'cake-autotune-dns-accounting' }, cakeUi.text(_('Counts this test\'s own traffic. DNS through the router\'s shared resolver is estimated, not metered exactly.'))),
 		estimateText
 	].concat(cappedRows).concat([
+		E('label', { 'style': 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:6px 0' }, [
+			cakeUi.text(_('Retries after a server failure')), retrySelect,
+			E('span', { 'class': 'cbi-value-description', 'style': 'margin:0' },
+				cakeUi.text(_('A failed or timed-out server test is repeated this many times per measurement before that measurement is marked unavailable.')))
+		]),
 		E('label', {}, [ remember, cakeUi.text(_(' Remember this choice for this instance in this browser')) ])
 	]));
 }
@@ -3918,6 +3934,9 @@ function autotuneTrafficPolicyForRun(state, instance) {
 	if (control) {
 		// Submit what is displayed, including browser-restored/autofilled values.
 		state._traffic_policy_mode = control.querySelector('select').value;
+		var retrySelect = control.querySelector('.cake-autotune-server-retries');
+		if (retrySelect)
+			state._server_failure_retries = retrySelect.value;
 		state._traffic_policy_gb = control.querySelector('input[type=text]').value;
 		state._traffic_policy_remember = control.querySelector('input[type=checkbox]').checked;
 		var rates = control.querySelectorAll('input[type=number]');
@@ -3941,6 +3960,9 @@ function autotuneTrafficPolicyForRun(state, instance) {
 	// this launch and are carried separately in its immutable native request.
 	if (estimate)
 		policy.planning = { download_kbps: estimate.planning_download_kbps, upload_kbps: estimate.planning_upload_kbps };
+	var retries = Number(state._server_failure_retries == null ? AUTOTUNE_DEFAULT_SERVER_RETRIES : state._server_failure_retries);
+	if (Number.isInteger(retries) && retries >= 0 && retries <= AUTOTUNE_MAX_SERVER_RETRIES)
+		policy.server_failure_retries = retries;
 	return policy;
 }
 
@@ -3965,6 +3987,7 @@ function nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode, mwan3Memb
 		profile, conservative, calibrationStrategy, accessRequest, existingInstance,
 		plannedSqmSection, trafficPolicy) {
 	var planning = trafficPolicy && trafficPolicy.planning;
+	var serverRetries = trafficPolicy && trafficPolicy.server_failure_retries;
 	trafficPolicy = validatedAutotuneTrafficPolicy(trafficPolicy);
 	var mode = routeMode || 'main';
 	var bootstrap = existingInstance !== true;
@@ -4009,6 +4032,11 @@ function nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode, mwan3Memb
 		args.push('--allow-sqm-disable');
 	if (conservative)
 		args.push('--allow-active-traffic');
+	if (serverRetries != null) {
+		if (!Number.isInteger(serverRetries) || serverRetries < 0 || serverRetries > AUTOTUNE_MAX_SERVER_RETRIES)
+			throw new Error(_('Invalid number of retries after a server failure.'));
+		args.push('--server-failure-retries', String(serverRetries));
+	}
 	return args;
 }
 
@@ -4388,7 +4416,8 @@ function currentActiveNativeAutotuneJob(section_id, existingInstance, wan, route
 
 function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Member,
 		profile, conservative, calibrationStrategy, accessRequest, existingInstance,
-		plannedSqmSection, trafficPolicy, trafficPolicySupported, trafficPlanningSupported) {
+		plannedSqmSection, trafficPolicy, trafficPolicySupported, trafficPlanningSupported,
+		serverRetrySupported) {
 	backend = nativeEffectiveSpeedtestBackend(backend);
 	if (backend == null)
 		return Promise.reject(new Error(_('Unsupported native speed-test backend.')));
@@ -4514,6 +4543,9 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 		if (policy && policy.planning && !trafficPlanningSupported)
 			throw new Error(_('The calibration service does not support planning-rate admission. Update the daemon before starting a new test.'));
 		activePlanning = policy && policy.planning ? Object.assign({}, policy.planning) : undefined;
+		// An older daemon rejects the flag; it keeps its fixed retry bound.
+		if (policy && !serverRetrySupported)
+			delete policy.server_failure_retries;
 		var launchArgs = nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode,
 			mwan3Member, profile, conservative, calibrationStrategy, accessRequest,
 			existingInstance, plannedSqmSection, policy);
@@ -4571,7 +4603,8 @@ function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode
 		return runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode,
 			mwan3Member, profile, conservative, calibrationStrategy, accessRequest,
 			existingInstance, plannedSqmSection, trafficPolicy, summary.native_traffic_policy_version === 1,
-			summary.native_traffic_planning_version === 1);
+			summary.native_traffic_planning_version === 1,
+			summary.native_server_failure_retry_version === 1);
 	});
 }
 

@@ -8461,7 +8461,7 @@ impl CalibrationDaemon {
             .as_ref()
             .is_some_and(|scheduler| scheduler.lab_mode);
         format!(
-            "{{\"state\":\"{state}\",\"protocol_version\":{},\"active_job\":{},\"active_jobs\":{active},\"active_operations\":[{active_operations}],\"queued_jobs\":{queued},\"recovery_required_jobs\":{recovery},\"abandoned_safe_jobs\":{abandoned},\"settled_jobs\":{settled},\"leased_jobs\":{},\"admission_enabled\":{},\"native_rating\":{},\"native_speedtest\":{},\"native_bootstrap_speedtest\":true,\"native_speedtest_auto_backend\":true,\"native_speedtest_traffic_policy_version\":1,\"native_full_autotune\":{},\"native_bootstrap_autotune\":{},\"native_autotune_auto_backend\":true,\"native_traffic_policy_version\":1,\"native_traffic_planning_version\":1,\"native_operation_status_identity_version\":{},\"native_autotune_status_identity_version\":{},\"native_scheduler\":{},\"native_scheduler_lab\":{},\"native_scheduler_errors\":{scheduler_errors},\"native_scheduler_waiting\":[{scheduler_waiting}],\"native_scheduler_accounting_blocks\":[{scheduler_accounting_blocks}],\"native_public_result_version\":{}}}\n",
+            "{{\"state\":\"{state}\",\"protocol_version\":{},\"active_job\":{},\"active_jobs\":{active},\"active_operations\":[{active_operations}],\"queued_jobs\":{queued},\"recovery_required_jobs\":{recovery},\"abandoned_safe_jobs\":{abandoned},\"settled_jobs\":{settled},\"leased_jobs\":{},\"admission_enabled\":{},\"native_rating\":{},\"native_speedtest\":{},\"native_bootstrap_speedtest\":true,\"native_speedtest_auto_backend\":true,\"native_speedtest_traffic_policy_version\":1,\"native_full_autotune\":{},\"native_bootstrap_autotune\":{},\"native_autotune_auto_backend\":true,\"native_traffic_policy_version\":1,\"native_traffic_planning_version\":1,\"native_server_failure_retry_version\":1,\"native_operation_status_identity_version\":{},\"native_autotune_status_identity_version\":{},\"native_scheduler\":{},\"native_scheduler_lab\":{},\"native_scheduler_errors\":{scheduler_errors},\"native_scheduler_waiting\":[{scheduler_waiting}],\"native_scheduler_accounting_blocks\":[{scheduler_accounting_blocks}],\"native_public_result_version\":{}}}\n",
             OPERATION_PROTOCOL_VERSION,
             if active > 0 { "true" } else { "false" },
             self.leases.job_count(),
@@ -11339,6 +11339,7 @@ mod tests {
             },
             traffic_policy_explicit: false,
             traffic_plan: None,
+            server_failure_retries: None,
         }
     }
 

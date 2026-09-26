@@ -3045,8 +3045,9 @@ fn server_attempt_is_retryable(error: &str) -> bool {
 /// Return true only for evidence-shape errors emitted after speedtest-go has
 /// exited successfully and the selected route has already passed its traffic
 /// proof.  A Full Auto-Tune caller may treat these as a bounded unmeasurable
-/// transfer, but must never extend that policy to backend, route, accounting,
-/// identity, budget, cancellation, timeout or output-file failures.
+/// transfer. Its directional retry also covers a backend error exit and a
+/// timeout (see `directional_load_failure_is_transient`), but never route,
+/// accounting, identity, budget, cancellation or output-file failures.
 pub(crate) fn completed_speedtest_output_is_unmeasurable(error: &str) -> bool {
     matches!(
         error,
@@ -5306,6 +5307,7 @@ mod tests {
             },
             traffic_policy_explicit: false,
             traffic_plan: None,
+            server_failure_retries: None,
         }
     }
 
