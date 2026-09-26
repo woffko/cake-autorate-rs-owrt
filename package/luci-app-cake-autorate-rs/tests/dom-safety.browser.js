@@ -104,6 +104,16 @@ sources.liteStatus = fs.readFileSync(path.resolve(__dirname,
 				prefix(source.settings) + '\nreturn { renderAutotuneDiagnostics, renderNativeAutotuneDiagnostics, renderNativeServerComparison, autotuneTrafficPolicyControl, autotuneTrafficPolicyForRun, disableAutotuneTrafficPolicy, settingsActionLayout: typeof settingsActionLayout === "function" ? settingsActionLayout : null };')(
 				{}, {}, {}, {}, ui, {}, cakeUi, { declare: () => () => Promise.resolve(0) }, {}, E, value => value);
 			verify('autotune-diagnostic-and-code', settings.renderAutotuneDiagnostics({ error: payload, reason: payload }), payload);
+			{
+				const stopped = settings.renderAutotuneDiagnostics({ state: 'failed', terminal_state: 'failed',
+					diagnostic_code: 'speedtest-backend-failed' }, 'Keep current settings');
+				if (!stopped.textContent.includes('Your current settings are unchanged') ||
+				    !stopped.textContent.includes('kept failing even after the configured retries') ||
+				    !stopped.querySelector('.cake-autotune-keep-current'))
+					throw new Error('a stopped test must say the settings are unchanged, explain why, and offer to keep them');
+				if (settings.renderAutotuneDiagnostics({ state: 'failed' }).querySelector('.cake-autotune-keep-current'))
+					throw new Error('the keep button appears only where the caller can close the wizard');
+			}
 			const trafficDiagnostic = settings.renderAutotuneDiagnostics({ diagnostic: payload, traffic: {
 				schema_version: 1, policy: 'capped', limit_bytes: 32000000000,
 				consumed_bytes: 16381000000, remaining_bytes: 15619000000, overrun_bytes: 0,

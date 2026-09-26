@@ -5475,28 +5475,51 @@ function recordAutotuneRetryableInconclusive(state, result) {
 	return state;
 }
 
-function renderAutotuneDiagnostics(result) {
+// Plain explanations for stops that have no Review. Anything not listed keeps
+// the daemon's own text and diagnostic code.
+var AUTOTUNE_STOP_EXPLANATIONS = {
+	'speedtest-backend-failed': _('The speed-test server kept failing even after the configured retries.'),
+	'speedtest-route-drift': _('The uplink route changed during the test.'),
+	'runtime-route-changed': _('The uplink route changed during the test.'),
+	'native-search-load-confidence-low': _('Other traffic on this uplink made the measurements too unreliable.'),
+	'owned-traffic-accounting-failed': _('The test traffic could not be counted reliably, so the test stopped.'),
+	'native-autotune-deadline-expired': _('The test did not finish within its 45-minute limit.')
+};
+
+function renderAutotuneDiagnostics(result, closeLabel) {
 	if (nativeAutotunePublicResultValidated(result))
 		return renderNativeAutotuneDiagnostics(result);
 
 	var terminal = autotuneTypedTerminalDiagnostic(result);
+	var stopCode = result && (result.diagnostic_code || result.reason);
 	var message = terminal ? terminal.message :
+		(stopCode && Object.prototype.hasOwnProperty.call(AUTOTUNE_STOP_EXPLANATIONS, stopCode) ?
+			AUTOTUNE_STOP_EXPLANATIONS[stopCode] :
 		(result && (result.diagnostic || result.error) ||
-			_('Full Auto-Tune ended without a reviewable result.'));
+			_('Full Auto-Tune ended without a reviewable result.')));
 	var code = terminal ? terminal.code :
 		(result && (result.diagnostic_code || result.reason || result.state) || 'failed');
 	var traffic = nativeAutotuneTrafficSummary(result);
 	if (traffic)
 		message += ' ' + traffic;
+	var cancelled = !!(result && (result.terminal_state === 'cancelled' || result.state === 'cancelled'));
 	var nodes = [
-		E('strong', {}, _('Calibration did not produce an applicable proposal.')),
+		E('strong', {}, cancelled ? _('Test cancelled. Your current settings are unchanged.') :
+			_('The test stopped early. Your current settings are unchanged.')),
 		E('p', { 'style': 'white-space:normal;margin:6px 0 0' }, cakeUi.text(message)),
+		E('p', { 'style': 'white-space:normal;margin:6px 0 0' },
+			cakeUi.text(_('No new rates are offered from an incomplete test. You can run it again or keep the current settings.'))),
 		E('p', { 'style': 'white-space:normal;margin:6px 0 0;font-size:12px' },
 			cakeUi.text(_('Diagnostic code: %s').format(code)))
 	];
 	if (result && nativeServerComparisonValidated(result.server_comparison_diagnostic, true))
 		nodes.push(renderNativeServerComparison(result.server_comparison_diagnostic, true));
-	return E('div', { 'class': 'alert-message error' }, nodes);
+	if (closeLabel)
+		nodes.push(E('div', { 'style': 'margin-top:8px' }, [
+			E('button', { 'type': 'button', 'class': 'btn cbi-button cake-autotune-keep-current',
+				'click': function() { ui.hideModal(); } }, [ cakeUi.text(closeLabel) ])
+		]));
+	return E('div', { 'class': 'alert-message warning cake-autotune-stopped' }, nodes);
 }
 function replaceNodeContent(node, children) {
 	var replacements = Array.isArray(children) ? children : (children ? [ children ] : []);
@@ -6358,7 +6381,8 @@ function showCreateWizard(grid, name, existingName) {
 						state.autotune_failure_message = _('Calibration was skipped by the user.');
 						state.step = 2;
 						render();
-					} : null) : renderAutotuneDiagnostics(state.autotune_diagnostics)) : null;
+					} : null) : renderAutotuneDiagnostics(state.autotune_diagnostics,
+					rerun ? _('Keep current settings') : _('Close without creating'))) : null;
 			var startCalibration = function(conservative) {
 				var generation = (state.autotune_generation || 0) + 1;
 				var accessRequest;

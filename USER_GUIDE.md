@@ -342,6 +342,13 @@ If the speed measured without shaping is clearly below what the server
 comparison showed (less than 80%), the test continues. The options are still
 offered, marked with that finding, and need your confirmation to apply.
 
+### When the test stops early
+
+If a test cannot finish (for example the route changed, the traffic budget
+ran out or a server kept failing after all retries), no new rates are offered
+from the incomplete measurements. The wizard says why it stopped and that
+your current settings are unchanged; you can keep them or run the test again.
+
 ### Retries after a server failure
 
 Public speed-test servers occasionally refuse a connection or stop mid-test.
