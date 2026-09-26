@@ -81,6 +81,29 @@ verified for the same 12 ABIs.
   options. A shared fixture of the exact LuCI launch argv (new and existing
   instance, main, mwan3 and explicit routes, capped and Unlimited, with and
   without retries) is decoded by the daemon test through the same Start path.
+- Server switch (`tools/audit-vm-server-switch.py --mode selected-server`):
+  after the comparison selected server 17372, every backend connection to its
+  address was reset for the rest of the run. The first raw download control
+  failed three times and moved download to 29062; the raw upload control then
+  failed three times and moved upload to 29062. Both switches restarted the
+  measurements from the raw controls, and the Gaming run reached a complete
+  Review with CAKE options (`recommended`, both shaped; `bypass_download`,
+  upload shaped). The journal held two `server_switch` records; topology and
+  configuration were restored and the fault table was removed.
+- Incomplete upload search (`--mode upload-search`): backend connections were
+  reset only while the job searched its upload rate. Upload failed on 17372
+  and moved to 37193, the measurements restarted, and upload failed again
+  with no qualified source left. Review (public schema 7) offered
+  `partial_quality_first` (preselected for Gaming) and
+  `partial_throughput_first`, both shaped with the exact rates that ran during
+  the download search measurements, acknowledging
+  `upload-search-incomplete` and `upload-shaped-load-unmeasured`, plus
+  SQM disabled as a non-preferred option.
+- PPPoE router with mwan3 (10.0.77.1), LuCI wizard, Gaming, Full raw,
+  Unlimited, 2 retries: the run reached a complete Review with
+  `recommended` (both shaped, 845.9/901.2 Mbit/s, class A+, Auto-Apply checks
+  passed) and `bypass_download`. No switch was needed on server 12456, no
+  route event occurred during the run, and nothing was applied.
 - Raw control below the server comparison: with the raw upload control
   throttled to about 120 Mbit/s against a 317 Mbit/s comparison, the Full Raw
   run continued to Review; every option carried
