@@ -12717,7 +12717,10 @@ pub(crate) fn publish_native_public_result_transaction(
 const RUNTIME_ACK_POLL: Duration = Duration::from_millis(100);
 const LOADED_CAPTURE_PROGRESS_WAIT: Duration = Duration::from_secs(5);
 const MAX_DIRECTIONAL_LOAD_RUNS: u8 = 3;
-const MAX_DIRECTIONAL_RESULT_UNAVAILABLE_RUNS: u8 = 3;
+// One first attempt plus the largest retry count a request may carry. The
+// per-request limit is enforced by the measurement loop; evidence replay only
+// needs the global bound.
+const MAX_DIRECTIONAL_RESULT_UNAVAILABLE_RUNS: u8 = super::protocol::MAX_SERVER_FAILURE_RETRIES + 1;
 const CANDIDATE_OBSERVATION_STARVED_REASON: &str = "candidate-observation-starved";
 const CANDIDATE_TRANSFER_UNMEASURABLE_REASON: &str = "candidate-transfer-unmeasurable";
 const CANDIDATE_UNOBSERVED_ATTEMPT_LIMIT_REASON: &str =
@@ -22092,6 +22095,51 @@ mod tests {
             vec![(selected_dl_kbps, selected_ul_kbps)]
         );
         assert_eq!(settled.consumed_bytes - consumed_before, 11_000);
+    }
+
+    #[test]
+    fn unavailable_option_after_configured_server_retries_replays() {
+        // Five retries after the first failure: six charged attempts.
+        let (mut operation, _proposal, mut records, download, upload) = pair_search_records();
+        operation.access_medium = Some(AccessMedium::SharedWired);
+        operation.server_failure_retries = Some(5);
+        let candidate = profile_pair_candidates(&download, &upload).unwrap()[0];
+        push_measurement_debit(
+            &mut records,
+            AutotunePhase::PairConfirmation,
+            SpeedtestDirection::Download,
+            1_000,
+            100,
+        );
+        for _ in 0..6 {
+            push_measurement_debit(
+                &mut records,
+                AutotunePhase::PairConfirmation,
+                SpeedtestDirection::Upload,
+                100,
+                1_000,
+            );
+        }
+        let unavailable = PairOptionUnavailableEvidence {
+            candidate_dl_kbps: candidate.download_kbps,
+            candidate_ul_kbps: candidate.upload_kbps,
+            failed_direction: SpeedtestDirection::Upload,
+            reason: PairOptionUnavailableReason::TransferUnmeasurable,
+            run_count: 6,
+            download_debit_count: 1,
+            upload_debit_count: 6,
+            icmp_samples: 0,
+            transport_samples: 0,
+            cpu_samples: 0,
+        };
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::PairConfirmation,
+            AutotuneEvidence::PairOptionUnavailable(unavailable),
+        ));
+        let replay = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert_eq!(replay.pair_unavailable, vec![unavailable]);
+        assert!(MAX_DIRECTIONAL_RESULT_UNAVAILABLE_RUNS > 6);
     }
 
     #[test]
