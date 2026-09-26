@@ -1177,6 +1177,13 @@ fn main_policy_problem(rules: &str, routes: &str, expected_device: &str) -> Opti
     None
 }
 
+/// mwan3 keeps routing through a member while its tracker reports
+/// `disconnecting`; its policy rules change only on the `offline` hotplug
+/// event. `connecting` members are not used for routing yet.
+fn mwan3_member_routes(member_status: &str) -> bool {
+    matches!(member_status, "online" | "disconnecting")
+}
+
 fn inspect_mwan3_with_policy(
     spec: &RouteSpec,
     default_policy: Option<&str>,
@@ -1219,7 +1226,7 @@ fn inspect_mwan3_with_policy(
         .or_else(|| json_string_value(&network_json, "device"))
         .unwrap_or_default();
 
-    if !(enabled && running && member_up && network_up && member_status == "online") {
+    if !(enabled && running && member_up && network_up && mwan3_member_routes(&member_status)) {
         let reason = if !enabled {
             format!("member {} is disabled", spec.member)
         } else if matches!(member_status.as_str(), "connecting" | "disconnecting") {
@@ -1285,7 +1292,7 @@ fn inspect_mwan3_with_policy(
         && running
         && member_up
         && network_up
-        && member_status == "online"
+        && mwan3_member_routes(&member_status)
         && device_matches;
     let policy_percent = default_policy
         .and_then(|policy| json_policy_member_percent(&mwan_json, policy, &spec.member));
@@ -1307,7 +1314,7 @@ fn inspect_mwan3_with_policy(
         format!("member {} is disabled", spec.member)
     } else if !running || !network_up {
         format!("member {} interface is down", spec.member)
-    } else if !member_up || member_status != "online" {
+    } else if !member_up || !mwan3_member_routes(&member_status) {
         format!("member {} is {member_status}", spec.member)
     } else if !active {
         match (default_policy, policy_percent) {
@@ -2855,14 +2862,14 @@ mwan3.default_rule_v4.use_policy='wan_then_wan2'\n";
         lifecycle.observe(Ok(&route));
         lifecycle.record_learning_sample(1);
 
-        let disconnecting = RouteSnapshot {
+        let connecting = RouteSnapshot {
             online: false,
-            member_status: "disconnecting".to_string(),
-            reason: "member wanb is disconnecting".to_string(),
+            member_status: "connecting".to_string(),
+            reason: "member wanb is connecting".to_string(),
             ..route.clone()
         };
         for _ in 0..8 {
-            let transition = lifecycle.observe(Ok(&disconnecting));
+            let transition = lifecycle.observe(Ok(&connecting));
             assert_eq!(transition.state, UplinkState::Rechecking);
             assert!(!transition.became_offline);
             assert!(!transition.reset_learning);
@@ -2873,6 +2880,30 @@ mwan3.default_rule_v4.use_policy='wan_then_wan2'\n";
         assert_eq!(recovered.state, UplinkState::Active);
         assert!(!recovered.reset_learning);
         assert!(recovered.probes_allowed);
+    }
+
+    #[test]
+    fn mwan3_disconnecting_member_still_routes() {
+        // mwan3 changes its policy rules only on the offline event, so a
+        // member whose tracker is failing checks still carries the route.
+        assert!(mwan3_member_routes("online"));
+        assert!(mwan3_member_routes("disconnecting"));
+        for status in ["connecting", "offline", "disabled", "unknown", ""] {
+            assert!(!mwan3_member_routes(status), "{status}");
+        }
+        let route = snapshot(true, "198.51.100.1");
+        let mut lifecycle = UplinkLifecycle::new();
+        lifecycle.observe(Ok(&route));
+        lifecycle.observe(Ok(&route));
+        lifecycle.record_learning_sample(1);
+        let disconnecting = RouteSnapshot {
+            member_status: "disconnecting".to_string(),
+            ..route
+        };
+        let transition = lifecycle.observe(Ok(&disconnecting));
+        assert_eq!(transition.state, UplinkState::Active);
+        assert!(!transition.identity_changed);
+        assert!(transition.probes_allowed);
     }
 
     #[test]
