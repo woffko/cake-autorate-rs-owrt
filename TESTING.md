@@ -68,14 +68,28 @@ verified for the same 12 ABIs.
   reached Review. With 15 s of resets the retries were exhausted and the
   measurement was reported as unmeasurable instead of a terminal failure.
   Unit tests cover the retry limit (0–10), the request schema family and
-  evidence replay up to eleven charged attempts.
+  evidence replay up to eleven charged attempts. With an explicit limit the
+  same fault logged no retry for 0 and exactly one for 1 before the
+  measurement was marked unavailable; configuration and CAKE topology were
+  restored both times.
+- Launch from LuCI with a retry count: the daemon first refused every such
+  start without a route mark (main routing) with "operation schema does not
+  match its target lifecycle". After the fix, a wizard start on the VM
+  (main routing, 1 GB, 1 retry) and on the LTE router (Variable link, Full
+  raw, Unlimited, 2 retries) reached Review; the LTE Review offered
+  recommended, lowest-latency, highest-throughput and download-without-shaping
+  options. A shared fixture of the exact LuCI launch argv (new and existing
+  instance, main, mwan3 and explicit routes, capped and Unlimited, with and
+  without retries) is decoded by the daemon test through the same Start path.
 - Raw control below the server comparison: with the raw upload control
   throttled to about 120 Mbit/s against a 317 Mbit/s comparison, the Full Raw
   run continued to Review; every option carried
   `upload-raw-below-server-comparison`, and the read-only Apply check
   returned `confirmation_ready` with the same acknowledgement list.
 - Early stop: a DOM test checks that a stopped test states that the current
-  settings are unchanged, explains the reason and offers to keep them.
+  settings are unchanged, explains the reason and offers to keep them. A
+  start the service refuses is shown as "did not start", with nothing
+  measured and no test traffic used.
 - Re-calibration of an already tuned PPPoE instance on the x86_64 router
   reached Review with two options instead of stopping: a shaped option at
   about 904/913 Mbit/s that needed no acknowledgements, and a preselected

@@ -349,15 +349,26 @@ ran out or a server kept failing after all retries), no new rates are offered
 from the incomplete measurements. The wizard says why it stopped and that
 your current settings are unchanged; you can keep them or run the test again.
 
+If the service refuses the test before it begins (for example the daemon and
+the LuCI app come from different releases, or an earlier settings
+transaction is still being restored), the wizard says that the test did not
+start and that nothing was measured and no test traffic was used. Where the
+service's reason is internal detail, a plain explanation is shown with the
+original text below it.
+
 ### Retries after a server failure
 
 Public speed-test servers occasionally refuse a connection or stop mid-test.
 **Retries after a server failure** (0–5, default 2) sets how many times one
 measurement is repeated after such a failure, with a short pause, before that
 measurement is marked unavailable. Failed attempts do not count as
-measurements, and their traffic is still counted in the test budget. Route,
-traffic-accounting and deadline failures still stop the test immediately.
-Scheduled runs use the default.
+measurements, and their traffic is still counted in the test budget. The
+traffic estimate in the wizard does not include them: each retry can add up
+to one more measurement of traffic, so leave room in a capped budget or lower
+the retry count. Route, traffic-accounting and deadline failures still stop
+the test immediately. **Remember this choice** saves the retry count together
+with the traffic choice for that instance in this browser. Scheduled runs use
+the default.
 
 ## Explicit policy route
 

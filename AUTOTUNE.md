@@ -461,9 +461,15 @@ bound. Failed attempts do not use a measurement slot, and the route-counter
 wrapper has already charged their exact traffic before the retry decision.
 When the retries are exhausted the measurement becomes `TransferUnmeasurable`
 instead of a terminal failure. Deadline, route, accounting, identity and
-budget failures remain fatal. The field uses request schemas 23–41 (schemas
+budget failures remain fatal. The planning estimate counts successful
+measurements only; each failed attempt can add up to one more measurement of
+traffic, and a capped budget still stops the run when it is spent. The field uses request schemas 23–41 (schemas
 4–22 plus the trailing field); the daemon advertises
-`native_server_failure_retry_version=1`.
+`native_server_failure_retry_version=1`. LuCI sends the field only then. The
+public Start wire keeps the existing-instance schema 23 (4 plus the field);
+the private journal form is 24 (5 plus the field). A shared fixture of the
+exact LuCI launch argv is decoded by the daemon test through the same Start
+path for every lifecycle and route shape.
 
 ## Raw control below the server comparison
 
