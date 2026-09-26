@@ -3803,8 +3803,14 @@ function autotuneTrafficPlanningEstimate(profile, strategy, downloadMbps, upload
 function autotuneTrafficPolicyControl(state, instance, disabled) {
 	var key = 'cake-autorate-autotune-traffic-v1:' + instance;
 	if (state._traffic_policy_instance !== instance) {
-		var saved = null;
-		try { saved = validatedAutotuneTrafficPolicy(JSON.parse(window.localStorage.getItem(key))); } catch (error) {}
+		var saved = null, savedRetries = null;
+		try {
+			var stored = JSON.parse(window.localStorage.getItem(key));
+			saved = validatedAutotuneTrafficPolicy(stored);
+			savedRetries = stored.server_failure_retries;
+		} catch (error) {}
+		state._server_failure_retries = String(Number.isInteger(savedRetries) && savedRetries >= 0 &&
+			savedRetries <= AUTOTUNE_MAX_SERVER_RETRIES ? savedRetries : AUTOTUNE_DEFAULT_SERVER_RETRIES);
 		state._traffic_policy_instance = instance;
 		state._traffic_policy_mode = saved ? saved.mode : '';
 		if (saved && saved.mode === 'capped' && AUTOTUNE_TRAFFIC_PRESET_GB.indexOf(saved.bytes / 1000000000) >= 0)
@@ -3910,7 +3916,7 @@ function autotuneTrafficPolicyControl(state, instance, disabled) {
 		E('label', { 'style': 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:6px 0' }, [
 			cakeUi.text(_('Retries after a server failure')), retrySelect,
 			E('span', { 'class': 'cbi-value-description', 'style': 'margin:0' },
-				cakeUi.text(_('A failed or timed-out server test is repeated this many times per measurement before that measurement is marked unavailable.')))
+				cakeUi.text(_('A failed or timed-out server test is repeated this many times per measurement before that measurement is marked unavailable. Each retry can use up to one more measurement of traffic.')))
 		]),
 		E('label', {}, [ remember, cakeUi.text(_(' Remember this choice for this instance in this browser')) ])
 	]));
@@ -3940,17 +3946,21 @@ function autotuneTrafficPolicyForRun(state, instance) {
 			throw new Error(_('The budget is below the initial-stage planning allowance of %s GB at these rates. Choose a larger budget or Unlimited.').format(
 				(estimate.initial_plan_bytes / 1000000000).toFixed(2)));
 	}
+	var retries = Number(state._server_failure_retries == null ? AUTOTUNE_DEFAULT_SERVER_RETRIES : state._server_failure_retries);
+	var retriesValid = Number.isInteger(retries) && retries >= 0 && retries <= AUTOTUNE_MAX_SERVER_RETRIES;
 	if (state._traffic_policy_remember) {
+		// Older LuCI builds validate only mode and bytes and ignore the extra field.
 		try { window.localStorage.setItem('cake-autorate-autotune-traffic-v1:' + instance,
-			JSON.stringify(Object.assign({ version: 1 }, policy))); }
+			JSON.stringify(Object.assign({ version: 1 }, policy,
+				retriesValid ? { server_failure_retries: retries } : {}))); }
 		catch (error) { throw new Error(_('This browser could not remember the traffic policy. Uncheck Remember to use it for this test only.')); }
 	}
-	// Only the explicit traffic preference is saved. Planning inputs describe
-	// this launch and are carried separately in its immutable native request.
+	// Only the explicit traffic preference and retry count are saved. Planning
+	// inputs describe this launch and are carried separately in its immutable
+	// native request.
 	if (estimate)
 		policy.planning = { download_kbps: estimate.planning_download_kbps, upload_kbps: estimate.planning_upload_kbps };
-	var retries = Number(state._server_failure_retries == null ? AUTOTUNE_DEFAULT_SERVER_RETRIES : state._server_failure_retries);
-	if (Number.isInteger(retries) && retries >= 0 && retries <= AUTOTUNE_MAX_SERVER_RETRIES)
+	if (retriesValid)
 		policy.server_failure_retries = retries;
 	return policy;
 }
@@ -4540,8 +4550,11 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 			existingInstance, plannedSqmSection, policy);
 		startAttempted = true;
 		return fs.exec(NATIVE_AUTOTUNE_COMMAND, launchArgs).then(parseExecJson).then(function(started) {
-			if (started.error)
-				throw new Error(started.error);
+			if (started.error) {
+				var refused = new Error(started.error);
+				refused.autotuneStartRefused = true;
+				throw refused;
+			}
 			if (!/^[0-9a-f]{32}$/.test(started.job_id || ''))
 				throw new Error(_('The calibration service returned no valid job ID.'));
 			return attach(started);
@@ -4551,8 +4564,18 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 		 * executor must never mutate the same SQM. */
 		if (startAttempted)
 			error.nativeAutotuneStartAttempted = true;
+		/* Nothing ran when the request never left LuCI or the daemon refused it
+		 * outright. A lost reply after the start stays ambiguous. */
+		if (!publicJobId && (!startAttempted || error.autotuneStartRefused))
+			error.autotuneNotStarted = true;
 		throw error;
 	});
+}
+
+function autotuneNotStartedError(message) {
+	var error = new Error(message);
+	error.autotuneNotStarted = true;
+	return error;
 }
 
 function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Member,
@@ -4567,12 +4590,12 @@ function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode
 		(!routeMode || routeMode === 'main' || routeMode === 'mwan3') &&
 		!nativeAutotuneIntentSupported(backend, routeMode, existingInstance,
 			calibrationStrategy, accessRequest)) {
-		return Promise.reject(new Error(_('New-instance calibration requires Full raw capacity and explicit download/upload service caps.')));
+		return Promise.reject(autotuneNotStartedError(_('New-instance calibration requires Full raw capacity and explicit download/upload service caps.')));
 	}
 
 	if (!nativeAutotuneIntentSupported(backend, routeMode, existingInstance,
 		calibrationStrategy, accessRequest)) {
-		return Promise.reject(new Error(_('This Full Auto-Tune request is not supported by the native calibration service. No fallback calibration was started.')));
+		return Promise.reject(autotuneNotStartedError(_('This Full Auto-Tune request is not supported by the native calibration service. No fallback calibration was started.')));
 	}
 
 	return nativeAutotuneSummary().then(function(summary) {
@@ -4582,10 +4605,10 @@ function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode
 		if (!capabilityReady) {
 			if (nativeAutotuneCoordinatorRecognized(summary) &&
 			    summary.state === 'recovery_required')
-				throw new Error(_('Full Auto-Tune is restoring an earlier settings transaction. No second calibration was started.'));
+				throw autotuneNotStartedError(_('Full Auto-Tune is restoring an earlier settings transaction. No second calibration was started.'));
 			if (nativeAutotuneCoordinatorRecognized(summary) && summary.admission_enabled !== true)
-				throw new Error(_('Full Auto-Tune is temporarily not accepting work. No second calibration was started.'));
-			throw new Error(existingInstance === true ?
+				throw autotuneNotStartedError(_('Full Auto-Tune is temporarily not accepting work. No second calibration was started.'));
+			throw autotuneNotStartedError(existingInstance === true ?
 				_('Full Auto-Tune is unavailable or has an incompatible protocol. No fallback calibration was started.') :
 				_('New-instance Full Auto-Tune is unavailable or has an incompatible protocol. No fallback calibration was started.'));
 		}
@@ -5385,9 +5408,14 @@ function multiwanAutotuneItemCanSkip(item, running) {
 	return !!item && running !== true && item.recovery_pending !== true;
 }
 
-function recordAutotuneTerminalFailure(state, result, message) {
+function recordAutotuneTerminalFailure(state, result, message, notStarted) {
 	clearAutotuneProposalState(state);
-	state.autotune_diagnostics = result && Object.keys(result).length &&
+	state.autotune_diagnostics = notStarted ? {
+		state: 'not_started',
+		not_started: true,
+		error: message || _('Full Auto-Tune did not start.'),
+		configuration_written: false
+	} : result && Object.keys(result).length &&
 		!nativeAutotunePublicResultValidated(result) ? result : {
 		state: 'failed',
 		error: message || _('Full Auto-Tune failed.'),
@@ -5469,9 +5497,40 @@ var AUTOTUNE_STOP_EXPLANATIONS = {
 	'native-autotune-deadline-expired': _('The test did not finish within its 45-minute limit.')
 };
 
+// Start refusals whose daemon text is internal protocol detail.
+function autotuneStartRefusalExplanation(error) {
+	if (/schema|lifecycle|canonical|protocol|header|unsupported operation request/i.test(String(error || '')))
+		return _('The calibration service did not accept the request from this page. Install the same release of cake-autorate-rs and its LuCI app, reload the page and try again.');
+	return null;
+}
+
+function renderAutotuneKeepButton(closeLabel) {
+	return E('div', { 'style': 'margin-top:8px' }, [
+		E('button', { 'type': 'button', 'class': 'btn cbi-button cake-autotune-keep-current',
+			'click': function() { ui.hideModal(); } }, [ cakeUi.text(closeLabel) ])
+	]);
+}
+
 function renderAutotuneDiagnostics(result, closeLabel) {
 	if (nativeAutotunePublicResultValidated(result))
 		return renderNativeAutotuneDiagnostics(result);
+
+	if (result && result.not_started) {
+		var explanation = autotuneStartRefusalExplanation(result.error);
+		var startNodes = [
+			E('strong', {}, _('The test did not start. Nothing was measured and no test traffic was used.')),
+			E('p', { 'style': 'white-space:normal;margin:6px 0 0' },
+				cakeUi.text(explanation || result.error || _('Full Auto-Tune did not start.'))),
+			E('p', { 'style': 'white-space:normal;margin:6px 0 0' },
+				cakeUi.text(_('Your current settings are unchanged. Fix the cause and run the test again, or keep the current settings.')))
+		];
+		if (explanation && result.error)
+			startNodes.push(E('p', { 'style': 'white-space:normal;margin:6px 0 0;font-size:12px' },
+				cakeUi.text(_('Details: %s').format(result.error))));
+		if (closeLabel)
+			startNodes.push(renderAutotuneKeepButton(closeLabel));
+		return E('div', { 'class': 'alert-message warning cake-autotune-stopped cake-autotune-not-started' }, startNodes);
+	}
 
 	var terminal = autotuneTypedTerminalDiagnostic(result);
 	var stopCode = result && (result.diagnostic_code || result.reason);
@@ -5498,10 +5557,7 @@ function renderAutotuneDiagnostics(result, closeLabel) {
 	if (result && nativeServerComparisonValidated(result.server_comparison_diagnostic, true))
 		nodes.push(renderNativeServerComparison(result.server_comparison_diagnostic, true));
 	if (closeLabel)
-		nodes.push(E('div', { 'style': 'margin-top:8px' }, [
-			E('button', { 'type': 'button', 'class': 'btn cbi-button cake-autotune-keep-current',
-				'click': function() { ui.hideModal(); } }, [ cakeUi.text(closeLabel) ])
-		]));
+		nodes.push(renderAutotuneKeepButton(closeLabel));
 	return E('div', { 'class': 'alert-message warning cake-autotune-stopped' }, nodes);
 }
 function replaceNodeContent(node, children) {
@@ -6167,8 +6223,11 @@ function showCreateWizard(grid, name, existingName) {
 						itemState.autotune_diagnostics = result;
 						itemState.autotune_background_block = result;
 					}
-					else
-						recordAutotuneTerminalFailure(itemState, result || {}, item.error);
+					else {
+						recordAutotuneTerminalFailure(itemState, result || {}, item.error, err.autotuneNotStarted === true);
+						if (err.autotuneNotStarted === true)
+							item.diagnostics = itemState.autotune_diagnostics;
+					}
 					item.status = 'review';
 					render();
 				});
@@ -6344,7 +6403,9 @@ function showCreateWizard(grid, name, existingName) {
 						_('Full Auto-Tune Review is ready. Choose an exact option and confirm its listed trade-offs below.') :
 					(autotuneRetryableInconclusive(state.autotune_diagnostics) ?
 						_('Calibration was inconclusive. Retry when ready; this result cannot be reviewed or applied.') :
-						_('Calibration did not validate. Review the diagnostics; this result cannot be applied.'))) : ''));
+					(state.autotune_diagnostics.not_started ?
+						_('The test did not start. Nothing was measured.') :
+						_('Calibration did not validate. Review the diagnostics; this result cannot be applied.')))) : ''));
 		var progress = E('progress', {
 			'max': '100',
 			'value': state.autotune_progress || '0',
@@ -6469,9 +6530,10 @@ function showCreateWizard(grid, name, existingName) {
 						showError(_('A trustworthy idle baseline could not be established. Retry when this uplink is quieter; conservative mode is unavailable for this stage.'));
 					}
 				} else {
-					recordAutotuneTerminalFailure(state, result, err.message || String(err));
+					recordAutotuneTerminalFailure(state, result, err.message || String(err), err.autotuneNotStarted === true);
 					render();
-					showError(_('Full Auto-Tune failed: %s').format(state.autotune_failure_message));
+					showError((err.autotuneNotStarted === true ? _('Full Auto-Tune did not start: %s') :
+						_('Full Auto-Tune failed: %s')).format(state.autotune_failure_message));
 				}
 			});
 		};

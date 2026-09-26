@@ -113,7 +113,21 @@ sources.liteStatus = fs.readFileSync(path.resolve(__dirname,
 					throw new Error('a stopped test must say the settings are unchanged, explain why, and offer to keep them');
 				if (settings.renderAutotuneDiagnostics({ state: 'failed' }).querySelector('.cake-autotune-keep-current'))
 					throw new Error('the keep button appears only where the caller can close the wizard');
+				const notStarted = settings.renderAutotuneDiagnostics({ state: 'not_started', not_started: true,
+					error: 'calibration control operation schema does not match its target lifecycle' }, 'Keep current settings');
+				if (!notStarted.textContent.includes('The test did not start') ||
+				    !notStarted.textContent.includes('no test traffic was used') ||
+				    !notStarted.textContent.includes('same release') ||
+				    !notStarted.textContent.includes('Details: calibration control operation schema') ||
+				    notStarted.textContent.includes('stopped early') ||
+				    !notStarted.querySelector('.cake-autotune-keep-current'))
+					throw new Error('a refused start must say nothing ran, explain the cause and offer to keep the settings');
+				const plainRefusal = settings.renderAutotuneDiagnostics({ state: 'not_started', not_started: true,
+					error: 'Full Auto-Tune is temporarily not accepting work.' });
+				if (!plainRefusal.textContent.includes('temporarily not accepting work') || plainRefusal.textContent.includes('Details:'))
+					throw new Error('a readable refusal is shown as is, without a duplicate details line');
 			}
+			verify('autotune-not-started', settings.renderAutotuneDiagnostics({ not_started: true, error: payload }), payload);
 			const trafficDiagnostic = settings.renderAutotuneDiagnostics({ diagnostic: payload, traffic: {
 				schema_version: 1, policy: 'capped', limit_bytes: 32000000000,
 				consumed_bytes: 16381000000, remaining_bytes: 15619000000, overrun_bytes: 0,
@@ -233,13 +247,21 @@ sources.liteStatus = fs.readFileSync(path.resolve(__dirname,
 				if (settings.autotuneTrafficPolicyForRun(state, 'fixture_one').mode !== 'unlimited' || preferenceWrites !== 0)
 					throw new Error('one-run unlimited choice was not explicit');
 				remember.checked = true; remember.dispatchEvent(new Event('change'));
+				control.querySelector('.cake-autotune-server-retries').value = '4';
 				if (preferenceWrites !== 0) throw new Error('preference written before explicit start');
-				settings.autotuneTrafficPolicyForRun(state, 'fixture_one');
+				if (settings.autotuneTrafficPolicyForRun(state, 'fixture_one').server_failure_retries !== 4)
+					throw new Error('the displayed retry count must reach the launch policy');
 				if (preferenceWrites !== 1) throw new Error('explicit remembered preference missing');
+				if (JSON.parse(preferences.get('cake-autorate-autotune-traffic-v1:fixture_one')).server_failure_retries !== 4)
+					throw new Error('Remember must also save the retry count');
 				const other = settings.autotuneTrafficPolicyControl(Object.assign({}, state), 'fixture_two', false);
 				if (other.querySelector('select').value !== '') throw new Error('traffic preference crossed instance boundary');
+				if (other.querySelector('.cake-autotune-server-retries').value !== '2')
+					throw new Error('another instance must start from the default retry count');
 				const restored = settings.autotuneTrafficPolicyControl({}, 'fixture_one', false);
 				if (restored.querySelector('select').value !== 'unlimited') throw new Error('remembered choice was not restored');
+				if (restored.querySelector('.cake-autotune-server-retries').value !== '4')
+					throw new Error('remembered retry count was not restored');
 				mode.value = 'capped'; mode.dispatchEvent(new Event('change'));
 				remember.checked = false;
 				amount.value = '15.749999999';
@@ -334,7 +356,7 @@ sources.liteStatus = fs.readFileSync(path.resolve(__dirname,
 			return { positiveControl: true, cases };
 		}, sources);
 		assert.equal(result.positiveControl, true);
-		assert.equal(result.cases.length, 26);
+		assert.equal(result.cases.length, 27);
 		assert.ok(result.cases.includes('failed-server-comparison-diagnostic'));
 		assert.ok(result.cases.includes('autotune-traffic-terminal-diagnostic'));
 		assert.ok(result.cases.includes('traffic-policy-choice-and-instance-scope'));

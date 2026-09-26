@@ -2716,6 +2716,44 @@ async function testNativeAutotuneTransport() {
 		});
 		assert.equal(timeoutCalls.length, 3,
 			'an ambiguous native start timeout must not retry with the legacy mutating backend');
+		await assert.rejects(timeoutHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy), err => {
+			assert.notEqual(err.autotuneNotStarted, true, 'a lost start reply is not proof that nothing ran');
+			return true;
+		});
+		{
+			const refusedHelpers = compileHelpers({
+				exec(command, args) {
+					if (args[1] === 'summary')
+						return Promise.resolve({ stdout: JSON.stringify(capability) });
+					if (args[1] === 'autotune-current')
+						return Promise.resolve({ stdout: JSON.stringify({ state: 'idle', instance: 'wan_sqm' }) });
+					return Promise.resolve({ stdout: JSON.stringify({
+						error: 'calibration control operation schema does not match its target lifecycle' }) });
+				},
+			});
+			await assert.rejects(refusedHelpers.runPreferredAutotuneJob(
+				'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+				'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy), err => {
+				assert.equal(err.autotuneNotStarted, true, 'a refused start measured nothing');
+				assert.match(err.message, /target lifecycle/);
+				return true;
+			});
+			await assert.rejects(recoveryHelpers.runPreferredAutotuneJob(
+				'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+				'best_overall', false, 'shaped_only', null, true), err => {
+				assert.equal(err.autotuneNotStarted, true, 'a recovery refusal starts nothing');
+				return true;
+			});
+			const notStartedState = {};
+			helpers.recordAutotuneTerminalFailure(notStartedState, {}, 'refused', true);
+			assert.deepEqual(notStartedState.autotune_diagnostics, {
+				state: 'not_started', not_started: true, error: 'refused', configuration_written: false });
+			const failedState = {};
+			helpers.recordAutotuneTerminalFailure(failedState, {}, 'broken');
+			assert.equal(failedState.autotune_diagnostics.state, 'failed');
+		}
 		const abortStartCalls = [];
 		const abortStartHelpers = compileHelpers({
 			exec(command, args) {
