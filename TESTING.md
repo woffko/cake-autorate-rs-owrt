@@ -60,6 +60,34 @@ verified for the same 12 ABIs.
   CLI-only speedtest-go package fits where the previous 25 MB package failed
   with ENOSPC; Full Raw Auto-Tune reached Review (accounting 99.3%).
 
+### Auto-Tune robustness (server failures, raw controls, early stops, Gaming)
+
+- Server failure retries: on the VM, TCP resets for the backend's user for
+  5 s during a search measurement produced two logged retries
+  (`speedtest-backend-failed`); the third attempt succeeded and the run
+  reached Review. With 15 s of resets the retries were exhausted and the
+  measurement was reported as unmeasurable instead of a terminal failure.
+  Unit tests cover the retry limit (0–10), the request schema family and
+  evidence replay up to eleven charged attempts.
+- Raw control below the server comparison: with the raw upload control
+  throttled to about 120 Mbit/s against a 317 Mbit/s comparison, the Full Raw
+  run continued to Review; every option carried
+  `upload-raw-below-server-comparison`, and the read-only Apply check
+  returned `confirmation_ready` with the same acknowledgement list.
+- Early stop: a DOM test checks that a stopped test states that the current
+  settings are unchanged, explains the reason and offers to keep them.
+- Re-calibration of an already tuned PPPoE instance on the x86_64 router
+  reached Review with two options instead of stopping: a shaped option at
+  about 904/913 Mbit/s that needed no acknowledgements, and a preselected
+  no-shaping option. Accounting was 98% of interface counters.
+- Gaming on the LTE router: the first candidate's samples did not repeat
+  within 5%, so the search stepped down (to 219, 179, 159, 149 and
+  144 Mbit/s download) instead of falling back to the raw result. Review
+  offered a recommended lowest-delay option and a throughput-first option
+  with a higher upload rate, each listing the capacity and latency
+  acknowledgements it needs. Accounting was 99.6% of interface counters, and
+  the CAKE topology was restored.
+
 ### Known limits
 
 - IPv6-only uplinks are not supported.
