@@ -292,11 +292,11 @@ impl AutotuneProfile {
         direction: SearchDirection,
     ) -> f64 {
         match (self, variable) {
-            // Standard Gaming never explores below its 70% retention
-            // objective. Deeper sacrifices require the explicit Extreme A+
-            // opt-in and remain manual-only below this boundary.
-            (Self::Gaming, _) => 0.70,
-            (Self::GamingExtreme, _) => match direction {
+            // Gaming puts latency first: like Extreme A+ it may search a wide
+            // link down to a capacity-aware floor. Results below the 70%
+            // retention objective stay manual-only, and Review still offers
+            // the highest-throughput option next to the lowest-latency one.
+            (Self::Gaming | Self::GamingExtreme, _) => match direction {
                 SearchDirection::Download if observed_low_kbps >= 500_000.0 => 0.25,
                 SearchDirection::Download if observed_low_kbps >= 100_000.0 => 0.40,
                 SearchDirection::Download if observed_low_kbps >= 25_000.0 => 0.55,
@@ -563,10 +563,12 @@ impl AutotuneProposal {
     ) -> Result<(), String> {
         if !matches!(
             profile,
-            AutotuneProfile::VariableLink | AutotuneProfile::GamingExtreme
+            AutotuneProfile::VariableLink
+                | AutotuneProfile::Gaming
+                | AutotuneProfile::GamingExtreme
         ) {
             return Err(
-                "measured runtime minimum overrides require variable_link or gaming_extreme"
+                "measured runtime minimum overrides require variable_link, gaming or gaming_extreme"
                     .to_string(),
             );
         }
@@ -4651,11 +4653,13 @@ pub fn optimize_profile_direction(
                 reason = "transport-deadline-censored-review";
             }
         }
-        let runtime_minimum_index = if input.profile == AutotuneProfile::GamingExtreme
-            && matches!(
-                action,
-                ProfileSearchAction::Complete | ProfileSearchAction::Fallback
-            ) {
+        let runtime_minimum_index = if matches!(
+            input.profile,
+            AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme
+        ) && matches!(
+            action,
+            ProfileSearchAction::Complete | ProfileSearchAction::Fallback
+        ) {
             input
                 .observations
                 .iter()
@@ -5108,8 +5112,10 @@ pub fn terminate_profile_direction_at_measured_boundary(
     result.next_candidate_kbps = None;
     result.selected_index = selected_index;
     result.metrics = metrics.clone();
-    result.runtime_minimum_index = if input.profile == AutotuneProfile::GamingExtreme
-        && action == ProfileSearchAction::Fallback
+    result.runtime_minimum_index = if matches!(
+        input.profile,
+        AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme
+    ) && action == ProfileSearchAction::Fallback
     {
         input
             .observations
@@ -6943,7 +6949,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_gaming_never_explores_below_seventy_percent() {
+    fn gaming_explores_the_same_capacity_aware_floor_as_extreme() {
         let proposal = build_proposal_for_profile(
             &[1_000_000.0, 1_000_000.0, 1_000_000.0],
             &[200_000.0, 200_000.0, 200_000.0],
@@ -6956,8 +6962,10 @@ mod tests {
             AutotuneProfile::Gaming,
         )
         .unwrap();
-        assert_eq!(proposal.download.minimum_kbps, 700_000);
-        assert_eq!(proposal.upload.minimum_kbps, 140_000);
+        // Latency first: a wide link may be searched down to 25%; options
+        // below the 70% retention objective stay manual-only.
+        assert_eq!(proposal.download.minimum_kbps, 250_000);
+        assert_eq!(proposal.upload.minimum_kbps, 60_000);
     }
 
     #[test]

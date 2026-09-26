@@ -3035,7 +3035,7 @@ function autotuneProfileDefinitions() {
 			id: 'gaming',
 			title: _('Gaming'),
 			target: _('Target A+ · under 5 ms loaded-latency increase'),
-			description: _('Lowest latency: the highest rate that still earns A+, or the best grade found. Auto-Apply needs 70% of measured throughput kept; below that, or below 50% of earlier results, Review asks you. Uses diffserv4 and keeps incoming DSCP.')
+			description: _('Lowest latency: the highest rate that still earns A+, or the best grade found, searching down to 25% of capacity on wide links. The fastest measured option is offered too. Auto-Apply needs 70% of measured throughput kept; below that, or below 50% of earlier results, Review asks you. Uses diffserv4.')
 		},
 		{
 			id: 'gaming_extreme',
@@ -3210,29 +3210,12 @@ function storedAutotuneProfile(value) {
 		'gaming' : canonicalAutotuneProfile(value);
 }
 
-function autotuneExtremeGamingControl(state, disabled, onChange) {
-	if (visibleAutotuneProfile(state && state.autotune_profile) !== 'gaming')
-		return E('div', { 'style': 'display:none' });
-	return E('div', {
-		'class': 'alert-message warning',
-		'style': 'margin:8px 0 0'
-	}, [
-		E('label', { 'style': 'display:flex;align-items:flex-start;gap:8px;font-weight:600' }, [
-			E('input', {
-				'type': 'checkbox',
-				'checked': state.autotune_extreme_a_plus === true ? 'checked' : null,
-				'disabled': disabled ? 'disabled' : null,
-				'change': function(ev) {
-					state.autotune_extreme_a_plus = !!ev.currentTarget.checked;
-					if (onChange)
-						onChange();
-				}
-			}),
-			E('span', {}, _('Enable Extreme A+ search for this run'))
-		]),
-		E('div', { 'style': 'margin:5px 0 0 25px' },
-			_('Wide links may be tested down to a capacity-aware 25% floor only when searching for A+. Results below 70% retention are manual-only and are not recommended for continuous household use. Narrow links keep a higher floor.'))
-	]);
+function autotuneExtremeGamingControl(state) {
+	// Gaming itself now searches down to the capacity-aware floor, so the
+	// separate Extreme A+ opt-in is no longer offered.
+	if (state)
+		state.autotune_extreme_a_plus = false;
+	return E('div', { 'style': 'display:none' });
 }
 
 function autotuneProfileGrid(buttons) {

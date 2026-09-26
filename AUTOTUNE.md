@@ -301,10 +301,11 @@ the search may reduce that rate even if doing so moves farther below an older
 its queue in the modem, which defeats SQM.
 No profile silently lowers its objective to manufacture unattended eligibility.
 
-Gaming also exposes a wizard-only **Extreme A+ search** opt-in. It does not
-become a persistent or scheduled profile. Ordinary Gaming never explores
-below 70% of the conservative raw reference. Extreme A+ may explore wider
-links more deeply using these direction-specific floors:
+Gaming puts latency first and explores wider links more deeply using these
+direction-specific floors (formerly the separate Extreme A+ opt-in, which the
+wizard no longer offers; `gaming_extreme` requests behave the same way).
+Options below 70% of the conservative raw reference stay manual-only, and the
+option catalog still includes the highest-throughput candidate:
 
 | Conservative raw reference | Download exploration floor | Upload exploration floor |
 |---:|---:|---:|

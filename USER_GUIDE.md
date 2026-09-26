@@ -93,10 +93,10 @@ form. See the current [categorized Autorate setup](docs/screenshots/settings-aut
 calibration profiles,
 then measures the selected uplink and presents diagnostics before anything is
 written to UCI. Multi-WAN calibration keeps the route and evidence separate for
-each selected uplink. Gaming additionally has a one-run **Extreme A+ search**
-for wide links: it accepts only measured A+ minima, disables Auto-Apply below
-70% retained capacity, and warns that such a throughput sacrifice is intended
-for short latency-critical sessions rather than continuous household use.
+each selected uplink. Gaming puts latency first: on wide links it may search
+down to 25% of capacity to reach A+. Review also offers the fastest measured
+option, and anything that keeps less than 70% of the measured throughput is
+manual-only. (The former separate Extreme A+ opt-in is no longer needed.)
 
 Variable link opens a small access/capacity wizard instead of guessing the
 provider medium from an Ethernet or PPPoE handoff. QMI/MBIM/NCM and modem-like

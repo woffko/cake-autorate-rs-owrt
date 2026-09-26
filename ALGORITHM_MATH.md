@@ -255,7 +255,7 @@ exploration_cap     = maximum
 
 | Profile | Stable exploration minimum factor | Variable exploration minimum factor |
 |---|---|---|
-| Gaming | 0.70 | 0.70 |
+| Gaming | capacity-aware 0.25–0.70 | capacity-aware 0.25–0.70 |
 | Best overall | 0.70 | 0.40 |
 | Variable link | Medium-dependent floor | Medium-dependent floor |
 | Fair | 0.35 | 0.35 |
@@ -268,7 +268,7 @@ server/path saturated the line's available capacity.
 The exploration minimum is not proof of an enforced runtime minimum or a
 tested-safe ceiling. Those require later shaped measurements and provenance.
 
-Explicit Gaming Extreme A+ uses deeper exploration floors: DL factors are
+Gaming (and the older explicit Extreme A+) uses these capacity-aware floors: DL factors are
 0.25/0.40/0.55/0.70 for `L >= 500000 / >= 100000 / >= 25000 / below 25000`
 kbit/s; UL factors are 0.25/0.30/0.50/0.70 at thresholds 500000/100000/20000.
 This does not change the initial base/cap rule or grant unattended acceptance
