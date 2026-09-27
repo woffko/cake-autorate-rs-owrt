@@ -28,10 +28,14 @@ the original cake-autorate concept.
 
 Substantial parts of this port were written and reviewed with OpenAI Codex and
 Google Gemini working as paired development assistants. Anthropic Claude Opus
-was also used for additional deep bug analysis and independent review. The
-human project author defined the requirements and product logic, made the
-design and safety decisions, controlled access to test equipment, reviewed the
-results, and retained final authority over every accepted change. The
+was also used for additional deep bug analysis and independent review, and for
+the RC27 r320/r128 release it did a substantial part of the work itself: the
+Auto-Tune server switch, the CAKE options after an incomplete search, the
+related mwan3 and runtime-restore fixes, and the release documentation,
+screenshots and package verification. The human project author defined the
+requirements and product logic, made the design and safety decisions,
+controlled access to test equipment, reviewed the results, and retained final
+authority over every accepted change. The
 assistants provided implementation, analysis, testing, and independent review;
 project ownership and responsibility remain with the human author.
 
