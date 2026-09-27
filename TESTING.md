@@ -6,26 +6,30 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
-## Current source acceptance
+## RC27 r320/r128 release acceptance
 
-This summary covers the development source after the RC27 r318/r127 release
-(audit remediation of commit 074e221, September 2026). It is not a release
-announcement; publication has its own package, checksum and manifest checks.
+This summary covers the RC27 r320/r128 release (daemon r320, Full LuCI r128,
+Lite r320/r8, speedtest-go 1.7.10-r5), built after the audit remediation of
+commit 074e221 in September 2026.
 
 ### Source gate
 
-Every change passes one scripted source gate: Full and Lite Rust tests,
-formatting, LuCI JavaScript unit tests, TypeScript checks, a real-Chromium DOM
-text-safety test, shell syntax, the speedtest-go backend patch tests and a
-hash of all sources before and after the run. A gate is void if any source
-changes while it runs.
+Every change passes one scripted source gate of 53 commands: Full (1,777) and
+Lite (419) Rust tests, formatting, LuCI JavaScript unit tests, TypeScript
+checks, a real-Chromium DOM text-safety test, shell syntax, the speedtest-go
+backend patch tests and a hash of all sources before and after the run. A gate
+is void if any source changes while it runs.
 
 ### Package matrix
 
 Full, Full LuCI and Lite LuCI packages are built in the OpenWrt 25.12 SDK for
 all 12 ABIs and verified for payload, metadata, dependencies and ELF
-interpreter/ABI. The speedtest-go backend (1.7.10-r5, CLI only) is built and
-verified for the same 12 ABIs.
+interpreter/ABI; the LuCI payloads are identical across all SDKs. The
+speedtest-go backend (1.7.10-r5, CLI only) is built from the repository recipe
+after its race-detector patch tests and verified for the same 12 ABIs. The
+release set (38 APKs) is bound to its source commit by `release-manifest.json`,
+`matrix-report.json` and `SHA256SUMS`, and the new history, the decoded
+payloads and the public metadata pass a pinned secret scan.
 
 ### VM acceptance (x86_64, OpenWrt 25.12)
 
@@ -99,7 +103,7 @@ verified for the same 12 ABIs.
   the download search measurements, acknowledging
   `upload-search-incomplete` and `upload-shaped-load-unmeasured`, plus
   SQM disabled as a non-preferred option.
-- PPPoE router with mwan3 (10.0.77.1), LuCI wizard, Gaming, Full raw,
+- x86_64 PPPoE router with mwan3, LuCI wizard, Gaming, Full raw,
   Unlimited, 2 retries: the run reached a complete Review with
   `recommended` (both shaped, 845.9/901.2 Mbit/s, class A+, Auto-Apply checks
   passed) and `bypass_download`. No switch was needed on server 12456, no

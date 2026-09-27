@@ -167,6 +167,23 @@ Implemented:
   retention, latency or topology exceptions are explicit-review only. No
   acknowledgement can weaken route, SQM ownership, loss/latency, measurement,
   or runtime-restoration gates.
+- Full Auto-Tune tolerates unreliable public servers. It first compares up to
+  six servers with repeated full-rate runs and keeps every stable source
+  within 80% of the best. A failed or timed-out run is retried (0–5 times,
+  default 2; each retry counts against the traffic budget). When every retry
+  fails, that direction moves to the next qualified server and all
+  measurement phases restart on the new server combination, so no comparison
+  mixes two servers in one direction (at most four switches per run). A raw
+  control below 80% of the comparison no longer ends the run; its options
+  carry an explicit acknowledgement. When a search still ends without a
+  selection, Review keeps the exact measured CAKE rate pairs (lowest latency
+  and highest throughput) next to SQM disabled, each listing what could not
+  be measured. See [AUTOTUNE.md](AUTOTUNE.md).
+- An mwan3 member whose tracker reports `disconnecting` still carries the
+  route, so short tracker flaps neither pause autorate control nor restore a
+  running Auto-Tune; only `connecting` and `offline` revoke admission. A
+  runtime restore of the running control during a measurement re-arms and
+  repeats that measurement instead of failing the run.
 - Optional scheduled Full Auto-Tune, disabled by default, adds a quiet-time
   gate, maintenance window, interval, RAM-only daily byte budget, and explicit
   review-only versus validated auto-apply mode. Unattended apply requires a

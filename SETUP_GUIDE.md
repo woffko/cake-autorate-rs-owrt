@@ -81,10 +81,13 @@ latency probes and adaptive ceiling remain available.
 4. Stop large downloads and uploads first. The strict run measures idle ICMP
    across three independent reflector families, persistent transport latency,
    one bidirectional control plus repeated direction-only capacity controls,
-   and a bounded per-direction shaped search. Retries and server replacement
-   may repeat a control, so traffic use is bounded by the selected job budget,
-   not by a fixed transfer count. Forwarded client traffic is accounted
-   separately during every heavy phase.
+   and a bounded per-direction shaped search. Choose **Total test traffic**
+   (Unlimited, a preset or your own total) and **Retries after a server
+   failure** (default 2). If a server keeps failing after its retries, that
+   direction moves to another server from the comparison and the measurements
+   restart there. Retries and server switches repeat measurements, so traffic
+   use is bounded by the selected job budget, not by a fixed transfer count.
+   Forwarded client traffic is accounted separately during every heavy phase.
 5. If background traffic blocks calibration, prefer **Retry when quiet**. The
    explicit **Continue conservatively** action applies to that run only: it
    subtracts measured background with an extra margin, never raises confirmed
@@ -262,7 +265,7 @@ The documentation includes anonymized
 [desktop](docs/screenshots/traffic-priorities-desktop.png),
 [mobile](docs/screenshots/traffic-priorities-mobile.png), and
 [Custom editing](docs/screenshots/traffic-priorities-custom.png) examples from
-the isolated test router.
+the test VM.
 
 ## Multi-WAN rules
 

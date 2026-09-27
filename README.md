@@ -121,9 +121,11 @@ Full (example for `aarch64_generic`; use the exact file names from the release):
 ```sh
 cd /root
 apk add --allow-untrusted --simulate \
-  speedtest-go-*.apk cake-autorate-rs-*_aarch64_generic.apk luci-app-cake-autorate-rs-[0-9]*.apk
+  speedtest-go-*_aarch64_generic.apk cake-autorate-rs-1.0_*_aarch64_generic.apk \
+  luci-app-cake-autorate-rs-[0-9]*.apk
 apk add --allow-untrusted \
-  speedtest-go-*.apk cake-autorate-rs-*_aarch64_generic.apk luci-app-cake-autorate-rs-[0-9]*.apk
+  speedtest-go-*_aarch64_generic.apk cake-autorate-rs-1.0_*_aarch64_generic.apk \
+  luci-app-cake-autorate-rs-[0-9]*.apk
 ```
 
 Lite:

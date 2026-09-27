@@ -17,7 +17,7 @@ below shows a cellular uplink with upload-only shaping and the honest
 complete passive or guided capture, **LAST KNOWN** preserves that DL/UL grade;
 an incomplete or contaminated attempt never replaces it.
 
-[![Status overview for a cellular uplink with upload-only shaping](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
+[![Status overview with installed versions, services and quality for one uplink](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
 
 ### Display preferences and service actions
 
@@ -59,7 +59,7 @@ job and worker identity, while closing during an in-flight Start receipt still
 cancels the exact admitted job. Raw lease/debug identities are never shown to
 the user.
 
-[![Guided Rating reconnected to the active per-instance job](docs/screenshots/rating-guided.png)](docs/screenshots/rating-guided.png)
+[![Get rating dialog in guided client-capture mode](docs/screenshots/rating-guided.png)](docs/screenshots/rating-guided.png)
 
 ## Graphs
 
@@ -127,7 +127,7 @@ fixed-wireless access, Full raw capacity also attempts a download-unshaped /
 upload-shaped result. If that control cannot satisfy the hard evidence gates,
 the card remains visible but disabled with its exact reason.
 
-[![Full Auto-Tune Review with four measured options and one aggregate confirmation](docs/screenshots/autotune-review-options.png)](docs/screenshots/autotune-review-options.png)
+[![Full Auto-Tune Review with a measured option and one aggregate trade-off confirmation](docs/screenshots/autotune-review-options.png)](docs/screenshots/autotune-review-options.png)
 
 ### Controlled cellular observations (anonymized)
 
@@ -387,6 +387,8 @@ were running during that measurement. Their confirmations list what could not
 be measured, for example that upload was never tested under load with CAKE at
 that rate. **SQM disabled** is still offered. Gaming preselects the lowest
 latency; the other profiles preselect the higher throughput.
+
+[![Review after an incomplete upload search: two measured CAKE options and SQM disabled](docs/screenshots/autotune-review-incomplete-search.png)](docs/screenshots/autotune-review-incomplete-search.png)
 
 ## Explicit policy route
 
