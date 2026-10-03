@@ -434,13 +434,15 @@ See [Profile traffic priorities](TRAFFIC_PRIORITIES.md) for the rule model.
 
 ## Optional MQTT publisher
 
-The Logging tab of an instance can publish telemetry to an MQTT broker, for
-example for Home Assistant. Enable **MQTT publisher**, set the broker host and,
-if needed, the user name and password. The publisher also needs **Log to file**
-and summary statistics. **Check MQTT** shows whether the saved settings are
-ready; save pending edits first. For a TLS broker it also opens a TLS session
-with the saved address and says whether the certificate is accepted; it sends
-no user name, password or data, and it does not contact a plain MQTT broker.
+An instance can publish telemetry to an MQTT broker, for example for Home
+Assistant. The settings are on the **Monitoring** tab of the instance (turn on
+**Show expert options** to see them). Enable **MQTT publisher**, set the broker
+host and, if needed, the user name and password. The publisher also needs **Log
+to file** and summary statistics. **Check MQTT** shows whether the applied
+settings are ready, so apply pending edits first. For a TLS broker it also opens
+a TLS session with the configured address and says whether the certificate is
+accepted; it sends no user name, password or data, and it does not contact a
+plain MQTT broker.
 
 ### Encryption (TLS)
 

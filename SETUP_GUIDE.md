@@ -373,10 +373,12 @@ scp mqtt-ca.crt root@router:/etc/ssl/mqtt-ca.pem
 ssh root@router 'chown root:root /etc/ssl/mqtt-ca.pem; chmod 644 /etc/ssl/mqtt-ca.pem'
 ```
 
-In LuCI, on the Logging tab of the instance, set **MQTT host** to the name in
-the certificate (`broker.lan`), turn **MQTT TLS** on, leave **MQTT port** empty
-(8883) or set it to the listener port, and set **MQTT CA file** to
-`/etc/ssl/mqtt-ca.pem`. Press **Check MQTT**, then save and apply. With UCI:
+In LuCI, on the Monitoring tab of the instance (with **Show expert options**
+on), set **MQTT host** to the name in the certificate (`broker.lan`), turn
+**MQTT TLS** on, leave **MQTT port** empty (8883) or set it to the listener
+port, and set **MQTT CA file** to `/etc/ssl/mqtt-ca.pem`. Save and apply, then
+press **Check MQTT**: it opens a TLS session with the broker and tells whether
+the certificate is accepted. With UCI:
 
 ```sh
 uci set cake-autorate.wan.mqtt_host='broker.lan'
