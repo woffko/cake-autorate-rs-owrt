@@ -139,5 +139,7 @@ assert.doesNotMatch(text({ tls: true, tls_verify: true, tls_ca_file: true, tls_h
     /handshake/);
 assert.doesNotMatch(text({ tls: false, tls_handshake: 'ok' }), /handshake/);
 assert.match(description('_mqtt_status'), /no user name, password or data is sent/);
+assert.match(description('_mqtt_status'), /Save and apply pending MQTT edits/);
+assert.match(description('mqtt_tls_ca_file'), /read when the publisher starts/);
 
 console.log('MQTT TLS settings: defaults, upgrade display, dependencies, notices and status lines passed');
