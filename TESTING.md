@@ -286,3 +286,146 @@ manifest now states the setting; the packages are unchanged.
   has synchronised.
 - Lite and the physical routers were not run for these changes beyond the source
   gate.
+
+## Changes after RC27 r320/r128: MQTT over TLS (unreleased)
+
+These results cover the commits that add TLS to the native MQTT publisher
+(`mqtt_tls`, `mqtt_tls_ca_file`, `mqtt_tls_verify`), the LuCI settings for it,
+and the retry at start-up that the TLS work showed to be necessary. They were
+made on top of the commits in the previous sections.
+
+### Source gate and packages
+
+- Source gate, 54 commands: Full (1,810) and Lite (391) Rust tests, formatting,
+  LuCI JavaScript tests, TypeScript checks, real-UCI tests and a hash of 234
+  sources before and after the run, which did not change.
+- All twelve matrix architectures were built from that exact source in the
+  OpenWrt 25.12 SDK and verified for payload, metadata, dependencies and ELF
+  interpreter/ABI.
+- Size, compared with the build before the TLS work (the Full daemon already
+  contained rustls for the calibration client, so only the MQTT glue and the
+  trust-anchor handling are new): the Full binary file grows by 24 to 32 KiB
+  on x86_64 and ARM (0.4%) and by one 64 KiB step on MIPS (0.7%). On aarch64
+  the file size does not change because its segments are aligned to 64 KiB;
+  the read-only segment grows by 22 KB. The Full package grows by 12.9 to
+  16.6 KB on every architecture (0.39% to 0.46%). The Lite daemon has no MQTT
+  and is unchanged on every architecture. `rcgen`, which makes the test
+  certificates, is a development dependency: it is in `Cargo.lock` but is not
+  compiled into any package.
+
+### Tests without a router
+
+- 29 Rust tests run the publisher against a TLS server inside the test
+  process (rustls server, certificates made by `rcgen`):
+  - the whole MQTT conversation over TLS with a private CA, addressed by host
+    name and by IP address; a wrong CA; the built-in roots; an expired, a not
+    yet valid and a wrong-name certificate; verification switched off; a CA
+    file that is missing; a TLS client against a plain broker (the error says
+    that the port may not be TLS); a silent broker (the handshake gives up
+    after 5 s); a single self-signed certificate, with and without the CA flag;
+  - several MQTT packets in one TLS record: all of them are read in one
+    wake-up, none is left waiting in rustls's decrypted buffer, where `poll` on
+    the socket cannot see it;
+  - the status handshake: it completes the TLS handshake and sends no MQTT
+    packet, so no user name or password leaves the router;
+  - the CA file rules: absolute path of at most 1024 bytes, regular file, not a
+    symbolic link, owned by root, not writable by group or others, 1 byte to
+    1 MiB, at most 512 certificates (a bundle of 200 certificates is accepted;
+    the real 121-certificate bundle of the build host was also read once);
+  - the start-up retry: pauses of 5, 10, 20, 40 and 60 s, a stop request that
+    ends the wait at once, and the policy for repeating an unchanged error.
+- Upgrade invariant, checked against bytes recorded before the change:
+  - a configuration without `mqtt_tls` is plain MQTT on port 1883, a plain
+    broker's plan has exactly the bytes (version 1) that the release before TLS
+    wrote, and a plan file of that release on disk decodes and is unchanged
+    when the same configuration is planned again; a TLS plan uses version 2,
+    and every field that does not apply is dropped, so an unused TLS setting
+    cannot restart a publisher.
+- LuCI (JavaScript tests and a real browser): `mqtt_tls` is on by default for
+  new settings; a saved publisher without the option shows it off, with the
+  plain-MQTT notice (the A5 warning appears only then); the CA file and
+  Verify certificate fields, the unverified and port-1883 notices, the port
+  placeholder and the Check MQTT result lines.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+The brokers were a real Mosquitto 2.0.11 (OpenSSL 3.0.2) on the Linux test VM:
+one plain listener, four TLS listeners and a TLS 1.2-only proxy. The MQTT user
+and password were made up for the test. The run starts with the daemon of the
+Goal D candidate (no TLS), installs the candidate, and puts everything back at
+the end: the router configuration is byte-identical, no `mqtt_*` option is
+left, the clock is within a second of the host and NTP runs; Mosquitto is
+removed from the Linux VM. The run was made on the build of the previous
+source gate and again, after the last source change (the CA file limits and two
+corrected texts), on the final build (daemon `0e3efcca…`): 27 scenarios and 207
+checks, none failed in either run.
+
+- Upgrade: the plain publisher of the old daemon keeps its plan bytes after
+  the candidate is installed (same SHA-256), connects to port 1883 as before,
+  `--mqtt-status` reports `tls: false` and `not_checked` (the broker is not
+  contacted), and a `reload` with no change leaves the publisher alone. The
+  real-browser LuCI page for that legacy configuration shows TLS off.
+- TLS: with a CA file the publisher connects (TLS 1.3, and TLS 1.2 against the
+  1.2-only proxy) and the broker receives discovery, availability and state on
+  port 8883; without a CA file a private broker is refused (`UnknownIssuer`);
+  a wrong CA, a certificate for another name, a CA certificate used as the
+  broker's own (`CaUsedAsEndEntity`, with the hint to issue a CA:FALSE
+  certificate), a TLS client on a plain port (hint that the port is not TLS),
+  a missing CA file and a group-writable CA file are all refused with the
+  reason in the system log; the publisher stays the same process and keeps
+  retrying. Verification off connects and the log says that the certificate
+  was not verified. Every case was also checked with `--mqtt-status`.
+- Reload (what Save & Apply runs): switching to TLS, a different CA file path,
+  a changed verify flag and a changed port restart the publisher, and the
+  broker sees the new connection on the expected port; a reload with an
+  unchanged configuration restarts neither the publisher nor the controller,
+  for plain MQTT and for TLS; a publisher that cannot reach its broker (unknown
+  CA, refused port) no longer makes the reload fail or leaves the service
+  stopped (see below).
+- Broker: a lost connection ends the process and procd starts a new one; a
+  broker that is away for more than a minute does not restart the publisher,
+  which connects by itself when the broker is back; the last will (`offline`,
+  retained) is published after `kill -9`, a clean stop publishes `offline`
+  itself, and an idle publisher stays connected over TLS across the broker's
+  keepalive limit (100 s without any restart).
+- Clock (changed on the VM only, restored from the host afterwards): with the
+  router clock behind the certificate the log says `not valid yet`, with the
+  clock ahead `certificate expired`; the publisher keeps retrying as the same
+  process and connects by itself when the clock is right.
+
+### The reload hazard that the TLS work exposed
+
+With the daemon of the current release, `/etc/init.d/cake-autorate reload` (the
+command behind Save & Apply) fails with `MQTT startup deadline expired` and
+`native reload failed; inspect retained recovery state` when it restarts a
+publisher that cannot connect, for example a plain broker that refuses the
+connection, and the controller is left stopped. A later `start`, `reload` or a
+corrected configuration is refused with `uci-transaction-source-receipt-changed`
+until the router is rebooted. TLS makes the trigger much easier (an unknown CA,
+an expired certificate, a clock that is not set yet). The lifecycle waits for
+the publisher's start-up receipt and then needs the same process to be alive in
+procd, and a publisher that could not connect exited within milliseconds. The
+publisher now retries by itself when a start cannot reach the broker (5 s
+growing to 60 s) and only an established connection that is lost ends the
+process. It was reproduced on the test VM with the unchanged daemon of the
+current release (MQTT enabled, a broker address that nothing listens on,
+`uci commit`, `reload`), and the same failure followed in the first TLS
+candidate with a CA file that did not match the broker's certificate. With the
+final daemon both reloads succeed, the controller and the publisher stay up,
+and the publisher keeps retrying.
+
+### Known limits
+
+- The dates of the broker's certificate are judged by the router's clock. A
+  router that has not synchronised its time yet retries until it has.
+- The CA file is read when the publisher starts. After replacing it, restart
+  the service.
+- Client certificates, MQTT over WebSocket and brokers limited to TLS 1.1 or to
+  non-ECDHE cipher suites are not supported.
+- `--mqtt-status` tells the result of a handshake made when it is called; the
+  last error of the running publisher is only in the system log.
+- After a native reload that failed for some other reason, the lifecycle's
+  retained recovery state still asks for the exact sources of the failed
+  transaction, and only a reboot clears it. That was already so and is not
+  changed here.
+- Lite has no MQTT. The physical routers were not run for these changes.
