@@ -719,6 +719,7 @@ fn a_tls_client_does_not_hang_on_a_broker_that_is_not_tls() {
     .err()
     .unwrap();
     assert!(error.contains("MQTT TLS handshake failed"), "{error}");
+    assert!(error.contains("is this a TLS port?"), "{error}");
     broker.join().unwrap();
 }
 

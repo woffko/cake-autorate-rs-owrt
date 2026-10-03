@@ -201,8 +201,12 @@ pub(super) fn summary(stream: &TlsStream, verified: bool) -> String {
 fn describe(error: &io::Error) -> String {
     match error.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => "timed out".to_string(),
-        io::ErrorKind::UnexpectedEof => {
-            "the broker closed the connection (is this a TLS port?)".to_string()
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => {
+            "the broker closed the connection during the handshake (is this a TLS port?)"
+                .to_string()
         }
         _ => error.to_string(),
     }
