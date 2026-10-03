@@ -428,6 +428,17 @@ representative examples rather than guarantees.
 
 See [Profile traffic priorities](TRAFFIC_PRIORITIES.md) for the rule model.
 
+## Optional MQTT publisher
+
+The Logging tab of an instance can publish telemetry to an MQTT broker, for
+example for Home Assistant. Enable **MQTT publisher**, set the broker host and,
+if needed, the port, user name and password. The publisher also needs **Log to
+file** and summary statistics.
+
+The connection is plain MQTT without TLS (port 1883 by default). The user name,
+the password and the metrics are sent unencrypted, so use a broker on a trusted
+local network.
+
 ## Optional external IPv4 lookup
 
 External-address lookup is disabled by default in Full and Lite. Existing

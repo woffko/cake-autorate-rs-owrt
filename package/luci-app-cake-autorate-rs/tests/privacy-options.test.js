@@ -29,4 +29,9 @@ for (const variant of ['', '-lite']) {
     for (const key of ['external_ip_check_url', 'external_ip_check_interval_s'])
         assert.deepEqual(options[key].dependencies, [['external_ip_check_enabled', '1']]);
 }
+// The native MQTT publisher speaks plain MQTT: the settings must say so.
+const fullSource = fs.readFileSync(path.join(__dirname,
+    '../htdocs/luci-static/resources/view/cake-autorate-rs/settings.js'), 'utf8');
+assert.match(fullSource, /mqtt_host: '[^']*plain MQTT without TLS[^']*unencrypted[^']*trusted local network/);
+assert.match(fullSource, /mqtt_password: '[^']*unencrypted/);
 console.log('Full/Lite external IP settings are opt-in with visible privacy notice and bounded cadence');

@@ -442,4 +442,6 @@ The LuCI Logging tab validates the built-in native MQTT publisher. No external
 MQTT client package is needed. After setting `mqtt_enabled=1`, `mqtt_host`, and
 the required summary logging options, restart `cake-autorate`; its Full-only
 MQTT sidecar creates Home Assistant discovery sensors and publishes instance
-state under the configured base topic.
+state under the configured base topic. The connection is plain MQTT without
+TLS, so the user name, the password and the metrics travel unencrypted; use a
+broker on a trusted local network.
