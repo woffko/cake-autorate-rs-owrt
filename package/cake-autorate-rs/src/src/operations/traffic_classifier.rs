@@ -656,8 +656,8 @@ fn family(value: &str) -> Result<AddressFamily, String> {
 }
 
 /// One port number: ASCII digits only, 1..=65535. Rust's integer parser also
-/// accepts a leading `+`, which nftables rejects, and a leading zero is octal
-/// there, so only the parsed value is ever emitted.
+/// accepts a leading `+`, which nftables refuses with a syntax error, so only
+/// the parsed value is ever emitted.
 fn parse_port(text: &str) -> Option<u16> {
     if text.is_empty() || text.len() > 5 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -667,8 +667,9 @@ fn parse_port(text: &str) -> Option<u16> {
 
 /// Validate a comma-separated port list and return its canonical text: ports
 /// and ranges ascending, duplicates removed and overlapping ranges merged.
-/// nftables rejects overlapping intervals in one set, which would otherwise
-/// reject the whole classifier table because of a single entry.
+/// nftables builds the same set from any spelling, so this does not change what
+/// is matched; it keeps the installed rules and their state digest independent
+/// of how the list was typed.
 fn normalize_ports(value: &str) -> Result<String, String> {
     if value.is_empty() {
         return Ok(String::new());
@@ -721,9 +722,9 @@ fn validate_ports(value: &str) -> Result<(), String> {
 
 /// Validate one IPv4 or IPv6 address with an optional prefix and return its
 /// family and canonical text: compressed address, decimal prefix, host bits
-/// cleared. The prefix is digits only (a leading `+` or zero must not reach
-/// nftables, which reads a leading zero as octal), so the original text is
-/// never emitted.
+/// cleared. The prefix is digits only and is re-rendered from its value: Rust
+/// accepts a leading `+`, which nftables refuses, and nftables reads a prefix
+/// such as `/024` as octal and silently installs `/20`.
 fn normalize_network(value: &str) -> Result<(AddressFamily, String), String> {
     if value.is_empty() {
         return Ok((AddressFamily::Any, String::new()));
@@ -2086,6 +2087,90 @@ mod tests {
         );
         assert!(!error.contains("fine"), "{error}");
         assert!(!applied.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires explicit nft binary and a freshly isolated user/network namespace"]
+    fn native_nft_installs_custom_rules_in_canonical_form_in_isolated_namespace() {
+        let parent = std::env::var_os("CAKE_TEST_PARENT_NETNS")
+            .expect("explicit parent network namespace required");
+        let current = fs::read_link("/proc/self/ns/net").unwrap();
+        assert_ne!(
+            current.as_os_str(),
+            parent.as_os_str(),
+            "refusing to mutate the parent network namespace"
+        );
+        let nft = PathBuf::from(
+            std::env::var_os("CAKE_TEST_NATIVE_NFT").expect("explicit native nft required"),
+        );
+        assert!(nft.is_absolute() && nft.is_file());
+        let root = root();
+        let config = root.join("cake.show");
+        fs::write(
+            &config,
+            "cake-autorate.wan_sqm=cake_autorate\n\
+             cake-autorate.wan_sqm.enabled='1'\n\
+             cake-autorate.wan_sqm.manage_sqm='1'\n\
+             cake-autorate.wan_sqm.sqm_enabled='1'\n\
+             cake-autorate.wan_sqm.sqm_direction_mode='both'\n\
+             cake-autorate.wan_sqm.traffic_rules_enabled='1'\n\
+             cake-autorate.wan_sqm.autotune_profile='gaming'\n\
+             cake-autorate.wan_sqm.traffic_profile='auto'\n\
+             cake-autorate.wan_sqm.sqm_script='layer_cake.qos'\n\
+             cake-autorate.wan_sqm.sqm_eqdisc_opts='diffserv4'\n\
+             cake-autorate.wan_sqm.wan_if='eth0'\n\
+             cake-autorate.r1=traffic_rule\n\
+             cake-autorate.r1.enabled='1'\n\
+             cake-autorate.r1.instance='wan_sqm'\n\
+             cake-autorate.r1.profile='gaming'\n\
+             cake-autorate.r1.preset='custom'\n\
+             cake-autorate.r1.protocol='tcp'\n\
+             cake-autorate.r1.family='ipv4'\n\
+             cake-autorate.r1.destination_ports='443,443,80-90,85,1000-2000,1500-2500'\n\
+             cake-autorate.r1.source_network='10.0.0.5/24'\n\
+             cake-autorate.r1.class='voice'\n\
+             cake-autorate.r2=traffic_rule\n\
+             cake-autorate.r2.enabled='1'\n\
+             cake-autorate.r2.instance='wan_sqm'\n\
+             cake-autorate.r2.profile='gaming'\n\
+             cake-autorate.r2.preset='custom'\n\
+             cake-autorate.r2.protocol='udp'\n\
+             cake-autorate.r2.family='ipv4'\n\
+             cake-autorate.r2.destination_ports='0080,5000'\n\
+             cake-autorate.r2.destination_network='10.0.0.0/024'\n\
+             cake-autorate.r2.class='video'\n",
+        )
+        .unwrap();
+        let uci = root.join("uci");
+        executable(&uci, &format!("#!/bin/sh\ncat '{}'\n", config.display()));
+        let environment = Environment {
+            uci,
+            nft,
+            ubus: PathBuf::from("/bin/false"),
+            sys_class_net: root.join("sys"),
+            runtime_dir: root.join("runtime"),
+            state_file: root.join("runtime/traffic-classifier.state"),
+        };
+        apply(&environment).unwrap();
+        let listed = command_text(
+            &environment.nft,
+            &["-j", "list", "table", "inet", TABLE_NAME],
+        )
+        .unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        let listed = listed.to_string();
+        // `/024` is read as octal by nftables: it would have installed /20.
+        assert!(
+            listed.contains(r#""prefix":{"addr":"10.0.0.0","len":24}"#),
+            "{listed}"
+        );
+        assert!(!listed.contains(r#""len":20"#), "{listed}");
+        // Host bits are cleared, repeated and overlapping ports become one set.
+        assert!(!listed.contains("10.0.0.5"), "{listed}");
+        assert!(listed.contains(r#""range":[1000,2500]"#), "{listed}");
+        assert!(listed.contains(r#""range":[80,90]"#), "{listed}");
+        clear(&environment).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

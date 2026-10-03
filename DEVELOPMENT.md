@@ -74,6 +74,25 @@ For Lite select `CONFIG_PACKAGE_cake-autorate-rs-lite=m` and
 `CONFIG_PACKAGE_luci-app-cake-autorate-rs-lite=m` instead of the two Full
 package symbols.
 
+## Tests against a real nftables
+
+Two ignored unit tests apply the traffic-classifier rules to a real nftables in
+a throw-away network namespace. They never touch the host firewall: they refuse
+to run in the namespace named by `CAKE_TEST_PARENT_NETNS`.
+
+Get an `nft` binary without installing it, for example with
+`apt-get download nftables libnftables1 libnftnl11` and `dpkg-deb --extract`
+into a temporary directory, plus a wrapper script that sets `LD_LIBRARY_PATH`.
+Then run the test binary in new user and network namespaces:
+
+```sh
+unshare --user --map-user=0 --map-group=0 --net env \
+  CAKE_TEST_PARENT_NETNS="$(readlink /proc/self/ns/net)" \
+  CAKE_TEST_NATIVE_NFT=/absolute/path/to/nft \
+  package/cake-autorate-rs/src/target/debug/deps/cake_autorated-<hash> \
+  --ignored operations::traffic_classifier
+```
+
 ## Notes
 
 Rust is a reasonable daemon language for this project because it provides one static-ish native binary, predictable memory safety, and better long-term maintainability than a large shell daemon. The main practical cost on OpenWrt is build complexity: the first SDK build of `rust/host` is heavy because it compiles Rust/LLVM tooling.
