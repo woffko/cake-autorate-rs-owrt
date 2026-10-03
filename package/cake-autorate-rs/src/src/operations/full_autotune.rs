@@ -25393,6 +25393,7 @@ mod tests {
             restarted.consumed_bytes - switched.consumed_bytes
         );
         assert!(records_since_switch < epoch_records);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -25481,6 +25482,7 @@ mod tests {
             session.next_server_switch(SpeedtestDirection::Upload),
             Some((2, 3))
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
