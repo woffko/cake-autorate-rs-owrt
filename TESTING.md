@@ -149,9 +149,10 @@ the topology repeat fix described below.
   LuCI JavaScript tests, TypeScript checks, real-UCI tests and a hash of 230
   sources before and after the run, which did not change.
 - During development the package matrix covers x86_64 and the ARM test-router
-  architecture (aarch64_cortex-a76): both were built from that exact source in
-  the OpenWrt 25.12 SDK and verified for payload, metadata, dependencies and ELF
-  interpreter/ABI. The full 12-ABI matrix is built for a release.
+  architectures (aarch64_cortex-a76 and aarch64_generic): all three were built
+  from that exact source in the OpenWrt 25.12 SDK and verified for payload,
+  metadata, dependencies and ELF interpreter/ABI. The full 12-ABI matrix is
+  built for a release.
 
 ### Real nftables
 
