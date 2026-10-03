@@ -70,6 +70,13 @@ manual Review option. If the traffic budget, sample coverage, measurement
 integrity, or safety gates cannot prove it, Review keeps an unavailable card
 with the exact reason instead of inventing a topology.
 
+The topology comparison measures one direction without SQM while the other
+direction stays shaped at the rate of the pair Review is built on. That pair is
+the first measured option that keeps the 50% retained-capacity trust floor,
+which is not always the point the directional searches recommended: when the
+recommended pair falls below the floor, a later option becomes the reference.
+The journal binds every repeat to that confirmed pair.
+
 After a verified Apply receipt, LuCI unloads and reloads both relevant UCI
 packages and navigates to a fresh Settings view automatically. There is no
 second Reload button: new direction mode and DL/UL values must be visible

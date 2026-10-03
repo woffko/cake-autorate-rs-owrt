@@ -5612,7 +5612,6 @@ pub struct AutotuneReplayState {
     search_upload_unmeasurable: Option<SearchProbeUnmeasurableEvidence>,
     search_download_inconclusive: Option<SearchInconclusiveEvidence>,
     search_upload_inconclusive: Option<SearchInconclusiveEvidence>,
-    selected_download_kbps: Option<u64>,
     selected_upload_kbps: Option<u64>,
     pair_confirmed: bool,
     pair_measurements: Vec<(u64, u64)>,
@@ -5790,7 +5789,6 @@ impl AutotuneReplayState {
             search_upload_unmeasurable: None,
             search_download_inconclusive: None,
             search_upload_inconclusive: None,
-            selected_download_kbps: None,
             selected_upload_kbps: None,
             pair_confirmed: false,
             pair_measurements: Vec::new(),
@@ -5823,6 +5821,25 @@ impl AutotuneReplayState {
             self.consumed_bytes
                 .saturating_sub(self.epoch_start_consumed_bytes),
         )
+    }
+
+    /// Whether a pair option with this shaped download rate was measured.
+    /// The pair Review is built on is the first option that passes the trust
+    /// gate, which is not always the one the directional searches selected,
+    /// and replay cannot rank options without the search results. It therefore
+    /// accepts any measured rate and leaves the exact binding to
+    /// `verify_topology_repeats_follow_pair`.
+    fn pair_measured_download(&self, rate_kbps: u64) -> bool {
+        self.pair_measurements
+            .iter()
+            .any(|(download_kbps, _)| *download_kbps == rate_kbps)
+    }
+
+    /// Upload counterpart of [`Self::pair_measured_download`].
+    fn pair_measured_upload(&self, rate_kbps: u64) -> bool {
+        self.pair_measurements
+            .iter()
+            .any(|(_, upload_kbps)| *upload_kbps == rate_kbps)
     }
 
     /// Whether this journal can still restart its measurement phases on
@@ -6069,7 +6086,6 @@ impl AutotuneReplayState {
             } => match direction {
                 EvidenceDirection::Download => {
                     self.download_search_complete = true;
-                    self.selected_download_kbps = Some(*selected_kbps);
                     self.search_download_starved = None;
                     self.search_download_unmeasurable = None;
                 }
@@ -6726,7 +6742,9 @@ impl AutotuneReplayState {
                 SpeedtestDirection::Download
                     if value.topology == MeasurementTopology::RawDownload
                         && value.candidate_dl_kbps.is_none()
-                        && value.candidate_ul_kbps == self.selected_upload_kbps
+                        && value
+                            .candidate_ul_kbps
+                            .is_some_and(|rate| self.pair_measured_upload(rate))
                         && self.topology_download_unavailable.is_none()
                         && self.topology_upload_repeat_count == 0
                         && self.topology_download_repeat_count
@@ -6736,7 +6754,9 @@ impl AutotuneReplayState {
                 }
                 SpeedtestDirection::Upload
                     if value.topology == MeasurementTopology::RawUpload
-                        && value.candidate_dl_kbps == self.selected_download_kbps
+                        && value
+                            .candidate_dl_kbps
+                            .is_some_and(|rate| self.pair_measured_download(rate))
                         && value.candidate_ul_kbps.is_none()
                         && self.topology_upload_unavailable.is_none()
                         && self.topology_upload_repeat_count
@@ -6746,7 +6766,7 @@ impl AutotuneReplayState {
                 }
                 _ => {
                     return Err(
-                        "native Auto-Tune topology repeat is out of order or contradicts the selected pair"
+                        "native Auto-Tune topology repeat is out of order or contradicts the measured pairs"
                             .to_string(),
                     )
                 }
@@ -11761,12 +11781,46 @@ fn replay_remaining_traffic_budget(
         .ok_or_else(|| "native topology comparison traffic accounting underflow".to_string())
 }
 
+/// Every raw repeat keeps the other direction shaped at the confirmed pair's
+/// rate, so the raw and shaped samples of a direction differ only in that
+/// direction's topology. Replay checks the repeat against the measured pair
+/// rates; this check binds it to the exact pair Review is built on.
+fn verify_topology_repeats_follow_pair(
+    pair: &NativePairConfirmationResult,
+    records: &[AutotuneEvidenceRecord],
+) -> Result<(), String> {
+    for record in live_records(records) {
+        let AutotuneEvidence::Measurement(value) = record.evidence else {
+            continue;
+        };
+        if record.phase != AutotunePhase::TopologyComparison {
+            continue;
+        }
+        let follows_pair = match value.topology {
+            MeasurementTopology::RawDownload => {
+                value.candidate_ul_kbps == Some(pair.selected_ul_kbps)
+            }
+            MeasurementTopology::RawUpload => {
+                value.candidate_dl_kbps == Some(pair.selected_dl_kbps)
+            }
+            _ => false,
+        };
+        if !follows_pair {
+            return Err(
+                "native Auto-Tune topology repeat contradicts the confirmed pair".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn native_topology_comparison_result(
     request: &OperationRequest,
     proposal: &AutotuneProposal,
     records: &[AutotuneEvidenceRecord],
 ) -> Result<NativeTopologyComparisonResult, String> {
     let pair = native_pair_confirmation_result(proposal, records)?;
+    verify_topology_repeats_follow_pair(&pair, records)?;
     let comparison_available = uses_full_raw_controls(
         request
             .strategy
@@ -20417,6 +20471,17 @@ mod tests {
         proposal: &AutotuneProposal,
         direction: EvidenceDirection,
     ) -> ProfileSearchResult {
+        append_completed_search_with(records, proposal, direction, |_| 3_000)
+    }
+
+    /// Run the search to its end, answering each probe with the loaded
+    /// transport delay `transport_delta_us(candidate_kbps)`.
+    fn append_completed_search_with(
+        records: &mut Vec<AutotuneEvidenceRecord>,
+        proposal: &AutotuneProposal,
+        direction: EvidenceDirection,
+        transport_delta_us: impl Fn(u64) -> u64,
+    ) -> ProfileSearchResult {
         let mut candidate = match direction {
             EvidenceDirection::Download => proposal.download.maximum_kbps,
             EvidenceDirection::Upload => proposal.upload.maximum_kbps,
@@ -20432,19 +20497,17 @@ mod tests {
                 EvidenceDirection::Download => proposal.upload.maximum_kbps,
                 EvidenceDirection::Upload => candidate,
             };
-            push_measurement_record(
-                records,
-                AutotunePhase::DirectionalSearch,
-                search_measurement(
-                    match direction {
-                        EvidenceDirection::Download => SpeedtestDirection::Download,
-                        EvidenceDirection::Upload => SpeedtestDirection::Upload,
-                    },
-                    fixed_download,
-                    fixed_upload,
-                    candidate * 95 / 100,
-                ),
+            let mut probe = search_measurement(
+                match direction {
+                    EvidenceDirection::Download => SpeedtestDirection::Download,
+                    EvidenceDirection::Upload => SpeedtestDirection::Upload,
+                },
+                fixed_download,
+                fixed_upload,
+                candidate * 95 / 100,
             );
+            probe.transport_delta_us = transport_delta_us(candidate);
+            push_measurement_record(records, AutotunePhase::DirectionalSearch, probe);
             let decision = native_profile_search_result(proposal, direction, records).unwrap();
             if decision.action == ProfileSearchAction::Test {
                 candidate = decision.next_candidate_kbps.unwrap();
@@ -20722,6 +20785,212 @@ mod tests {
             },
         ));
         (operation, proposal, records, pair_result)
+    }
+
+    /// Records up to a confirmed pair whose recommended option keeps only a
+    /// quarter of its rate, so Review is built on another searched option.
+    /// Also returns the recommended pair the directional searches selected.
+    fn topology_ready_records_with_a_later_primary_pair() -> (
+        OperationRequest,
+        AutotuneProposal,
+        Vec<AutotuneEvidenceRecord>,
+        NativePairConfirmationResult,
+        ProfilePairCandidate,
+    ) {
+        let mut operation = request(CalibrationStrategy::FullRaw, 1_000_000_000);
+        operation.profile = Some(AutotuneProfile::BestOverall);
+        let mut records = proposal_ready_records(CalibrationStrategy::FullRaw);
+        let proposal = build_native_proposal_from_evidence(
+            &operation,
+            &"66".repeat(16),
+            &records,
+            LinkKind::Pppoe,
+        )
+        .unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Proposal,
+            AutotuneEvidence::ProposalBuilt {
+                digest: "cc".repeat(32),
+            },
+        ));
+        // The loaded delay grows with the rate, so the searches keep several
+        // distinct options.
+        let slope = |direction: DirectionProposal| {
+            move |candidate_kbps: u64| {
+                let span = direction
+                    .maximum_kbps
+                    .saturating_sub(direction.exploration_minimum_kbps)
+                    .max(1);
+                3_000
+                    + candidate_kbps.saturating_sub(direction.exploration_minimum_kbps) * 60_000
+                        / span
+            }
+        };
+        let download = append_completed_search_with(
+            &mut records,
+            &proposal,
+            EvidenceDirection::Download,
+            slope(proposal.download),
+        );
+        let upload = append_completed_search_with(
+            &mut records,
+            &proposal,
+            EvidenceDirection::Upload,
+            slope(proposal.upload),
+        );
+        let pairs = profile_pair_candidates(&download, &upload).unwrap();
+        assert!(pairs.len() >= 2, "the fixture needs several searched pairs");
+        for (index, pair) in pairs.iter().enumerate() {
+            let share = if index == 0 { 25 } else { 90 };
+            let mut value = measurement(
+                MeasurementTopology::ShapedBoth,
+                SpeedtestDirection::Both,
+                2_000_000,
+            );
+            value.candidate_dl_kbps = Some(pair.download_kbps);
+            value.candidate_ul_kbps = Some(pair.upload_kbps);
+            value.achieved_dl_kbps = Some(pair.download_kbps * share / 100);
+            value.achieved_ul_kbps = Some(pair.upload_kbps * share / 100);
+            value.realized_dl_kbps = value.achieved_dl_kbps;
+            value.realized_ul_kbps = value.achieved_ul_kbps;
+            value.load_reference_dl_kbps = Some(pair.download_kbps);
+            value.load_reference_ul_kbps = Some(pair.upload_kbps);
+            value.icmp_delta_us = 2_000;
+            value.transport_delta_us = 3_000;
+            push_measurement_record(&mut records, AutotunePhase::PairConfirmation, value);
+        }
+        let confirmed = native_pair_confirmation_result(&proposal, &records).unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::PairConfirmation,
+            AutotuneEvidence::PairConfirmed {
+                digest: "dd".repeat(32),
+            },
+        ));
+        (operation, proposal, records, confirmed, pairs[0])
+    }
+
+    /// One raw repeat of `direction` that keeps the other direction shaped at
+    /// the given rate.
+    fn topology_repeat(
+        proposal: &AutotuneProposal,
+        direction: EvidenceDirection,
+        shaped_other_kbps: u64,
+    ) -> MeasurementEvidence {
+        match direction {
+            EvidenceDirection::Download => {
+                let mut value = measurement(
+                    MeasurementTopology::RawDownload,
+                    SpeedtestDirection::Download,
+                    1_000_000,
+                );
+                value.candidate_dl_kbps = None;
+                value.candidate_ul_kbps = Some(shaped_other_kbps);
+                value.load_reference_dl_kbps = Some(proposal.download.maximum_kbps);
+                value
+            }
+            EvidenceDirection::Upload => {
+                let mut value = measurement(
+                    MeasurementTopology::RawUpload,
+                    SpeedtestDirection::Upload,
+                    1_000_000,
+                );
+                value.candidate_dl_kbps = Some(shaped_other_kbps);
+                value.candidate_ul_kbps = None;
+                value.load_reference_ul_kbps = Some(proposal.upload.maximum_kbps);
+                value
+            }
+        }
+    }
+
+    #[test]
+    fn topology_repeats_follow_the_confirmed_pair_when_it_is_not_the_recommended_one() {
+        let (operation, proposal, records, confirmed, recommended) =
+            topology_ready_records_with_a_later_primary_pair();
+        let worker = "66".repeat(16);
+        assert!(
+            (confirmed.selected_dl_kbps, confirmed.selected_ul_kbps)
+                != (recommended.download_kbps, recommended.upload_kbps),
+            "the recommended pair was supposed to miss the trust floor"
+        );
+        assert!(confirmed.selected_dl_kbps != recommended.download_kbps);
+        assert!(confirmed.selected_ul_kbps != recommended.upload_kbps);
+        let replay = AutotuneReplayState::replay(&operation, &worker, &records).unwrap();
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::CompareTopologies
+        );
+
+        // The repeats a run would take: both directions keep the other
+        // direction shaped at the confirmed pair's rates.
+        let mut with_repeats = records.clone();
+        push_measurement_record(
+            &mut with_repeats,
+            AutotunePhase::TopologyComparison,
+            topology_repeat(
+                &proposal,
+                EvidenceDirection::Download,
+                confirmed.selected_ul_kbps,
+            ),
+        );
+        push_measurement_record(
+            &mut with_repeats,
+            AutotunePhase::TopologyComparison,
+            topology_repeat(
+                &proposal,
+                EvidenceDirection::Upload,
+                confirmed.selected_dl_kbps,
+            ),
+        );
+        AutotuneReplayState::replay(&operation, &worker, &with_repeats).unwrap();
+        let result =
+            native_topology_comparison_result(&operation, &proposal, &with_repeats).unwrap();
+        assert_eq!(result.download.repeat_count, 1);
+        assert_eq!(result.upload.repeat_count, 1);
+
+        // The recommended pair is a measured option, so replay accepts a
+        // repeat shaped at its rate; the confirmed pair is what binds it.
+        let mut recommended_download = records.clone();
+        push_measurement_record(
+            &mut recommended_download,
+            AutotunePhase::TopologyComparison,
+            topology_repeat(
+                &proposal,
+                EvidenceDirection::Download,
+                recommended.upload_kbps,
+            ),
+        );
+        AutotuneReplayState::replay(&operation, &worker, &recommended_download).unwrap();
+        let error = native_topology_comparison_result(&operation, &proposal, &recommended_download)
+            .unwrap_err();
+        assert!(error.contains("contradicts the confirmed pair"), "{error}");
+        let mut recommended_upload = records.clone();
+        push_measurement_record(
+            &mut recommended_upload,
+            AutotunePhase::TopologyComparison,
+            topology_repeat(
+                &proposal,
+                EvidenceDirection::Upload,
+                recommended.download_kbps,
+            ),
+        );
+        AutotuneReplayState::replay(&operation, &worker, &recommended_upload).unwrap();
+        let error = native_topology_comparison_result(&operation, &proposal, &recommended_upload)
+            .unwrap_err();
+        assert!(error.contains("contradicts the confirmed pair"), "{error}");
+
+        // A rate no pair measurement covered never reaches the comparison.
+        for direction in [EvidenceDirection::Download, EvidenceDirection::Upload] {
+            let mut unmeasured = records.clone();
+            push_measurement_record(
+                &mut unmeasured,
+                AutotunePhase::TopologyComparison,
+                topology_repeat(&proposal, direction, 12_345),
+            );
+            let error = AutotuneReplayState::replay(&operation, &worker, &unmeasured).unwrap_err();
+            assert!(error.contains("contradicts the measured pairs"), "{error}");
+        }
     }
 
     #[test]
