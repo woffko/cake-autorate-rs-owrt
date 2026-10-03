@@ -23,6 +23,26 @@ const MAX_PROC_ENTRIES: usize = 65_536;
 const MAX_CMDLINE_BYTES: usize = 8 * 1024;
 pub const SCHEDULER_RUNTIME_FRESHNESS_MS: u64 = 5_000;
 
+/// The earliest wall-clock time the scheduler believes: 2026-01-01T00:00:00Z.
+/// Calendar windows, due times and the daily and monthly budgets are computed
+/// from the wall clock, and a router without a battery-backed clock runs at the
+/// epoch or at a stale time until NTP sets it. A time before this release's era
+/// has certainly not been set. A plausible but wrong time cannot be told apart;
+/// route, runtime, quiet-window and accounting gates still apply to it. Raise
+/// the constant when releases move well past it.
+pub const MIN_PLAUSIBLE_WALL_CLOCK_UNIX_S: u64 = 1_767_225_600;
+
+/// Refuse to evaluate the schedule while the wall clock has not been set.
+pub fn require_plausible_wall_clock(now_unix_s: u64) -> Result<(), String> {
+    if now_unix_s < MIN_PLAUSIBLE_WALL_CLOCK_UNIX_S {
+        return Err(
+            "the system clock has not been set; scheduled calibration waits for a valid time"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalCalendar {
     pub now_unix_s: u64,
@@ -525,6 +545,28 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn the_scheduler_refuses_a_wall_clock_that_has_not_been_set() {
+        // 2026-01-01T00:00:00Z.
+        assert_eq!(MIN_PLAUSIBLE_WALL_CLOCK_UNIX_S, 1_767_225_600);
+        for unset in [
+            0,
+            1,
+            86_400,
+            1_000_000_000,
+            MIN_PLAUSIBLE_WALL_CLOCK_UNIX_S - 1,
+        ] {
+            assert!(require_plausible_wall_clock(unset).is_err(), "{unset}");
+        }
+        for set in [
+            MIN_PLAUSIBLE_WALL_CLOCK_UNIX_S,
+            1_790_000_000,
+            4_102_444_800,
+        ] {
+            require_plausible_wall_clock(set).unwrap();
+        }
+    }
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 

@@ -60,8 +60,8 @@ use super::{
     scheduler_runtime::{
         acknowledge_scheduled_accounting_unknown, attest_no_competing_calibration_processes,
         load_or_initialize_state, local_calendar, mark_scheduled_accounting_unknown,
-        reserve_scheduled_request, settle_scheduled_request, QuietEvidence, ScheduledSettlement,
-        SCHEDULER_RUNTIME_FRESHNESS_MS,
+        require_plausible_wall_clock, reserve_scheduled_request, settle_scheduled_request,
+        QuietEvidence, ScheduledSettlement, SCHEDULER_RUNTIME_FRESHNESS_MS,
     },
     scheduler_status::{
         format_native_scheduler_batch, format_native_scheduler_issue,
@@ -4132,6 +4132,7 @@ impl CalibrationDaemon {
         let observed_monotonic = Instant::now();
         let now_unix_ms = rating::epoch_ms()?;
         let now_unix_s = now_unix_ms / 1_000;
+        require_plausible_wall_clock(now_unix_s)?;
         let calendar = local_calendar(now_unix_s, 0, 0)?;
 
         self.reconcile_native_scheduler_reservations(
@@ -12025,6 +12026,46 @@ mod tests {
         Ok(NativeScheduledAutoApplyOutcome::Applied(
             NativeApplyCommitDisposition::Applied,
         ))
+    }
+
+    #[test]
+    fn an_unset_wall_clock_stops_the_scheduler_pass_before_it_reads_any_state() {
+        use crate::operations::identity::test_clock::ScriptedClocks;
+        let root = temp_path("sched-unset-clock");
+        let state_dir = root.join("state");
+        let scheduler_dir = root.join("scheduler");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut scheduler = NativeSchedulerRuntime {
+            store: SchedulerStore::open(&scheduler_dir).unwrap(),
+            quiet: BTreeMap::new(),
+            errors: BTreeMap::new(),
+            auto_apply_errors: BTreeMap::new(),
+            auto_apply_warnings: BTreeMap::new(),
+            waiting: BTreeMap::new(),
+            accounting_blocks: BTreeMap::new(),
+            status_cache: NativeSchedulerStatusCache::default(),
+            lab_mode: false,
+        };
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+
+        // A router that booted at 2001 and has not been set by NTP yet.
+        let clocks = ScriptedClocks::install(60_000, 978_307_200_000);
+        let error = daemon
+            .poll_native_scheduler_inner(&mut scheduler)
+            .unwrap_err();
+        assert!(error.contains("system clock has not been set"), "{error}");
+        assert!(scheduler.waiting.is_empty());
+
+        // The pass is let through as soon as the time is a real one; it then
+        // proceeds to its other gates, whatever they say in this fixture.
+        clocks.step_wall_forward(1_790_000_000_000 - 978_307_200_000);
+        let verdict = daemon.poll_native_scheduler_inner(&mut scheduler);
+        assert!(verdict
+            .err()
+            .is_none_or(|error| !error.contains("system clock has not been set")));
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
