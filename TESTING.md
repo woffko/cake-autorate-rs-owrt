@@ -201,3 +201,88 @@ the topology repeat fix described below.
   real journal carry that path.
 - Lite and the physical routers were not run for these changes beyond the source
   gate.
+
+## Changes after RC27 r320/r128: operation deadlines and overflow checks (unreleased)
+
+These results cover the commits that move the time limits of Speed Test, Rating
+and Auto-Tune, and the freshness check of the runtime snapshot, from the wall
+clock to the boot clock, and the decision to keep integer overflow checks in the
+release build. They were made on top of the commits in the previous section.
+
+### Source gate and packages
+
+- Source gate, 53 commands: Full (1,779) and Lite (391) Rust tests, formatting,
+  LuCI JavaScript tests, TypeScript checks, real-UCI tests and a hash of 231
+  sources before and after the run, which did not change.
+- All twelve matrix architectures were built from that exact source in the
+  OpenWrt 25.12 SDK and verified for payload, metadata, dependencies and ELF
+  interpreter/ABI. The SDK build log of every architecture shows
+  `-C overflow-checks=on` on both daemon compilations (Full and Lite).
+
+### Clock steps
+
+- Unit tests script the wall clock and the boot clock separately
+  (`identity::test_clock`). They step the wall clock forward by hours and back
+  by minutes, and back past the creation time of a job. A job's deadline neither
+  moves nor expires early; a queued job neither expires nor is extended; a
+  runtime snapshot stamped ahead of the reader's clock, or too old, makes the
+  job wait instead of failing; the capture request of a Rating run keeps its
+  deadline when it is published again; the scheduler does not evaluate a
+  schedule while the wall clock is before 2026.
+- VM acceptance (x86_64, OpenWrt 25.12). The clock was changed on the test VM
+  only: NTP stopped for the run, the clock set with `date -s`, set back from the
+  host clock afterwards and NTP restarted. Most runs used the build of the
+  previous source gate; its x86_64 daemon equals the final one byte for byte
+  apart from the build path embedded in it, and the final build was run again
+  with a Speed Test and an Auto-Tune (below).
+  - Speed Test (capped, current topology) with four steps (+2 h, -5 h, +3 h,
+    +15 min) while it ran: completed in 25 s. Speed Tests on the shaped and on
+    the unshaped topology with three and four steps completed the same way.
+  - Full Raw Auto-Tune (explicit Unlimited policy) with four steps (+2 h, -5 h,
+    +3 h, +10 min): reached Review in 13 minutes with the topology restored.
+    Two earlier runs with two and four steps reached Review in 9 minutes.
+  - Control: the build before these changes failed an Automatic Rating at the
+    first +2 h step with `operation-deadline-expired-during-capture-handshake`.
+  - One Auto-Tune run failed during server qualification with
+    `speedtest-rate-invalid` after a +2 h step. Direct runs of the backend with
+    and without steps, two further Auto-Tune runs and Speed Tests on the
+    unshaped topology with steps all passed; the failure was not reproduced and
+    its cause is not established.
+
+### Overflow checks
+
+The OpenWrt SDK already builds every Rust package with overflow checks, so the
+checks were measured against a build of the same source with that default
+switched off in a private SDK copy (see [DEVELOPMENT.md](DEVELOPMENT.md)). The
+manifest now states the setting; the packages are unchanged.
+
+- Size, all twelve architectures: the Full binary grows by 0.6% to 1.1%, the
+  Lite binary by 0% to 2.3% (one 64 KiB segment step on MIPS), the packages by
+  0.3% to 0.7%.
+- CPU on the test VM, each build measured twice for 3 minutes idle and 4 minutes
+  of repeated capped Speed Tests: the controller used 0.39% (checks on) and
+  0.36% (off) of one core idle, 1.22% and 1.23% under load, within the spread of
+  repeated runs. Host micro-benchmarks of the Auto-Tune search and the
+  controller's text parsers: 1.4% slower with the checks.
+- Review and stress: every subtraction and multiplication that clippy's
+  `arithmetic_side_effects` lint flags was read against its guard. The
+  Auto-Tune search, the routed DNS answer parser and the controller's text
+  parsers ran with the checks on against about 3.4 million random and mutated
+  inputs without a panic.
+- Soak on the VM with the shipped build (checks on), 55 minutes: 39 capped Speed
+  Tests, 6 Automatic Ratings and 3 Full Raw Auto-Tune runs (explicit Unlimited
+  policy) that reached Review with the topology and the fixed settings
+  restored. No process restarted, and the system log, the controller log, the
+  job logs and `dmesg` held no panic or overflow message.
+
+### Known limits
+
+- A Rating run collects its quality grade in wall-clock windows. A step of the
+  wall clock during the capture makes the controller drop the samples collected
+  so far, so that run does not finish before its deadline; repeat it. Speed Test
+  and Auto-Tune are not affected.
+- Scheduled calibration follows the calendar and keeps using the wall clock.
+  It does not start while the clock is before 2026, that is before the router
+  has synchronised.
+- Lite and the physical routers were not run for these changes beyond the source
+  gate.
