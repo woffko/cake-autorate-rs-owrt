@@ -440,6 +440,10 @@ pub(crate) struct EmbeddedSpeedtestSession {
     /// Sources each direction has already used, in order.
     download_servers_used: Vec<u64>,
     upload_servers_used: Vec<u64>,
+    /// Monotonic start of the measurement epoch in progress. The evidence
+    /// journal carries no timestamps, so a restarted worker only knows the time
+    /// since it resumed; the server-switch window has a fixed floor for that.
+    epoch_started_boot_ms: Option<u64>,
     owned_checkpoint: Option<(PathBuf, String)>,
     owned_ledger: Option<std::cell::Cell<OwnedTrafficLedger>>,
 }
@@ -663,6 +667,7 @@ impl EmbeddedSpeedtestSession {
             upload_server: None,
             download_servers_used: Vec::new(),
             upload_servers_used: Vec::new(),
+            epoch_started_boot_ms: None,
         })
     }
 
@@ -679,6 +684,67 @@ impl EmbeddedSpeedtestSession {
                 self.selected_server_id,
                 self.selected_endpoint_sha256.as_deref(),
             ),
+        }
+    }
+
+    /// Mark the monotonic start of a measurement epoch.
+    pub(crate) fn begin_epoch(&mut self, now_boot_ms: u64) {
+        self.epoch_started_boot_ms = Some(now_boot_ms);
+    }
+
+    /// Time spent in the epoch in progress, when this worker saw it start.
+    pub(crate) fn epoch_elapsed_ms(&self, now_boot_ms: u64) -> Option<u64> {
+        self.epoch_started_boot_ms
+            .map(|started| now_boot_ms.saturating_sub(started))
+    }
+
+    /// A session with three qualified sources and no route pin, for tests that
+    /// exercise the server-switch decision without a device.
+    #[cfg(test)]
+    pub(crate) fn for_server_switch_tests(operation: &OperationRequest) -> Self {
+        let server = |id: u64, download_kbps: u64, upload_kbps: u64| {
+            super::server_qualification::QualifiedServer {
+                server_id: id,
+                endpoint_sha256: format!("{id:064x}"),
+                download_kbps,
+                upload_kbps,
+            }
+        };
+        Self {
+            probe_pin: None,
+            owned_checkpoint: None,
+            owned_ledger: None,
+            route_pin: NftRoutePin {
+                cleanup_on_drop: false,
+                table: None,
+                owner: None,
+            },
+            credentials: BackendCredentials {
+                uid: 32769,
+                gid: 32770,
+            },
+            job_id: operation.identity.job_id.clone(),
+            worker_run_id: "66".repeat(16),
+            route_fingerprint: operation.identity.route_fingerprint.clone(),
+            route: operation.route.clone(),
+            backend: operation.backend.clone(),
+            requested_server_id: None,
+            authorized_traffic_budget: operation.traffic_budget,
+            traffic_policy_explicit: operation.traffic_policy_explicit,
+            selected_server_id: Some(1),
+            server_qualified: true,
+            qualified_raw_capacity: None,
+            selected_endpoint_sha256: Some(format!("{:064x}", 1)),
+            qualified_servers: vec![
+                server(1, 90_000, 45_000),
+                server(2, 88_000, 44_000),
+                server(3, 86_000, 43_000),
+            ],
+            download_server: None,
+            upload_server: None,
+            download_servers_used: vec![1],
+            upload_servers_used: vec![1],
+            epoch_started_boot_ms: None,
         }
     }
 
@@ -6899,6 +6965,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             upload_server: None,
             download_servers_used: vec![1],
             upload_servers_used: vec![1],
+            epoch_started_boot_ms: None,
         };
         assert_eq!(
             session.server_for(SpeedtestDirection::Upload),
@@ -6985,6 +7052,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             upload_server: None,
             download_servers_used: Vec::new(),
             upload_servers_used: Vec::new(),
+            epoch_started_boot_ms: None,
         };
         assert!(session.matches(&operation, &worker_run_id));
 
@@ -7742,6 +7810,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             upload_server: None,
             download_servers_used: Vec::new(),
             upload_servers_used: Vec::new(),
+            epoch_started_boot_ms: None,
             owned_checkpoint: Some((path, digest)),
             owned_ledger: Some(Cell::new(
                 OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), origin).unwrap(),
@@ -7875,6 +7944,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             upload_server: None,
             download_servers_used: Vec::new(),
             upload_servers_used: Vec::new(),
+            epoch_started_boot_ms: None,
             owned_checkpoint: Some((path, digest)),
             owned_ledger: Some(std::cell::Cell::new(
                 OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), origin).unwrap(),

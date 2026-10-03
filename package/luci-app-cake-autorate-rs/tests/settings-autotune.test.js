@@ -2003,6 +2003,8 @@ async function testNativeAutotuneTransport() {
 			assert.equal(diagnostic.code, code);
 			assert.match(diagnostic.message, expected);
 		}
+		assert.match(source, /'native-autotune-measurement-basis-unstable': _\('The uplink route or the shaper kept changing during one measurement/,
+			'a path that keeps resetting the measurement basis must have a plain stop explanation');
 		assert.match(helpers.autotuneTypedTerminalDiagnostic({ state: 'cancelled' }).message, /Cancellation does not mean/);
 		assert.equal(helpers.autotuneTypedTerminalDiagnostic({ terminal_state: 'failed', diagnostic_code: '__proto__' }), null);
 		assert.match(trafficText, /16\.381 GB.*32\.000 GB.*15\.619 GB/);

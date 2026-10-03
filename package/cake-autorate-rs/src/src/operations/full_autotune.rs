@@ -5635,14 +5635,108 @@ pub struct AutotuneReplayState {
     initial_server_id: Option<u64>,
     download_servers_used: Vec<u64>,
     upload_servers_used: Vec<u64>,
+    /// Journal position and consumed traffic when the epoch in progress began
+    /// (the selected-server receipt, then every server switch). They size what
+    /// a restarted epoch is likely to need.
+    epoch_start_sequence: u32,
+    epoch_start_consumed_bytes: u64,
 }
 
 /// Server switches per run. Each restarts the measurement phases, so the
 /// bound also caps the extra traffic, time and evidence records.
 pub(crate) const MAX_SERVER_SWITCHES: u8 = 4;
 /// A switch needs room for a complete measurement epoch in the bounded
-/// evidence journal.
+/// evidence journal. This is the floor used when a journal is replayed: the
+/// replay must never be stricter than the writer that produced it. The writer
+/// applies `ServerSwitchWindow`, which can only be stricter. Complete runs on
+/// the test VM used 65 to 79 journal records in total, so 96 covers a typical
+/// epoch with room to spare.
 const SERVER_SWITCH_EVIDENCE_RESERVE: usize = 96;
+/// A restarted epoch repeats the phases of the failed one, so it is expected to
+/// cost about what the failed epoch cost so far (records, traffic, time) plus
+/// this margin.
+const SERVER_SWITCH_EPOCH_MARGIN_PERCENT: u64 = 125;
+/// Lower bound for the time a restarted epoch needs. The measurement phases of
+/// a complete best_overall run took about 8.3 minutes on the test VM; slower
+/// links and retries take longer, so the floor leaves room for that.
+const SERVER_SWITCH_MIN_EPOCH_MS: u64 = 10 * 60 * 1_000;
+
+/// Why a server switch is declined before it is recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerSwitchDecline {
+    Journal,
+    Time,
+    Budget,
+}
+
+impl ServerSwitchDecline {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Journal => "journal",
+            Self::Time => "time",
+            Self::Budget => "budget",
+        }
+    }
+}
+
+/// The deadline and traffic budget a switch decision is taken against.
+#[derive(Clone, Copy, Debug)]
+struct ServerSwitchLimits {
+    /// Monotonic deadline of the measurement in progress.
+    deadline_boot_ms: u64,
+    /// Traffic budget that remains (`Unlimited` when no cap applies).
+    traffic_budget: super::protocol::TrafficPolicy,
+}
+
+/// What a restarted measurement epoch has to fit into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ServerSwitchWindow {
+    /// Journal position when the switch is considered.
+    last_sequence: u32,
+    /// Journal records and traffic the failed epoch used so far.
+    epoch_records: u32,
+    epoch_bytes: u64,
+    /// Monotonic time left until the operation deadline, and the time the
+    /// failed epoch took (unknown when this worker did not see it start).
+    remaining_ms: u64,
+    epoch_elapsed_ms: Option<u64>,
+    /// Traffic left; `None` for an unlimited budget.
+    remaining_bytes: Option<u64>,
+}
+
+fn with_epoch_margin(value: u64) -> u64 {
+    value
+        .saturating_mul(SERVER_SWITCH_EPOCH_MARGIN_PERCENT)
+        .div_ceil(100)
+}
+
+impl ServerSwitchWindow {
+    /// A switch discards the failed epoch's artifacts and repeats every
+    /// measurement phase. When the journal, the time or the traffic that remain
+    /// cannot hold that, keeping the failed epoch's outcome is better than a
+    /// run that ends at the deadline or the journal bound without a Review.
+    fn decline(&self) -> Option<ServerSwitchDecline> {
+        let records = with_epoch_margin(u64::from(self.epoch_records))
+            .max(SERVER_SWITCH_EVIDENCE_RESERVE as u64);
+        if u64::from(self.last_sequence).saturating_add(records)
+            >= MAX_AUTOTUNE_EVIDENCE_RECORDS as u64
+        {
+            return Some(ServerSwitchDecline::Journal);
+        }
+        let needed_ms =
+            with_epoch_margin(self.epoch_elapsed_ms.unwrap_or(0)).max(SERVER_SWITCH_MIN_EPOCH_MS);
+        if self.remaining_ms < needed_ms {
+            return Some(ServerSwitchDecline::Time);
+        }
+        if self
+            .remaining_bytes
+            .is_some_and(|remaining| remaining < with_epoch_margin(self.epoch_bytes))
+        {
+            return Some(ServerSwitchDecline::Budget);
+        }
+        None
+    }
+}
 
 impl AutotuneReplayState {
     pub fn new(request: &OperationRequest, worker_run_id: &str) -> Result<Self, String> {
@@ -5716,7 +5810,19 @@ impl AutotuneReplayState {
             initial_server_id: None,
             download_servers_used: Vec::new(),
             upload_servers_used: Vec::new(),
+            epoch_start_sequence: 0,
+            epoch_start_consumed_bytes: 0,
         })
+    }
+
+    /// Journal records and traffic the epoch in progress has used so far.
+    /// A restarted epoch repeats the same phases, so this sizes its needs.
+    pub(crate) fn epoch_usage(&self) -> (u32, u64) {
+        (
+            self.last_sequence.saturating_sub(self.epoch_start_sequence),
+            self.consumed_bytes
+                .saturating_sub(self.epoch_start_consumed_bytes),
+        )
     }
 
     /// Whether this journal can still restart its measurement phases on
@@ -6003,6 +6109,16 @@ impl AutotuneReplayState {
             let mut origin = self.clone();
             origin.epoch_origin = None;
             self.epoch_origin = Some(Box::new(origin));
+        }
+        if matches!(
+            record.evidence,
+            AutotuneEvidence::ServerSelected { .. } | AutotuneEvidence::ServerSwitched(_)
+        ) {
+            // The origin snapshot above keeps zeros here; a switch rewinds to
+            // it and lands in this branch again, so every epoch is measured
+            // from its own start.
+            self.epoch_start_sequence = self.last_sequence;
+            self.epoch_start_consumed_bytes = self.consumed_bytes;
         }
         Ok(())
     }
@@ -15507,6 +15623,10 @@ fn run_directional_capture_load_with_session(
                             evidence_phase,
                             direction,
                             count,
+                            ServerSwitchLimits {
+                                deadline_boot_ms: request.deadline_boot_ms,
+                                traffic_budget: *remaining_traffic_budget,
+                            },
                         )? {
                             return Err(CaptureWaitError::ServerSwitched);
                         }
@@ -15663,6 +15783,7 @@ fn switch_measurement_server(
     failed_phase: AutotunePhase,
     direction: SpeedtestDirection,
     run_count: u8,
+    limits: ServerSwitchLimits,
 ) -> Result<bool, String> {
     let Some((from, to)) = session.next_server_switch(direction) else {
         return Ok(false);
@@ -15670,6 +15791,31 @@ fn switch_measurement_server(
     let records = evidence_store.load()?;
     let replay = AutotuneReplayState::replay(operation, worker_run_id, &records)?;
     if !replay.server_switch_available() {
+        return Ok(false);
+    }
+    let now_boot_ms = monotonic_boot_ms()?;
+    let (epoch_records, epoch_bytes) = replay.epoch_usage();
+    let window = ServerSwitchWindow {
+        last_sequence: replay.last_sequence,
+        epoch_records,
+        epoch_bytes,
+        remaining_ms: limits.deadline_boot_ms.saturating_sub(now_boot_ms),
+        epoch_elapsed_ms: session.epoch_elapsed_ms(now_boot_ms),
+        remaining_bytes: limits.traffic_budget.limit_bytes(),
+    };
+    if let Some(decline) = window.decline() {
+        // The failed epoch's outcome is kept, exactly as when no backup server
+        // exists, instead of restarting into a run that cannot finish.
+        eprintln!(
+            "autotune-server-switch-skipped reason={} direction={} phase={} remaining_ms={} epoch_elapsed_ms={} epoch_records={epoch_records}",
+            decline.as_str(),
+            direction.as_str(),
+            failed_phase.as_str(),
+            window.remaining_ms,
+            window
+                .epoch_elapsed_ms
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        );
         return Ok(false);
     }
     let (download_debit_count, upload_debit_count) = match replay.pending_measurement_debits {
@@ -16157,6 +16303,23 @@ fn idle_baseline_runtime_rates(
     }
 }
 
+/// Restartable measurement-basis losses (a route or runtime reset) one
+/// directional measurement tolerates, the same tolerance as route re-arms. A
+/// restart after the load began has already spent traffic, so a path that
+/// keeps resetting is reported instead of being retried until the deadline.
+const MAX_MEASUREMENT_BASIS_RESTARTS: u32 = MAX_RUNTIME_ROUTE_REARMS;
+const MEASUREMENT_BASIS_UNSTABLE: &str = "native-autotune-measurement-basis-unstable";
+
+fn count_basis_restart(restarts: &mut u32) -> Result<(), CaptureWaitError> {
+    *restarts = restarts.saturating_add(1);
+    if *restarts > MAX_MEASUREMENT_BASIS_RESTARTS {
+        return Err(CaptureWaitError::Failure(
+            MEASUREMENT_BASIS_UNSTABLE.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn run_idle_baseline_with_recovery(
     session: &EmbeddedSpeedtestSession,
     operation: &OperationRequest,
@@ -16237,6 +16400,7 @@ fn run_directional_measurement_with_recovery(
         );
     }
     let runtime_snapshot_path = capture.request_path.with_file_name("rating-runtime");
+    let mut basis_restarts = 0u32;
     loop {
         capture.cleanup();
         wait_for_measurement_basis(
@@ -16283,7 +16447,10 @@ fn run_directional_measurement_with_recovery(
             terminate,
         ) {
             Ok(_) => {}
-            Err(error) if error.is_restartable_measurement_basis_loss() => continue,
+            Err(error) if error.is_restartable_measurement_basis_loss() => {
+                count_basis_restart(&mut basis_restarts)?;
+                continue;
+            }
             Err(error) if error.requires_route_rearm() => {
                 capture.cleanup();
                 *control = rearm_runtime_after_route_recovery(
@@ -16329,7 +16496,10 @@ fn run_directional_measurement_with_recovery(
         };
         let (snapshot, load) = match load_result {
             Ok(value) => value,
-            Err(error) if error.is_restartable_measurement_basis_loss() => continue,
+            Err(error) if error.is_restartable_measurement_basis_loss() => {
+                count_basis_restart(&mut basis_restarts)?;
+                continue;
+            }
             Err(error) if error.requires_route_rearm() => {
                 capture.cleanup();
                 *control = rearm_runtime_after_route_recovery(
@@ -17897,6 +18067,7 @@ where
             // source combination; the idle baseline and the server comparison
             // stay valid for every epoch.
             loop {
+                speedtest_session.begin_epoch(monotonic_boot_ms()?);
                 let epoch = (|| -> Result<(), String> {
                     let mut last_control = None;
                     for topology in topologies.iter().copied() {
@@ -25033,6 +25204,305 @@ mod tests {
         )
         .is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn server_switch_window_declines_when_the_journal_time_or_traffic_cannot_hold_another_epoch() {
+        let minute = 60 * 1_000;
+        let roomy = ServerSwitchWindow {
+            last_sequence: 40,
+            epoch_records: 30,
+            epoch_bytes: 2_000_000_000,
+            remaining_ms: 30 * minute,
+            epoch_elapsed_ms: Some(4 * minute),
+            remaining_bytes: Some(10_000_000_000),
+        };
+        assert_eq!(roomy.decline(), None);
+        // Unlimited traffic and an unseen epoch start only use the floors.
+        let unknown = ServerSwitchWindow {
+            remaining_bytes: None,
+            epoch_elapsed_ms: None,
+            ..roomy
+        };
+        assert_eq!(unknown.decline(), None);
+
+        // Journal: the floor is the replay reserve; a heavy epoch needs 125
+        // percent of the records it already used (160 records need 200).
+        let edge = (MAX_AUTOTUNE_EVIDENCE_RECORDS - SERVER_SWITCH_EVIDENCE_RESERVE) as u32;
+        for (last_sequence, expected) in
+            [(edge - 1, None), (edge, Some(ServerSwitchDecline::Journal))]
+        {
+            let window = ServerSwitchWindow {
+                last_sequence,
+                ..roomy
+            };
+            assert_eq!(window.decline(), expected, "floor at {last_sequence}");
+        }
+        let heavy_limit = MAX_AUTOTUNE_EVIDENCE_RECORDS as u32 - 200;
+        for (last_sequence, expected) in [
+            (heavy_limit - 1, None),
+            (heavy_limit, Some(ServerSwitchDecline::Journal)),
+        ] {
+            let window = ServerSwitchWindow {
+                last_sequence,
+                epoch_records: 160,
+                ..roomy
+            };
+            assert_eq!(window.decline(), expected, "heavy epoch at {last_sequence}");
+        }
+
+        // Time: at least the fixed floor, or 125 percent of the failed epoch.
+        for (remaining_ms, epoch_elapsed_ms, expected) in [
+            (SERVER_SWITCH_MIN_EPOCH_MS, Some(4 * minute), None),
+            (
+                SERVER_SWITCH_MIN_EPOCH_MS - 1,
+                Some(4 * minute),
+                Some(ServerSwitchDecline::Time),
+            ),
+            (25 * minute, Some(20 * minute), None),
+            (
+                25 * minute - 1,
+                Some(20 * minute),
+                Some(ServerSwitchDecline::Time),
+            ),
+            (SERVER_SWITCH_MIN_EPOCH_MS, None, None),
+            (
+                SERVER_SWITCH_MIN_EPOCH_MS - 1,
+                None,
+                Some(ServerSwitchDecline::Time),
+            ),
+            (0, Some(0), Some(ServerSwitchDecline::Time)),
+        ] {
+            let window = ServerSwitchWindow {
+                remaining_ms,
+                epoch_elapsed_ms,
+                ..roomy
+            };
+            assert_eq!(window.decline(), expected, "{remaining_ms} ms left");
+        }
+
+        // Traffic: 125 percent of what the failed epoch consumed.
+        for (remaining_bytes, expected) in [
+            (Some(2_500_000_000), None),
+            (Some(2_499_999_999), Some(ServerSwitchDecline::Budget)),
+            (None, None),
+            (Some(0), Some(ServerSwitchDecline::Budget)),
+        ] {
+            let window = ServerSwitchWindow {
+                remaining_bytes,
+                ..roomy
+            };
+            assert_eq!(window.decline(), expected, "{remaining_bytes:?} bytes left");
+        }
+        // A tiny epoch (failure at the first control) never blocks on traffic.
+        let first_control = ServerSwitchWindow {
+            epoch_bytes: 0,
+            remaining_bytes: Some(1),
+            ..roomy
+        };
+        assert_eq!(first_control.decline(), None);
+
+        // The journal is reported first, then time, then traffic.
+        let nothing_left = ServerSwitchWindow {
+            last_sequence: MAX_AUTOTUNE_EVIDENCE_RECORDS as u32,
+            remaining_ms: 0,
+            remaining_bytes: Some(0),
+            ..roomy
+        };
+        assert_eq!(nothing_left.decline(), Some(ServerSwitchDecline::Journal));
+        let no_time_no_traffic = ServerSwitchWindow {
+            remaining_ms: 0,
+            remaining_bytes: Some(0),
+            ..roomy
+        };
+        assert_eq!(
+            no_time_no_traffic.decline(),
+            Some(ServerSwitchDecline::Time)
+        );
+        // Saturating arithmetic: absurd inputs cannot wrap into an approval.
+        let absurd = ServerSwitchWindow {
+            epoch_records: u32::MAX,
+            epoch_bytes: u64::MAX,
+            epoch_elapsed_ms: Some(u64::MAX),
+            ..roomy
+        };
+        assert_eq!(absurd.decline(), Some(ServerSwitchDecline::Journal));
+    }
+
+    #[test]
+    fn epoch_usage_counts_from_the_selected_server_receipt_and_from_every_switch() {
+        let root = private_temp_directory("epoch-usage");
+        let (operation, mut records) = server_switch_fixture(&root);
+        let worker = "66".repeat(16);
+        let origin = AutotuneReplayState::replay(&operation, &worker, &records).unwrap();
+        // The qualification traffic precedes the first epoch.
+        assert_eq!(origin.epoch_usage(), (0, 0));
+        assert!(origin.consumed_bytes > 0);
+
+        push_full_raw_controls(&mut records);
+        let proposal =
+            build_native_proposal_from_evidence(&operation, &worker, &records, LinkKind::Pppoe)
+                .unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Proposal,
+            AutotuneEvidence::ProposalBuilt {
+                digest: "cc".repeat(32),
+            },
+        ));
+        append_completed_search(&mut records, &proposal, EvidenceDirection::Download);
+        for _ in 0..3 {
+            push_measurement_debit(
+                &mut records,
+                AutotunePhase::DirectionalSearch,
+                SpeedtestDirection::Upload,
+                10,
+                10,
+            );
+        }
+        let failed = AutotuneReplayState::replay(&operation, &worker, &records).unwrap();
+        let (epoch_records, epoch_bytes) = failed.epoch_usage();
+        assert_eq!(epoch_records, failed.last_sequence - origin.last_sequence);
+        assert_eq!(epoch_bytes, failed.consumed_bytes - origin.consumed_bytes);
+        assert!(epoch_records > 10 && epoch_bytes > 0);
+
+        // The switch starts a new epoch; every byte stays consumed.
+        records.push(switch_record(
+            records.len() as u32 + 1,
+            SpeedtestDirection::Upload,
+            AutotunePhase::DirectionalSearch,
+            1,
+            2,
+            (0, 3),
+        ));
+        let switched = AutotuneReplayState::replay(&operation, &worker, &records).unwrap();
+        assert_eq!(switched.epoch_usage(), (0, 0));
+        assert_eq!(switched.consumed_bytes, failed.consumed_bytes);
+        assert_eq!(switched.epoch_start_sequence, switched.last_sequence);
+
+        // The restarted epoch is measured from its own start, not the run's.
+        push_full_raw_controls(&mut records);
+        let restarted = AutotuneReplayState::replay(&operation, &worker, &records).unwrap();
+        let (records_since_switch, bytes_since_switch) = restarted.epoch_usage();
+        assert_eq!(
+            records_since_switch,
+            restarted.last_sequence - switched.last_sequence
+        );
+        assert_eq!(
+            bytes_since_switch,
+            restarted.consumed_bytes - switched.consumed_bytes
+        );
+        assert!(records_since_switch < epoch_records);
+    }
+
+    #[test]
+    fn a_failure_without_room_keeps_the_failed_epoch_instead_of_switching() {
+        let root = private_temp_directory("switch-window-wiring");
+        let (operation, mut records) = server_switch_fixture(&root);
+        let worker = "66".repeat(16);
+        push_full_raw_controls(&mut records);
+        let proposal =
+            build_native_proposal_from_evidence(&operation, &worker, &records, LinkKind::Pppoe)
+                .unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Proposal,
+            AutotuneEvidence::ProposalBuilt {
+                digest: "cc".repeat(32),
+            },
+        ));
+        append_completed_search(&mut records, &proposal, EvidenceDirection::Download);
+        // Three upload runs failed on server 1 after every retry.
+        for _ in 0..3 {
+            push_measurement_debit(
+                &mut records,
+                AutotunePhase::DirectionalSearch,
+                SpeedtestDirection::Upload,
+                10,
+                10,
+            );
+        }
+        let job = root.join("job");
+        fs::create_dir(&job).unwrap();
+        fs::set_permissions(&job, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = AutotuneEvidenceStore::open(&job).unwrap();
+        for item in &records {
+            store.append(item).unwrap();
+        }
+        let minute = 60 * 1_000;
+        let now = monotonic_boot_ms().unwrap();
+        let mut session = EmbeddedSpeedtestSession::for_server_switch_tests(&operation);
+        // The failed epoch has been running for five minutes.
+        session.begin_epoch(now.saturating_sub(5 * minute));
+        let limits = |remaining_ms: u64, traffic_budget| ServerSwitchLimits {
+            deadline_boot_ms: now + remaining_ms,
+            traffic_budget,
+        };
+        let unlimited = super::super::protocol::TrafficPolicy::Unlimited;
+        let switch = |session: &mut EmbeddedSpeedtestSession, limits| {
+            switch_measurement_server(
+                session,
+                &operation,
+                &worker,
+                &store,
+                AutotunePhase::DirectionalSearch,
+                SpeedtestDirection::Upload,
+                3,
+                limits,
+            )
+            .unwrap()
+        };
+
+        // Too little time for another epoch, or too little traffic: the
+        // journal and the session stay exactly as they were.
+        assert!(!switch(&mut session, limits(5 * minute, unlimited)));
+        assert!(!switch(
+            &mut session,
+            limits(
+                30 * minute,
+                super::super::protocol::TrafficPolicy::Capped { max_bytes: 1 }
+            )
+        ));
+        assert_eq!(store.load().unwrap().len(), records.len());
+        assert_eq!(
+            session.next_server_switch(SpeedtestDirection::Upload),
+            Some((1, 2))
+        );
+
+        // Enough time and traffic: the switch is recorded and applied.
+        assert!(switch(&mut session, limits(30 * minute, unlimited)));
+        let persisted = store.load().unwrap();
+        assert_eq!(persisted.len(), records.len() + 1);
+        assert!(matches!(
+            persisted.last().unwrap().evidence,
+            AutotuneEvidence::ServerSwitched(_)
+        ));
+        assert_eq!(
+            session.next_server_switch(SpeedtestDirection::Upload),
+            Some((2, 3))
+        );
+    }
+
+    #[test]
+    fn a_path_that_keeps_resetting_the_measurement_basis_is_reported() {
+        let mut restarts = 0;
+        for _ in 0..MAX_MEASUREMENT_BASIS_RESTARTS {
+            assert!(count_basis_restart(&mut restarts).is_ok());
+        }
+        let error = count_basis_restart(&mut restarts).unwrap_err();
+        assert!(matches!(
+            &error,
+            CaptureWaitError::Failure(code) if code == MEASUREMENT_BASIS_UNSTABLE
+        ));
+        // The code is published as the terminal diagnostic unchanged.
+        assert_eq!(
+            worker_failure_terminal_code(MEASUREMENT_BASIS_UNSTABLE),
+            MEASUREMENT_BASIS_UNSTABLE
+        );
+        // Counting never wraps.
+        let mut saturated = u32::MAX;
+        assert!(count_basis_restart(&mut saturated).is_err());
+        assert_eq!(saturated, u32::MAX);
     }
 
     #[test]

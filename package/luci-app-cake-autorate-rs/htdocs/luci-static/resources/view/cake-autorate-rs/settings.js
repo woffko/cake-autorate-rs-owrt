@@ -5602,6 +5602,7 @@ var AUTOTUNE_STOP_EXPLANATIONS = {
 	'speedtest-backend-failed': _('The speed-test server kept failing even after the configured retries.'),
 	'speedtest-route-drift': _('The uplink route changed during the test.'),
 	'runtime-route-changed': _('The uplink route changed during the test.'),
+	'native-autotune-measurement-basis-unstable': _('The uplink route or the shaper kept changing during one measurement, so the test stopped.'),
 	'native-search-load-confidence-low': _('Other traffic on this uplink made the measurements too unreliable.'),
 	'owned-traffic-accounting-failed': _('The test traffic could not be counted reliably, so the test stopped.'),
 	'native-autotune-deadline-expired': _('The test did not finish within its 45-minute limit.')
