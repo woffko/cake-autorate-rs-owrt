@@ -318,3 +318,102 @@ compute ceiling plus the single-CPU warning, compare the OpenWrt modes with a
 short reversible test, confirm rates/latency/packet loss, and retain the change
 only when the same router improves. A route/address change invalidates the
 calibration regardless of steering mode.
+
+## Sending telemetry to a broker over TLS
+
+The MQTT publisher can encrypt its connection to the broker; see
+[Optional MQTT publisher](USER_GUIDE.md#optional-mqtt-publisher) for the
+options. A broker whose certificate comes from a public authority needs no
+further steps. This section is for a broker on your own network, such as
+Mosquitto, whose certificate you issue yourself. Do the first two steps on a
+trusted computer, not on the router.
+
+### 1. Issue the certificates
+
+Create a private certificate authority once, and a server certificate for the
+broker. The server certificate must list, as a subject alternative name, the
+exact name or address that the router will use in **MQTT host**.
+
+```sh
+openssl req -x509 -newkey rsa:3072 -sha256 -days 3650 -nodes \
+    -keyout mqtt-ca.key -out mqtt-ca.crt -subj "/CN=Home MQTT CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+openssl req -newkey rsa:3072 -sha256 -nodes \
+    -keyout broker.key -out broker.csr -subj "/CN=broker.lan"
+printf 'subjectAltName=DNS:broker.lan,IP:192.168.1.10\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > broker.ext
+openssl x509 -req -in broker.csr -CA mqtt-ca.crt -CAkey mqtt-ca.key \
+    -CAcreateserial -days 825 -sha256 -extfile broker.ext -out broker.crt
+```
+
+Keep `mqtt-ca.key` and `broker.key` private. Only `mqtt-ca.crt` goes to the
+router.
+
+### 2. Configure the broker
+
+For Mosquitto, add a TLS listener to its configuration and point it at the
+broker certificate and key:
+
+```text
+listener 8883
+cafile /etc/mosquitto/certs/mqtt-ca.crt
+certfile /etc/mosquitto/certs/broker.crt
+keyfile /etc/mosquitto/certs/broker.key
+```
+
+Keep the user name and password settings you already use. Do not set
+`require_certificate true`: the publisher does not present a client
+certificate.
+
+### 3. Give the router the CA certificate
+
+```sh
+scp mqtt-ca.crt root@router:/etc/ssl/mqtt-ca.pem
+ssh root@router 'chown root:root /etc/ssl/mqtt-ca.pem; chmod 644 /etc/ssl/mqtt-ca.pem'
+```
+
+In LuCI, on the Logging tab of the instance, set **MQTT host** to the name in
+the certificate (`broker.lan`), turn **MQTT TLS** on, leave **MQTT port** empty
+(8883) or set it to the listener port, and set **MQTT CA file** to
+`/etc/ssl/mqtt-ca.pem`. Press **Check MQTT**, then save and apply. With UCI:
+
+```sh
+uci set cake-autorate.wan.mqtt_host='broker.lan'
+uci set cake-autorate.wan.mqtt_tls='1'
+uci set cake-autorate.wan.mqtt_tls_ca_file='/etc/ssl/mqtt-ca.pem'
+uci commit cake-autorate
+/etc/init.d/cake-autorate restart
+```
+
+The publisher reads the CA file when it starts. After replacing the file, or
+after the broker certificate changes, the publisher picks it up on its next
+start; restart the service to do that at once.
+
+### A single self-signed certificate
+
+If you prefer no certificate authority, create one self-signed certificate for
+the broker and use it as the router's CA file. It must not be marked as a CA:
+the TLS library refuses a CA certificate as a server's own certificate, even
+when it is trusted, and the log shows `CaUsedAsEndEntity`. OpenSSL marks the
+certificate as a CA by default, so ask for the opposite:
+
+```sh
+openssl req -x509 -newkey rsa:3072 -sha256 -days 825 -nodes \
+    -keyout broker.key -out broker.crt -subj "/CN=broker.lan" \
+    -addext "subjectAltName=DNS:broker.lan,IP:192.168.1.10" \
+    -addext "basicConstraints=critical,CA:FALSE"
+```
+
+Use `broker.crt` as the broker's `certfile` and copy the same file to the router
+as `/etc/ssl/mqtt-ca.pem`. The router has to be given a new copy whenever the
+certificate is renewed.
+
+### The router's clock
+
+The certificate's dates are checked against the router's clock. After a restart
+the clock can be behind until NTP has synchronised, and a certificate issued
+today then looks "not yet valid" for a short while; the publisher fails, the
+system restarts it a few times, and the log says `certificate not valid yet`
+with both times. If the publisher has given up, restart the service once the
+time is right.

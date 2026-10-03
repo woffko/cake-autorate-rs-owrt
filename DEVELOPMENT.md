@@ -118,6 +118,20 @@ None depends on an unvalidated input. The Auto-Tune search, the routed DNS
 answer parser and the controller's text parsers were also run with the checks
 on against about 3.4 million random and mutated inputs without a panic.
 
+## MQTT over TLS tests
+
+The MQTT publisher tests run a TLS broker inside the test process: a rustls
+`ServerConfig` serving certificates that the tests generate with the `rcgen`
+dev-dependency (a private CA, server certificates that are valid, expired, not
+yet valid or issued for another name, and self-signed certificates with and
+without the CA flag). No key is stored in the repository, and `rcgen` is not
+compiled into the packages. The tests cover the trust rules (private CA, wrong
+CA, built-in roots, unverified mode), the CA file rules, several MQTT packets
+in one TLS record, the handshake probe of `--mqtt-status`, and the plan
+encodings: a plain plan keeps the bytes of the release before TLS, checked
+against a golden plan produced by that release, while a TLS plan uses the
+version-2 encoding.
+
 ## Tests against a real nftables
 
 Two ignored unit tests apply the traffic-classifier rules to a real nftables in

@@ -243,7 +243,7 @@ that controller:
 | Observability | Detailed logs and external analysis tools | Live JSON status, component-level Services health, CPU/softirq and CAKE diagnostics, redacted export, and opt-in RAM-only synchronized latency/CPU/traffic graphs |
 | Traffic policy | Relies on the surrounding CAKE/SQM configuration | Optional outbound-only nftables DSCP profiles for Gaming, Best overall, Fair, and editable Custom rules, with runtime checksum attestation and no second qdisc owner |
 | Automation | Primarily controller runtime | Scheduled quiet-window Auto-Tune, per-instance speed-test server caching, package/backend checks, and safe review-only versus validated auto-apply modes |
-| Integrations | Upstream logging/analysis ecosystem | Optional MQTT/Home Assistant publisher and a LuCI replacement surface for the managed SQM settings |
+| Integrations | Upstream logging/analysis ecosystem | Optional MQTT/Home Assistant publisher (plain or over TLS) and a LuCI replacement surface for the managed SQM settings |
 
 The additions are intentionally bounded. This is not a drop-in rewrite of every
 upstream script, log-analysis utility, or platform integration. In particular,

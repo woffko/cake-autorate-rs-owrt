@@ -436,12 +436,69 @@ See [Profile traffic priorities](TRAFFIC_PRIORITIES.md) for the rule model.
 
 The Logging tab of an instance can publish telemetry to an MQTT broker, for
 example for Home Assistant. Enable **MQTT publisher**, set the broker host and,
-if needed, the port, user name and password. The publisher also needs **Log to
-file** and summary statistics.
+if needed, the user name and password. The publisher also needs **Log to file**
+and summary statistics. **Check MQTT** shows whether the saved settings are
+ready; save pending edits first. For a TLS broker it also opens a TLS session
+with the saved address and says whether the certificate is accepted; it sends
+no user name, password or data, and it does not contact a plain MQTT broker.
 
-The connection is plain MQTT without TLS (port 1883 by default). The user name,
-the password and the metrics are sent unencrypted, so use a broker on a trusted
-local network.
+### Encryption (TLS)
+
+**MQTT TLS** encrypts the connection to the broker (MQTT over TLS) and checks
+the broker's certificate. It is on by default when you set up a publisher, and
+the port then defaults to 8883. A publisher that was saved before this option
+existed keeps speaking plain MQTT on port 1883 after an upgrade, and the option
+shows as off; turn it on when the broker is ready for TLS. Without TLS the user
+name, the password and the metrics are sent unencrypted, so use plain MQTT only
+with a broker on a trusted local network.
+
+- **Public CA.** A broker whose certificate was issued by a public certificate
+  authority (a hosted broker, for example) needs nothing else: the publisher
+  trusts the public CA list that is built into the daemon.
+- **Private CA or self-signed certificate.** Set **MQTT CA file** to the
+  absolute path of a PEM file that holds the CA certificate of the broker (or
+  the broker's own self-signed certificate). Copy the file to the router, for
+  example to `/etc/ssl/mqtt-ca.pem`, and make it owned by root and writable by
+  root only (`chown root:root /etc/ssl/mqtt-ca.pem; chmod 644
+  /etc/ssl/mqtt-ca.pem`). Once a CA file is set, only the certificates in it are
+  trusted; the public list is not used. The broker side of this is described in
+  the [setup guide](SETUP_GUIDE.md#sending-telemetry-to-a-broker-over-tls).
+- **Host name.** The certificate has to be valid for exactly the name or address
+  in **MQTT host**. A certificate issued for `broker.lan` does not match the
+  address `192.168.1.10`, unless that address is in the certificate too.
+- **Verify certificate** can be switched off. The connection stays encrypted,
+  but any certificate is accepted, so anyone who can intercept the connection
+  can pose as the broker and read the password. Use it to test, or on a
+  trusted network when you cannot supply a CA file.
+- **Clock.** The dates in the certificate are checked against the router's
+  clock. Until the router has synchronised its time (NTP) after a start, the
+  broker's certificate can look "not yet valid", the connection fails, and the
+  system restarts the publisher a few times. If it has given up by the time the
+  clock is right, restart the service: `/etc/init.d/cake-autorate restart`.
+- **Not supported:** client certificates (a broker that requires them refuses
+  the publisher), MQTT over WebSocket, and brokers limited to TLS 1.1 or older
+  or to non-ECDHE cipher suites. TLS 1.2 and 1.3 are used.
+
+If the publisher cannot connect, the reason is in the system log
+(`logread -e cake-autorate`); **Check MQTT** shows the same messages for a TLS
+broker without starting the publisher:
+
+| Message | Meaning |
+|---|---|
+| `invalid peer certificate: UnknownIssuer` | The broker's certificate is not trusted: set or fix **MQTT CA file**. |
+| `certificate expired` or `certificate not valid yet` | The certificate's dates do not fit the router's clock; the message shows both times. |
+| `certificate not valid for name` | **MQTT host** does not match the names in the certificate. |
+| `CaUsedAsEndEntity` | The broker presents a CA certificate as its own server certificate; see the setup guide. |
+| `the broker closed the connection during the handshake (is this a TLS port?)` | The port does not speak TLS: check the port, or turn TLS off for a plain broker. |
+| `unable to open the MQTT CA file`, `must be owned by root`, `no certificate` | The CA file is missing, not safe or not PEM. |
+
+The settings are the `mqtt_*` options of the instance:
+
+- `mqtt_tls`: `1` for TLS, `0` or absent for plain MQTT.
+- `mqtt_port`: defaults to 8883 with TLS and to 1883 without.
+- `mqtt_tls_ca_file`: absolute path of the PEM file; empty uses the built-in
+  public list.
+- `mqtt_tls_verify`: `1` by default, `0` accepts any certificate.
 
 ## Optional external IPv4 lookup
 

@@ -236,7 +236,9 @@ Implemented:
 - Optional native MQTT publisher service: per-instance MQTT export reads
   bounded SUMMARY/CPU log records, speaks MQTT 3.1.1 directly without exposing
   credentials in a child-process argument list, and registers retained Home
-  Assistant discovery and availability records when enabled.
+  Assistant discovery and availability records when enabled. The connection can
+  use TLS (MQTT over TLS) with the public CA list built into the daemon or with
+  an operator-supplied CA file; certificate verification is on by default.
 - Automatic interface preset: selecting the target interface fills
   `sqm_interface`, `ul_if`, and `dl_if=ifb4<target>`. Automatic pinger binding
   is derived from the current route at runtime, not stored in extra arguments.
@@ -301,10 +303,14 @@ Known limits:
   member-scoped status API. The application validates and consumes that state;
   it does not invent a missing uplink or repair an invalid mwan3 policy.
 - MQTT is an optional native sidecar rather than controller authority. It
-  requires a configured plain-MQTT broker, `log_to_file=1`, and
-  `output_summary_stats=1`; CPU sensors additionally require
-  `output_cpu_stats=1`. Broker loss terminates the sidecar so procd owns retry
-  policy, while retained LWT marks the instance offline.
+  requires a configured broker (plain MQTT, or MQTT over TLS with `mqtt_tls=1`),
+  `log_to_file=1`, and `output_summary_stats=1`; CPU sensors additionally
+  require `output_cpu_stats=1`. Broker loss, a failed TLS handshake or an
+  unusable CA file terminates the sidecar so procd owns retry policy, while
+  retained LWT marks the instance offline. A configuration without `mqtt_tls`
+  stays plain MQTT on port 1883, so an upgrade does not change its behaviour;
+  with TLS the default port is 8883. A TLS plan uses its own versioned encoding,
+  and a plain plan keeps the bytes of the earlier release.
 
 SQM integration:
 
@@ -442,6 +448,14 @@ The LuCI Logging tab validates the built-in native MQTT publisher. No external
 MQTT client package is needed. After setting `mqtt_enabled=1`, `mqtt_host`, and
 the required summary logging options, restart `cake-autorate`; its Full-only
 MQTT sidecar creates Home Assistant discovery sensors and publishes instance
-state under the configured base topic. The connection is plain MQTT without
-TLS, so the user name, the password and the metrics travel unencrypted; use a
-broker on a trusted local network.
+state under the configured base topic. With `mqtt_tls=1` the connection is
+encrypted and the broker certificate is verified against the built-in public CA
+list, or against the PEM file in `mqtt_tls_ca_file` when one is set (a file that
+must be a regular file owned by root and not writable by group or others).
+`mqtt_tls_verify=0` keeps the encryption but accepts any certificate. Without
+TLS the user name, the password and the metrics travel unencrypted; use a broker
+on a trusted local network. Certificate dates are judged by the router clock, so
+a start before NTP has synchronised can fail until it has; `--mqtt-status`
+reports the TLS mode, why a CA file cannot be used and, for a TLS broker, the
+result of a TLS handshake that sends no MQTT packet; the handshake error of the
+publisher goes to the system log.
