@@ -213,17 +213,20 @@ var optionDescriptions = {
 	log_file_buffer_size_B: 'Buffered log write size in bytes.',
 	log_file_buffer_timeout_ms: 'Maximum time before flushing buffered log output.',
 	mqtt_enabled: 'Start the native MQTT telemetry publisher for this instance. It reads bounded daemon log records and publishes Home Assistant discovery, state, and availability directly.',
-	mqtt_host: 'MQTT broker host or address. Required only when the MQTT publisher is enabled. This is plain MQTT without TLS: the user name, the password and the metrics are sent unencrypted, so use a broker on a trusted local network.',
-	mqtt_port: 'MQTT broker port. Leave empty to use 1883.',
+	mqtt_host: 'MQTT broker host or address. Required only when the MQTT publisher is enabled. With TLS the broker certificate must be valid for exactly this name or address.',
+	mqtt_port: 'MQTT broker port. Leave empty to use 8883 with TLS and 1883 without.',
+	mqtt_tls: 'Encrypt the connection to the broker with TLS (MQTT over TLS, usually port 8883) and check the broker certificate. The certificate dates are checked against the router clock, so the connection can fail until the time is synchronised (NTP); the publisher is restarted by the system until it succeeds.',
+	mqtt_tls_ca_file: 'Optional absolute path of a PEM file with the CA certificate of the broker, or with its self-signed certificate. The file must be owned by root and not writable by others. When it is set, only the certificates in it are trusted. Leave empty to trust the public CA list built into the daemon.',
+	mqtt_tls_verify: 'Check that the broker certificate is valid, trusted and issued for the broker host. Switching this off keeps the connection encrypted but accepts any certificate, so anyone who can intercept the connection can pose as the broker and read the password.',
 	mqtt_username: 'Optional MQTT broker username.',
-	mqtt_password: 'Optional MQTT broker password. It is sent to the broker unencrypted (plain MQTT).',
+	mqtt_password: 'Optional MQTT broker password. Without TLS it is sent to the broker unencrypted.',
 	mqtt_discovery_prefix: 'Home Assistant MQTT discovery prefix.',
 	mqtt_base_topic: 'Base MQTT topic used for instance state and availability.',
 	mqtt_device_id: 'Home Assistant device identifier prefix. The instance name is appended automatically.',
 	mqtt_device_name: 'Home Assistant device display name prefix. The instance name is appended automatically.',
 	mqtt_min_interval_s: 'Minimum seconds between MQTT state publications.',
 	mqtt_publish_cpu_stats: 'Publish CPU sensors through MQTT. Requires CPU stats logging.',
-	_mqtt_status: 'Check whether the native publisher and required saved log settings are ready for this instance. Save pending MQTT edits before relying on this status.',
+	_mqtt_status: 'Check whether the native publisher and required saved log settings are ready for this instance. With TLS it also opens a TLS session with the saved broker and reports whether its certificate is accepted; no user name, password or data is sent. Save pending MQTT edits before relying on this status.',
 	enable_sleep_function: 'Allow the controller to sleep during sustained idle periods.',
 	sustained_idle_sleep_thr_s: 'Idle duration before sleep behavior may engage.',
 	min_shaper_rates_enforcement: 'Prevent shaper rates from dropping below configured minimums.',
@@ -4896,6 +4899,21 @@ function formatPingerPlan(result) {
 	return lines.join('\n');
 }
 
+function mqttNotice(section, key, dependency, level, text) {
+	var o = section.taboption('logging', form.DummyValue, key, ' ');
+
+	modal(o);
+	o.rawhtml = true;
+	o.depends(dependency);
+	o.cfgvalue = function() {
+		return E('div', { 'class': 'alert-message ' + level }, cakeUi.text(text));
+	};
+	o.write = function() {};
+	o.remove = function() {};
+
+	return o;
+}
+
 function runMqttStatus(section_id, mode) {
 	return fs.exec('/usr/sbin/cake-autorated', [
 		'--mqtt-status', section_id,
@@ -4914,6 +4932,17 @@ function formatMqttStatus(result) {
 	lines.push(_('MQTT publisher enabled: %s').format(yesNo(result.enabled)));
 	lines.push(_('Native MQTT publisher: %s').format(yesNo(result.installed)));
 	lines.push(_('Broker host configured: %s').format(yesNo(result.configured_host)));
+	if (result.tls != null) {
+		lines.push(_('TLS: %s').format(yesNo(result.tls)));
+		if (result.tls) {
+			lines.push(_('Certificate verification: %s').format(yesNo(result.tls_verify)));
+			if (result.tls_verify)
+				lines.push(_('CA file configured: %s').format(yesNo(result.tls_ca_file)));
+			if (result.tls_handshake === 'ok' || result.tls_handshake === 'failed')
+				lines.push(_('TLS handshake with the broker: %s').format(
+					result.tls_handshake === 'ok' ? _('ok') : _('failed')));
+		}
+	}
 	lines.push(_('Log to file: %s').format(yesNo(result.log_to_file)));
 	lines.push(_('Summary stats: %s').format(yesNo(result.summary_enabled)));
 	lines.push(_('CPU stats: %s').format(yesNo(result.cpu_enabled)));
@@ -8460,8 +8489,43 @@ function addLoggingOptions(section) {
 		return true;
 	};
 
-	o = optionalValue(section, 'logging', 'mqtt_port', _('MQTT port'), 'port', '1883');
+	o = optionalValue(section, 'logging', 'mqtt_port', _('MQTT port'), 'port', '8883 with TLS, 1883 without');
 	o.depends('mqtt_enabled', '1');
+
+	o = flag(section, 'logging', 'mqtt_tls', _('MQTT TLS'), '1');
+	o.depends('mqtt_enabled', '1');
+	o.cfgvalue = function(section_id) {
+		var saved = uci.get('cake-autorate', section_id, 'mqtt_tls');
+
+		/* A publisher saved before this option existed speaks plain MQTT.
+		 * Show that, not the default for new settings, so the form never
+		 * disagrees with what the daemon does. */
+		if (saved == null && uci.get('cake-autorate', section_id, 'mqtt_enabled') === '1')
+			return '0';
+
+		return saved;
+	};
+
+	o = optionalValue(section, 'logging', 'mqtt_tls_ca_file', _('MQTT CA file'), null, '');
+	o.depends({ mqtt_enabled: '1', mqtt_tls: '1', mqtt_tls_verify: '1' });
+	o.placeholder = _('built-in public CA list');
+	o.validate = function(section_id, value) {
+		if (value && (value.charAt(0) !== '/' || value.charAt(value.length - 1) === '/' ||
+		    value.length > 1024 || /[\u0000-\u001f\u007f]/.test(value)))
+			return _('The MQTT CA file must be an absolute path to a file, at most 1024 characters.');
+
+		return true;
+	};
+
+	o = flag(section, 'logging', 'mqtt_tls_verify', _('Verify certificate'), '1');
+	o.depends({ mqtt_enabled: '1', mqtt_tls: '1' });
+
+	mqttNotice(section, '_mqtt_plain_notice', { mqtt_enabled: '1', mqtt_tls: '0' }, 'notice',
+		_('Plain MQTT: the user name, the password and the metrics are sent unencrypted. Use it only with a broker on a trusted local network, or enable MQTT TLS.'));
+	mqttNotice(section, '_mqtt_unverified_notice', { mqtt_enabled: '1', mqtt_tls: '1', mqtt_tls_verify: '0' }, 'warning',
+		_('Certificate verification is off. The connection is encrypted, but the broker is not authenticated: anyone who can intercept it can pose as the broker and read the password.'));
+	mqttNotice(section, '_mqtt_port_notice', { mqtt_enabled: '1', mqtt_tls: '1', mqtt_port: '1883' }, 'notice',
+		_('Port 1883 is normally plain MQTT. TLS brokers usually listen on 8883.'));
 
 	o = optionalValue(section, 'logging', 'mqtt_username', _('MQTT username'), null, '');
 	o.depends('mqtt_enabled', '1');
