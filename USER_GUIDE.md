@@ -493,14 +493,14 @@ TLS broker without starting the publisher:
 | `certificate not valid for name` | **MQTT host** does not match the names in the certificate. |
 | `CaUsedAsEndEntity` | The broker presents a CA certificate as its own server certificate; see the setup guide. |
 | `the broker closed the connection during the handshake (is this a TLS port?)` | The port does not speak TLS: check the port, or turn TLS off for a plain broker. |
-| `unable to open the MQTT CA file`, `must be owned by root`, `no certificate` | The CA file is missing, not safe or not PEM. |
+| `unable to open the MQTT CA file`, `must be owned by root`, `no certificate` | The CA file is missing, not safe, too large or not PEM. |
 
 The settings are the `mqtt_*` options of the instance:
 
 - `mqtt_tls`: `1` for TLS, `0` or absent for plain MQTT.
 - `mqtt_port`: defaults to 8883 with TLS and to 1883 without.
-- `mqtt_tls_ca_file`: absolute path of the PEM file; empty uses the built-in
-  public list.
+- `mqtt_tls_ca_file`: absolute path of the PEM file (at most 1 MiB and 512
+  certificates); empty uses the built-in public list.
 - `mqtt_tls_verify`: `1` by default, `0` accepts any certificate.
 
 ## Optional external IPv4 lookup

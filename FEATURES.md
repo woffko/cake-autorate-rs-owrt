@@ -450,14 +450,15 @@ Legacy `log_file_export_compress` values remain readable for compatibility but
 do not enable runtime compression. LuCI diagnostic downloads remain plain text,
 including safely decoded older gzip archives.
 
-The LuCI Logging tab validates the built-in native MQTT publisher. No external
+The LuCI Monitoring tab (with expert options shown) validates the built-in native MQTT publisher. No external
 MQTT client package is needed. After setting `mqtt_enabled=1`, `mqtt_host`, and
 the required summary logging options, restart `cake-autorate`; its Full-only
 MQTT sidecar creates Home Assistant discovery sensors and publishes instance
 state under the configured base topic. With `mqtt_tls=1` the connection is
 encrypted and the broker certificate is verified against the built-in public CA
 list, or against the PEM file in `mqtt_tls_ca_file` when one is set (a file that
-must be a regular file owned by root and not writable by group or others).
+must be a regular file owned by root and not writable by group or others, at most
+1 MiB with at most 512 certificates).
 `mqtt_tls_verify=0` keeps the encryption but accepts any certificate. Without
 TLS the user name, the password and the metrics travel unencrypted; use a broker
 on a trusted local network. Certificate dates are judged by the router clock, so
