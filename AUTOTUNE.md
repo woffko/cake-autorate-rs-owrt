@@ -494,10 +494,38 @@ only for accounting. Replay accepts a switch only after the selected-server
 receipt, from the direction's current source, to a source that direction has
 not used, before any fallback, restore or Review record, and with the exact
 pending debits; Review verification additionally requires every switch to
-follow the comparison's order. A run makes at most four switches, and only
-while the journal has room for a full measurement epoch. A requested server
-is never replaced. The worker log shows each switch as
+follow the comparison's order. A requested server is never replaced. The
+worker log shows each switch as
 `autotune-server-switch direction=... phase=... from=... to=...`.
+
+A run makes at most four switches, and a switch discards the failed epoch's
+results, so the worker makes one only when the restarted measurements can
+finish. All three limits must hold:
+
+- **Time.** The monotonic time left until the 45-minute deadline covers 125% of
+  the time the failed epoch has taken and at least 10 minutes. A complete set
+  of measurements took about 8.3 minutes on the test VM; slower links and
+  retries take longer. A worker that was restarted does not know when the
+  epoch began (the journal has no timestamps) and uses the 10-minute floor.
+- **Traffic.** With a capped budget, the traffic left covers 125% of what the
+  failed epoch consumed. An unlimited budget has no such limit.
+- **Journal.** The journal has room for 125% of the records the failed epoch
+  used, and for at least 96. Complete runs on the test VM used 65 to 79
+  records in total, so 96 covers a typical epoch. The journal itself holds at
+  most 302 records.
+
+When a limit fails, the worker logs
+`autotune-server-switch-skipped reason=time|budget|journal ...` and keeps the
+failed epoch's outcome, exactly as if no backup server existed. These limits
+apply when a switch is written; replay still accepts every switch that the
+previous rule accepted, so existing journals stay readable.
+
+A directional measurement also tolerates at most eight restartable
+measurement-basis losses (a route or runtime reset before or during the
+load). A path that keeps resetting stops the test with
+`native-autotune-measurement-basis-unstable` instead of being retried until
+the deadline, because every restart after the load began has already spent
+test traffic.
 
 ## CAKE options after an incomplete search
 

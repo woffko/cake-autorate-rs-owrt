@@ -346,7 +346,8 @@ offered, marked with that finding, and need your confirmation to apply.
 
 If a test cannot finish (for example the route changed, the traffic budget
 ran out or the time limit expired), no new rates are offered from the
-incomplete measurements. The wizard says why it stopped and that
+incomplete measurements. A route or shaper that keeps changing during a single
+measurement also stops the test after eight restarts. The wizard says why it stopped and that
 your current settings are unchanged; you can keep them or run the test again.
 
 If the service refuses the test before it begins (for example the daemon and
@@ -374,7 +375,10 @@ If a server still fails after all retries, the test switches to another
 server that did well in the server comparison and repeats its measurements
 there, so results from two servers are never compared with each other. Only
 the failing direction changes server; the traffic already used still counts.
-A test switches at most four times.
+A test switches at most four times. A switch restarts the measurements, so it
+is made only when enough time (at least 10 minutes before the 45-minute limit),
+traffic budget and test records remain to finish them. Otherwise the test keeps
+the result it already has, as if no other server were available.
 
 ### When the search could not finish
 

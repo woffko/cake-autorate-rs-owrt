@@ -136,6 +136,18 @@ config traffic_rule
 	option order '200'
 ```
 
+Ports are decimal numbers or ranges separated by commas, for example
+`53,443,27000-27100`. A network is one IPv4 or IPv6 address with an optional
+prefix of up to three digits. The daemon installs both in canonical form:
+ports in ascending order with repeated entries removed and overlapping ranges
+merged, and networks with the host bits of the prefix cleared (`10.0.0.5/24`
+becomes `10.0.0.0/24`). Signs, spaces and leading zeros in IPv4 octets are
+refused.
+
+If nftables still refuses one entry, nothing is applied and the error names
+the rule (`Traffic rule NAME was rejected by nftables`). Fix or disable that
+rule and apply again.
+
 ## Activation and safety checks
 
 Rules are installed only when all of these are true for the instance:
