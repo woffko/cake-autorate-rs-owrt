@@ -941,3 +941,106 @@ fn a_self_signed_broker_certificate_is_trusted_only_when_it_is_not_a_ca() {
     assert!(error.contains("CA:FALSE"), "{error}");
     assert!(broker.join().unwrap().is_err());
 }
+
+// --- a start that cannot reach the broker ---------------------------------------------
+
+#[test]
+fn a_start_that_cannot_reach_the_broker_is_retried_with_a_growing_pause() {
+    let mut calls = 0;
+    let mut pauses = Vec::new();
+    let mut reported = Vec::new();
+    let result = connect_with_retry(
+        || {
+            calls += 1;
+            if calls <= 7 {
+                Err("unable to connect to MQTT broker: Connection refused".to_string())
+            } else {
+                Ok("connected")
+            }
+        },
+        |pause| {
+            pauses.push(pause.as_secs());
+            Ok(false)
+        },
+        |error| reported.push(error.to_string()),
+    )
+    .unwrap();
+    assert_eq!(result, Some(("connected", true)));
+    assert_eq!(pauses, [5, 10, 20, 40, 60, 60, 60]);
+    // The same error is not repeated on every attempt.
+    assert_eq!(reported.len(), 1, "{reported:?}");
+}
+
+#[test]
+fn a_broker_that_answers_at_once_costs_no_wait() {
+    let result = connect_with_retry(
+        || Ok::<_, String>("connected"),
+        |_| panic!("no pause is needed"),
+        |_| panic!("no error to report"),
+    )
+    .unwrap();
+    assert_eq!(result, Some(("connected", false)));
+}
+
+#[test]
+fn the_stop_signal_ends_the_retry_without_another_attempt() {
+    let mut calls = 0;
+    let mut waits = 0;
+    let result = connect_with_retry(
+        || {
+            calls += 1;
+            Err::<(), _>("unable to connect to MQTT broker: timed out".to_string())
+        },
+        |_| {
+            waits += 1;
+            Ok(waits == 3)
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert!(result.is_none());
+    assert_eq!((calls, waits), (3, 3));
+}
+
+#[test]
+fn a_failure_that_changes_or_lasts_is_reported_again() {
+    let mut calls = 0u32;
+    let mut reported = Vec::new();
+    connect_with_retry(
+        || {
+            calls += 1;
+            match calls {
+                1..=24 => Err("unable to connect to MQTT broker: Connection refused".to_string()),
+                25..=26 => Err("MQTT TLS handshake failed: timed out".to_string()),
+                _ => Ok(()),
+            }
+        },
+        |_| Ok(false),
+        |error| reported.push(error.to_string()),
+    )
+    .unwrap();
+    // First attempt, every tenth repeat, and the new error when it appears.
+    assert_eq!(
+        reported,
+        [
+            "unable to connect to MQTT broker: Connection refused",
+            "unable to connect to MQTT broker: Connection refused",
+            "unable to connect to MQTT broker: Connection refused",
+            "MQTT TLS handshake failed: timed out",
+        ]
+    );
+}
+
+#[test]
+fn the_wait_for_the_stop_signal_returns_early_when_it_arrives() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::UnixStream;
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    let started = Instant::now();
+    assert!(!wait_readable(reader.as_raw_fd(), Duration::from_millis(60)).unwrap());
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    writer.write_all(b"x").unwrap();
+    let started = Instant::now();
+    assert!(wait_readable(reader.as_raw_fd(), Duration::from_secs(30)).unwrap());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}

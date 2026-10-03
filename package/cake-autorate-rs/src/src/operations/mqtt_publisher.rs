@@ -4,8 +4,11 @@
 //! `tail | awk | mosquitto_pub` pipeline through predictable FIFOs. This
 //! module keeps the publisher as a non-authoritative procd sidecar, but owns
 //! configuration, aggregation and the MQTT wire contract in Rust. The live
-//! reader is event-driven; loss of the broker is terminal so procd, rather
-//! than an internal sleep loop, owns bounded restart policy.
+//! reader is event-driven; loss of an established connection is terminal so
+//! procd, rather than an internal sleep loop, owns the bounded restart policy.
+//! A start that cannot reach the broker is the exception: it waits and retries
+//! itself, because the service lifecycle accepts a restarted publisher only
+//! while its process stays alive (see `connect_with_retry`).
 
 use super::json_wire::json_escape;
 use super::runtime_health::{safe_name, UciPackage, UciSection};
@@ -34,6 +37,13 @@ const MQTT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESOLVED_ADDRESSES: usize = 8;
 const MAX_LOG_READ_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_LINE_BYTES: usize = 64 * 1024;
+/// First pause, and the longest pause, between attempts to reach the broker
+/// when the publisher starts and cannot.
+const CONNECT_RETRY_FIRST: Duration = Duration::from_secs(5);
+const CONNECT_RETRY_LAST: Duration = Duration::from_secs(60);
+/// A start that keeps failing with the same error repeats it in the system
+/// log once in this many attempts.
+const CONNECT_ERROR_REPEAT: u32 = 10;
 const MQTT_PORT: u16 = 1883;
 const MQTT_TLS_PORT: u16 = 8883;
 const MAX_CA_PATH_BYTES: usize = 1024;
@@ -358,7 +368,19 @@ where
         MonotonicTimer::periodic(Duration::from_secs(u64::from(MQTT_KEEPALIVE_SECONDS) / 2))?;
     let cpu_cores = cpu_core_count()?;
     start_notify::notify(&config);
-    let mut client = MqttClient::connect(&config)?;
+    let Some((mut client, waited)) = connect_with_retry(
+        || MqttClient::connect(&config),
+        |pause| stop_signal_within(&signals, pause),
+        |error| eprintln!("ERROR: {error}"),
+    )?
+    else {
+        return Ok(());
+    };
+    if waited {
+        // What the controller logged while the broker was away is history.
+        follower = LogFollower::open(config.log_path())?;
+        changes = LogEvents::new(follower.path())?;
+    }
     if let Some(summary) = client.tls_summary(config.tls_verify) {
         eprintln!("{summary}");
     }
@@ -449,6 +471,73 @@ where
             }
         }
     }
+}
+
+/// Keep trying to reach the broker until it answers or the service is stopped.
+///
+/// A broker that is down, a certificate that does not fit yet or a router clock
+/// that is not right yet must not end the process. The service lifecycle only
+/// accepts a restarted publisher whose process stays alive: a publisher that
+/// exited at once made a configuration change fail and left the whole service
+/// stopped, whatever the cause. The pause grows from 5 s to 60 s, an unchanged
+/// error is logged again only now and then, and `stopped(pause)` ends the wait
+/// early with `true` when the service is stopped. The result tells whether any
+/// waiting happened. A connection that was up and is lost still ends the
+/// process, and procd restarts it.
+fn connect_with_retry<T>(
+    mut connect: impl FnMut() -> Result<T, String>,
+    mut stopped: impl FnMut(Duration) -> Result<bool, String>,
+    mut report: impl FnMut(&str),
+) -> Result<Option<(T, bool)>, String> {
+    let mut pause = CONNECT_RETRY_FIRST;
+    let mut failures = 0u32;
+    let mut last = String::new();
+    loop {
+        match connect() {
+            Ok(client) => return Ok(Some((client, failures > 0))),
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                if failures == 1 || error != last || failures % CONNECT_ERROR_REPEAT == 0 {
+                    report(&error);
+                }
+                last = error;
+                if stopped(pause)? {
+                    return Ok(None);
+                }
+                pause = pause.saturating_mul(2).min(CONNECT_RETRY_LAST);
+            }
+        }
+    }
+}
+
+/// Wait up to `pause` for the stop signal.
+fn stop_signal_within(signals: &SignalEvents, pause: Duration) -> Result<bool, String> {
+    if wait_readable(signals.as_raw_fd(), pause)? {
+        signals.drain()?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// True when `descriptor` became readable within `pause`. A signal that is not
+/// ours cuts the wait short, which only makes the next attempt earlier.
+fn wait_readable(descriptor: RawFd, pause: Duration) -> Result<bool, String> {
+    let mut poll = libc::pollfd {
+        fd: descriptor,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let milliseconds = libc::c_int::try_from(pause.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `poll` is one valid pollfd that lives for the whole call.
+    let result = unsafe { libc::poll(&mut poll, 1, milliseconds) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(format!("MQTT retry wait failed: {error}"));
+    }
+    Ok(poll.revents & libc::POLLIN != 0)
 }
 
 pub(crate) fn service_configs(package: &UciPackage) -> Result<Vec<MqttPublisherConfig>, String> {

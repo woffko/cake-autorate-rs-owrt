@@ -474,16 +474,17 @@ with a broker on a trusted local network.
   trusted network when you cannot supply a CA file.
 - **Clock.** The dates in the certificate are checked against the router's
   clock. Until the router has synchronised its time (NTP) after a start, the
-  broker's certificate can look "not yet valid", the connection fails, and the
-  system restarts the publisher a few times. If it has given up by the time the
-  clock is right, restart the service: `/etc/init.d/cake-autorate restart`.
+  broker's certificate can look "not yet valid" and the connection fails. The
+  publisher keeps trying (pausing 5 seconds, growing to 60) and connects by
+  itself once the clock is right.
 - **Not supported:** client certificates (a broker that requires them refuses
   the publisher), MQTT over WebSocket, and brokers limited to TLS 1.1 or older
   or to non-ECDHE cipher suites. TLS 1.2 and 1.3 are used.
 
-If the publisher cannot connect, the reason is in the system log
-(`logread -e cake-autorate`); **Check MQTT** shows the same messages for a TLS
-broker without starting the publisher:
+If the publisher cannot connect, it keeps trying (pausing 5 seconds, growing to
+60) and writes the reason to the system log (`logread -e cake-autorate`, the same
+reason again every tenth attempt); **Check MQTT** shows the same messages for a
+TLS broker without starting the publisher:
 
 | Message | Meaning |
 |---|---|

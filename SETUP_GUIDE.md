@@ -415,7 +415,6 @@ certificate is renewed.
 
 The certificate's dates are checked against the router's clock. After a restart
 the clock can be behind until NTP has synchronised, and a certificate issued
-today then looks "not yet valid" for a short while; the publisher fails, the
-system restarts it a few times, and the log says `certificate not valid yet`
-with both times. If the publisher has given up, restart the service once the
-time is right.
+today then looks "not yet valid" for a short while. The publisher logs
+`certificate not valid yet` with both times, keeps trying and connects by itself
+once the time is right.

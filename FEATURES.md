@@ -305,9 +305,15 @@ Known limits:
 - MQTT is an optional native sidecar rather than controller authority. It
   requires a configured broker (plain MQTT, or MQTT over TLS with `mqtt_tls=1`),
   `log_to_file=1`, and `output_summary_stats=1`; CPU sensors additionally
-  require `output_cpu_stats=1`. Broker loss, a failed TLS handshake or an
-  unusable CA file terminates the sidecar so procd owns retry policy, while
-  retained LWT marks the instance offline. A configuration without `mqtt_tls`
+  require `output_cpu_stats=1`. Loss of an established connection terminates
+  the sidecar so procd owns retry policy, while retained LWT marks the instance
+  offline. A start that cannot reach the broker (broker down, TLS handshake
+  refused, unusable CA file, router clock not yet right) does not end the
+  process: the publisher logs the reason and retries itself, pausing 5 s and
+  growing to 60 s, until it connects or the service is stopped. The service
+  lifecycle accepts a restarted publisher only while its process stays alive, so
+  a publisher that exited at once made a configuration change fail and left the
+  service stopped. A configuration without `mqtt_tls`
   stays plain MQTT on port 1883, so an upgrade does not change its behaviour;
   with TLS the default port is 8883. A TLS plan uses its own versioned encoding,
   and a plain plan keeps the bytes of the earlier release.
