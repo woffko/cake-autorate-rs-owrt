@@ -308,7 +308,9 @@ impl RatingRuntimeSnapshot {
             ("download CAKE rate", self.cake_dl_kbps),
             ("upload CAKE rate", self.cake_ul_kbps),
         ] {
-            if value != value.round() {
+            // `inf.round() == inf`: finiteness must not depend on the range
+            // check above.
+            if !value.is_finite() || value != value.round() {
                 return Err(format!("{name} is not an exact kbit/s value"));
             }
         }
@@ -1923,6 +1925,16 @@ mod tests {
         let mut fractional_intent = snapshot();
         fractional_intent.cake_ul_kbps = 19_999.375;
         assert!(fractional_intent.validate().is_err());
+
+        // Non-finite CAKE rates are never exact kbit/s values.
+        for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let mut non_finite = snapshot();
+            non_finite.cake_dl_kbps = value;
+            assert!(non_finite.validate().is_err(), "download {value}");
+            let mut non_finite = snapshot();
+            non_finite.cake_ul_kbps = value;
+            assert!(non_finite.validate().is_err(), "upload {value}");
+        }
     }
 
     #[test]
