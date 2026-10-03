@@ -385,6 +385,15 @@ impl InstanceManifest {
     }
 }
 
+/// The rules one custom entry produced, kept so that a rejected table can be
+/// traced to the entry that nftables refuses.
+#[derive(Clone, Debug)]
+struct CustomRuleSnippet {
+    name: String,
+    forward: String,
+    output: String,
+}
+
 #[derive(Clone, Debug)]
 struct RenderedRuleset {
     text: String,
@@ -393,6 +402,7 @@ struct RenderedRuleset {
     instances: Vec<InstanceManifest>,
     builtin_rules: usize,
     custom_rules: usize,
+    custom_snippets: Vec<CustomRuleSnippet>,
 }
 
 #[derive(Clone, Debug)]
@@ -645,36 +655,78 @@ fn family(value: &str) -> Result<AddressFamily, String> {
     }
 }
 
-fn validate_ports(value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Ok(());
+/// One port number: ASCII digits only, 1..=65535. Rust's integer parser also
+/// accepts a leading `+`, which nftables rejects, and a leading zero is octal
+/// there, so only the parsed value is ever emitted.
+fn parse_port(text: &str) -> Option<u16> {
+    if text.is_empty() || text.len() > 5 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
+    text.parse::<u16>().ok().filter(|port| *port > 0)
+}
+
+/// Validate a comma-separated port list and return its canonical text: ports
+/// and ranges ascending, duplicates removed and overlapping ranges merged.
+/// nftables rejects overlapping intervals in one set, which would otherwise
+/// reject the whole classifier table because of a single entry.
+fn normalize_ports(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    let mut ranges = Vec::new();
     for item in value.split(',') {
         let mut pieces = item.split('-');
         let first = pieces
             .next()
-            .and_then(|part| part.parse::<u16>().ok())
-            .filter(|port| *port > 0)
+            .and_then(parse_port)
             .ok_or_else(|| "traffic-rule port is invalid".to_string())?;
-        if let Some(last) = pieces.next() {
-            let last = last
-                .parse::<u16>()
-                .ok()
-                .filter(|last| *last >= first)
-                .ok_or_else(|| "traffic-rule port range is invalid".to_string())?;
-            if last == 0 || pieces.next().is_some() {
-                return Err("traffic-rule port range is invalid".to_string());
+        let last = match pieces.next() {
+            None => first,
+            Some(last) => {
+                let last = parse_port(last)
+                    .filter(|last| *last >= first)
+                    .ok_or_else(|| "traffic-rule port range is invalid".to_string())?;
+                if pieces.next().is_some() {
+                    return Err("traffic-rule port range is invalid".to_string());
+                }
+                last
             }
-        } else if pieces.next().is_some() {
-            return Err("traffic-rule port is invalid".to_string());
+        };
+        ranges.push((first, last));
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u16, u16)> = Vec::new();
+    for (first, last) in ranges {
+        match merged.last_mut() {
+            Some(previous) if first <= previous.1 => previous.1 = previous.1.max(last),
+            _ => merged.push((first, last)),
         }
     }
-    Ok(())
+    Ok(merged
+        .iter()
+        .map(|&(first, last)| {
+            if first == last {
+                first.to_string()
+            } else {
+                format!("{first}-{last}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
-fn network_family(value: &str) -> Result<AddressFamily, String> {
+fn validate_ports(value: &str) -> Result<(), String> {
+    normalize_ports(value).map(|_| ())
+}
+
+/// Validate one IPv4 or IPv6 address with an optional prefix and return its
+/// family and canonical text: compressed address, decimal prefix, host bits
+/// cleared. The prefix is digits only (a leading `+` or zero must not reach
+/// nftables, which reads a leading zero as octal), so the original text is
+/// never emitted.
+fn normalize_network(value: &str) -> Result<(AddressFamily, String), String> {
     if value.is_empty() {
-        return Ok(AddressFamily::Any);
+        return Ok((AddressFamily::Any, String::new()));
     }
     if value.len() > 64 || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err("traffic-rule network is unsafe".to_string());
@@ -689,24 +741,47 @@ fn network_family(value: &str) -> Result<AddressFamily, String> {
     if parts.next().is_some() {
         return Err("traffic-rule network prefix is invalid".to_string());
     }
-    let detected = match address {
-        std::net::IpAddr::V4(_) => AddressFamily::Ipv4,
-        std::net::IpAddr::V6(_) => AddressFamily::Ipv6,
+    let prefix = match prefix {
+        None => None,
+        Some(text) => {
+            if text.is_empty() || text.len() > 3 || !text.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err("traffic-rule network prefix is invalid".to_string());
+            }
+            Some(
+                text.parse::<u8>()
+                    .map_err(|_| "traffic-rule network prefix is invalid".to_string())?,
+            )
+        }
     };
-    if let Some(prefix) = prefix {
-        let prefix = prefix
-            .parse::<u16>()
-            .map_err(|_| "traffic-rule network prefix is invalid".to_string())?;
-        let limit = if detected == AddressFamily::Ipv4 {
-            32
-        } else {
-            128
-        };
-        if prefix > limit {
-            return Err("traffic-rule network prefix is invalid".to_string());
+    match address {
+        std::net::IpAddr::V4(address) => {
+            let Some(prefix) = prefix else {
+                return Ok((AddressFamily::Ipv4, address.to_string()));
+            };
+            if prefix > 32 {
+                return Err("traffic-rule network prefix is invalid".to_string());
+            }
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            let network = std::net::Ipv4Addr::from(u32::from(address) & mask);
+            Ok((AddressFamily::Ipv4, format!("{network}/{prefix}")))
+        }
+        std::net::IpAddr::V6(address) => {
+            let Some(prefix) = prefix else {
+                return Ok((AddressFamily::Ipv6, address.to_string()));
+            };
+            if prefix > 128 {
+                return Err("traffic-rule network prefix is invalid".to_string());
+            }
+            let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+            let network = std::net::Ipv6Addr::from(u128::from(address) & mask);
+            Ok((AddressFamily::Ipv6, format!("{network}/{prefix}")))
         }
     }
-    Ok(detected)
+}
+
+fn network_family(value: &str) -> Result<AddressFamily, String> {
+    normalize_network(value).map(|(family, _)| family)
 }
 
 fn family_compatible(requested: AddressFamily, detected: AddressFamily) -> bool {
@@ -805,15 +880,15 @@ fn emit_rule(
     destination_network: &str,
     class: &str,
 ) -> Result<(), String> {
-    validate_ports(source_ports)?;
-    validate_ports(destination_ports)?;
+    let source_ports = normalize_ports(source_ports)?;
+    let destination_ports = normalize_ports(destination_ports)?;
     if matches!(requested_protocol, Protocol::Any | Protocol::Icmp)
         && (!source_ports.is_empty() || !destination_ports.is_empty())
     {
         return Err("traffic-rule ports require TCP or UDP".to_string());
     }
-    let source_family = network_family(source_network)?;
-    let destination_family = network_family(destination_network)?;
+    let (source_family, source_network) = normalize_network(source_network)?;
+    let (destination_family, destination_network) = normalize_network(destination_network)?;
     if !family_compatible(requested_family, source_family)
         || !family_compatible(requested_family, destination_family)
         || (source_family != AddressFamily::Any
@@ -847,10 +922,10 @@ fn emit_rule(
                     target,
                     *family,
                     *protocol,
-                    source_ports,
-                    destination_ports,
-                    source_network,
-                    destination_network,
+                    &source_ports,
+                    &destination_ports,
+                    &source_network,
+                    &destination_network,
                     class,
                 )?;
             }
@@ -893,6 +968,7 @@ fn render_ruleset(
     let mut seen_targets = BTreeSet::new();
     let mut builtin_count = 0usize;
     let mut custom_count = 0usize;
+    let mut custom_snippets = Vec::new();
 
     for (instance, section) in package
         .sections
@@ -1036,6 +1112,7 @@ fn render_ruleset(
             } else {
                 selected.destination_ports
             };
+            let (rule_forward_start, rule_output_start) = (forward.len(), output.len());
             emit_rule(
                 &mut forward,
                 &mut output,
@@ -1049,6 +1126,11 @@ fn render_ruleset(
                 if option(rule, "class").is_empty() { "voice" } else { option(rule, "class") },
             )
             .map_err(|_| format!("Traffic rule {name} contains an invalid family, network, protocol, port, or class."))?;
+            custom_snippets.push(CustomRuleSnippet {
+                name: name.clone(),
+                forward: forward[rule_forward_start..].to_string(),
+                output: output[rule_output_start..].to_string(),
+            });
             custom_count += 1;
         }
         let projection = hex_digest(
@@ -1065,9 +1147,7 @@ fn render_ruleset(
             .projection_sha256 = Some(projection);
     }
 
-    let text = format!(
-        "table inet {TABLE_NAME} {{\n\tchain forward {{\n\t\ttype filter hook forward priority -140; policy accept;\n{forward}\t}}\n\tchain output {{\n\t\ttype route hook output priority -140; policy accept;\n{output}\t}}\n}}\n"
-    );
+    let text = table_text(TABLE_NAME, &forward, &output);
     if text.len() > MAX_RULESET_BYTES {
         return Err("traffic-classifier ruleset exceeds its size bound".to_string());
     }
@@ -1078,7 +1158,35 @@ fn render_ruleset(
         instances,
         builtin_rules: builtin_count,
         custom_rules: custom_count,
+        custom_snippets,
     })
+}
+
+fn table_text(name: &str, forward: &str, output: &str) -> String {
+    format!(
+        "table inet {name} {{\n\tchain forward {{\n\t\ttype filter hook forward priority -140; policy accept;\n{forward}\t}}\n\tchain output {{\n\t\ttype route hook output priority -140; policy accept;\n{output}\t}}\n}}\n"
+    )
+}
+
+/// Name the first custom rule that nftables refuses on its own, so that a bad
+/// entry is not reported as an anonymous failure of the whole classifier. The
+/// result stays fail-closed: nothing is applied either way.
+fn rejected_rule_message(environment: &Environment, rendered: &RenderedRuleset) -> Option<String> {
+    let check_table = format!("{TABLE_NAME}_check");
+    for rule in &rendered.custom_snippets {
+        let text = table_text(&check_table, &rule.forward, &rule.output);
+        let accepted = command(&environment.nft, &["-c", "-f", "-"], Some(text.as_bytes()))
+            .map(|output| output.status.success())
+            // A check that cannot run proves nothing about this rule.
+            .unwrap_or(true);
+        if !accepted {
+            return Some(format!(
+                "Traffic rule {} was rejected by nftables; check its ports and networks.",
+                rule.name
+            ));
+        }
+    }
+    None
 }
 
 fn presets_json() -> String {
@@ -1376,7 +1484,9 @@ fn apply_with_package(
         let output = command(&environment.nft, actual, Some(batch.as_bytes()))?;
         if !output.status.success() {
             return Err(if actual[0] == "-c" {
-                "the generated nftables traffic-priority rules failed validation".to_string()
+                rejected_rule_message(environment, &rendered).unwrap_or_else(|| {
+                    "the generated nftables traffic-priority rules failed validation".to_string()
+                })
             } else {
                 "unable to apply the validated nftables traffic-priority rules".to_string()
             });
@@ -1786,6 +1896,196 @@ mod tests {
         assert!(render_ruleset(&environment(&root), &package)
             .unwrap_err()
             .contains("same traffic-rule uplink"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn port_lists_are_digits_only_and_reach_nftables_in_canonical_form() {
+        for (input, expected) in [
+            ("", ""),
+            ("443", "443"),
+            ("443,443", "443"),
+            ("1000-2000,1500", "1000-2000"),
+            ("2000-3000,1000-2000", "1000-3000"),
+            ("53,27000-27100,53", "53,27000-27100"),
+            ("90,80-85,80", "80-85,90"),
+            ("0080", "80"),
+            ("65535,1", "1,65535"),
+        ] {
+            assert_eq!(normalize_ports(input).as_deref(), Ok(expected), "{input}");
+        }
+        for invalid in [
+            "+80",
+            "80,",
+            ",80",
+            "0",
+            "65536",
+            "80-70",
+            "80-",
+            "-80",
+            "80-90-100",
+            "8 0",
+            "80;",
+            "８０",
+            "1e3",
+            "80,+90",
+            "99999",
+        ] {
+            assert!(normalize_ports(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn networks_are_validated_and_emitted_in_canonical_form() {
+        for (input, family, expected) in [
+            ("", AddressFamily::Any, ""),
+            ("10.0.0.1", AddressFamily::Ipv4, "10.0.0.1"),
+            ("192.168.1.50/32", AddressFamily::Ipv4, "192.168.1.50/32"),
+            ("10.0.0.5/24", AddressFamily::Ipv4, "10.0.0.0/24"),
+            ("10.0.0.0/024", AddressFamily::Ipv4, "10.0.0.0/24"),
+            ("10.1.2.3/0", AddressFamily::Ipv4, "0.0.0.0/0"),
+            ("2001:DB8:0:0::1", AddressFamily::Ipv6, "2001:db8::1"),
+            (
+                "2001:db8:0:1::5/64",
+                AddressFamily::Ipv6,
+                "2001:db8:0:1::/64",
+            ),
+            ("fe80::1/128", AddressFamily::Ipv6, "fe80::1/128"),
+        ] {
+            assert_eq!(
+                normalize_network(input),
+                Ok((family, expected.to_string())),
+                "{input}"
+            );
+        }
+        for invalid in [
+            "10.0.0.0/+24",
+            "10.0.0.0/33",
+            "10.0.0.0/",
+            "/24",
+            "10.0.0.0/24/1",
+            "10.0.0.0/0024",
+            "::1/129",
+            "fe80::1%eth0",
+            "10.0.0.0/2 4",
+            " 10.0.0.1",
+            "010.000.000.001",
+            "999.999.1.1/32",
+        ] {
+            assert!(normalize_network(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn custom_rule_ports_and_networks_are_rendered_canonically() {
+        let root = root();
+        let package = base_uci(
+            "cake-autorate.rule1=traffic_rule\n\
+             cake-autorate.rule1.enabled='1'\n\
+             cake-autorate.rule1.instance='wan_sqm'\n\
+             cake-autorate.rule1.profile='gaming'\n\
+             cake-autorate.rule1.preset='custom'\n\
+             cake-autorate.rule1.protocol='tcp'\n\
+             cake-autorate.rule1.family='ipv4'\n\
+             cake-autorate.rule1.destination_ports='443,443,80-90,85'\n\
+             cake-autorate.rule1.source_network='10.0.0.5/24'\n\
+             cake-autorate.rule1.class='voice'\n",
+        );
+        let rendered = render_ruleset(&environment(&root), &package).unwrap();
+        assert_eq!(
+            rendered
+                .text
+                .matches(
+                    "ip saddr 10.0.0.0/24 meta l4proto tcp tcp dport { 80-90,443 } ip dscp set cs5"
+                )
+                .count(),
+            2
+        );
+        assert!(!rendered.text.contains("85"));
+        assert_eq!(rendered.custom_snippets.len(), 1);
+        assert_eq!(rendered.custom_snippets[0].name, "rule1");
+        let broken = base_uci(
+            "cake-autorate.rule1=traffic_rule\n\
+             cake-autorate.rule1.enabled='1'\n\
+             cake-autorate.rule1.instance='wan_sqm'\n\
+             cake-autorate.rule1.profile='gaming'\n\
+             cake-autorate.rule1.preset='custom'\n\
+             cake-autorate.rule1.protocol='tcp'\n\
+             cake-autorate.rule1.destination_ports='+80'\n\
+             cake-autorate.rule1.class='voice'\n",
+        );
+        let error = render_ruleset(&environment(&root), &broken).unwrap_err();
+        assert!(error.contains("Traffic rule rule1"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_rule_nftables_rejects_is_named_and_nothing_is_applied() {
+        let root = root();
+        let config = root.join("cake.show");
+        fs::write(
+            &config,
+            "cake-autorate.wan_sqm=cake_autorate\n\
+             cake-autorate.wan_sqm.enabled='1'\n\
+             cake-autorate.wan_sqm.manage_sqm='1'\n\
+             cake-autorate.wan_sqm.sqm_enabled='1'\n\
+             cake-autorate.wan_sqm.sqm_direction_mode='both'\n\
+             cake-autorate.wan_sqm.traffic_rules_enabled='1'\n\
+             cake-autorate.wan_sqm.autotune_profile='gaming'\n\
+             cake-autorate.wan_sqm.traffic_profile='auto'\n\
+             cake-autorate.wan_sqm.sqm_script='layer_cake.qos'\n\
+             cake-autorate.wan_sqm.sqm_eqdisc_opts='diffserv4'\n\
+             cake-autorate.wan_sqm.wan_if='eth0'\n\
+             cake-autorate.fine=traffic_rule\n\
+             cake-autorate.fine.enabled='1'\n\
+             cake-autorate.fine.instance='wan_sqm'\n\
+             cake-autorate.fine.profile='gaming'\n\
+             cake-autorate.fine.preset='custom'\n\
+             cake-autorate.fine.protocol='udp'\n\
+             cake-autorate.fine.destination_ports='5000'\n\
+             cake-autorate.fine.class='voice'\n\
+             cake-autorate.stubborn=traffic_rule\n\
+             cake-autorate.stubborn.enabled='1'\n\
+             cake-autorate.stubborn.instance='wan_sqm'\n\
+             cake-autorate.stubborn.profile='gaming'\n\
+             cake-autorate.stubborn.preset='custom'\n\
+             cake-autorate.stubborn.protocol='udp'\n\
+             cake-autorate.stubborn.destination_ports='4242'\n\
+             cake-autorate.stubborn.class='voice'\n",
+        )
+        .unwrap();
+        let uci = root.join("uci");
+        executable(&uci, &format!("#!/bin/sh\ncat '{}'\n", config.display()));
+        let applied = root.join("applied.nft");
+        let nft = root.join("nft");
+        // A stand-in for nftables that refuses any table containing port 4242.
+        executable(
+            &nft,
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n\
+                 \"list table inet cake_autorate_dscp\") exit 1 ;;\n\
+                 \"-c -f -\") input=$(cat); case \"$input\" in *'dport {{ 4242 }}'*) exit 1 ;; esac ;;\n\
+                 \"-f -\") cat > '{applied}' ;;\n\
+                 *) exit 2 ;;\n\
+                 esac\n",
+                applied = applied.display(),
+            ),
+        );
+        let environment = Environment {
+            uci,
+            nft,
+            ubus: PathBuf::from("/bin/false"),
+            sys_class_net: root.join("sys"),
+            runtime_dir: root.join("runtime"),
+            state_file: root.join("runtime/traffic-classifier.state"),
+        };
+        let error = apply(&environment).unwrap_err();
+        assert!(
+            error.contains("Traffic rule stubborn was rejected by nftables"),
+            "{error}"
+        );
+        assert!(!error.contains("fine"), "{error}");
+        assert!(!applied.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

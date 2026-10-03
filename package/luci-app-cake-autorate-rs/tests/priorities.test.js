@@ -37,6 +37,19 @@ assert.equal(helpers.validateNetwork(null, '192.168.1.50/32'), true);
 assert.equal(helpers.validateNetwork(null, '2001:db8::1/128'), true);
 assert.notEqual(helpers.validateNetwork(null, '192.168.1.999/32'), true);
 assert.notEqual(helpers.validateNetwork(null, '192.168.1.1;drop'), true);
+// The daemon emits only canonical decimal text: no signs, no leading zeros in
+// octets, at most three prefix digits. Repeated or overlapping ports are
+// accepted here because the daemon merges them.
+assert.equal(helpers.validatePortList(null, '443,443'), true);
+assert.equal(helpers.validatePortList(null, '1000-2000,1500'), true);
+assert.notEqual(helpers.validatePortList(null, '+80'), true);
+assert.notEqual(helpers.validatePortList(null, '80,'), true);
+assert.equal(helpers.validateNetwork(null, '10.0.0.0/24'), true);
+assert.equal(helpers.validateNetwork(null, '10.0.0.0/024'), true);
+assert.notEqual(helpers.validateNetwork(null, '10.0.0.0/0024'), true);
+assert.notEqual(helpers.validateNetwork(null, '10.0.0.0/+24'), true);
+assert.notEqual(helpers.validateNetwork(null, '010.000.000.001'), true);
+assert.equal(helpers.validateNetwork(null, '10.0.0.0'), true);
 
 assert.equal(helpers.parseClassifierStatus({ stdout: '{"state":"active","table_present":true}\n' }).state,
 	'active');

@@ -141,7 +141,7 @@ function validateNetwork(sectionId, value) {
 			return _('Enter one IPv4 or IPv6 address/prefix.');
 		address = value.slice(0, value.indexOf('/'));
 		prefix = value.slice(value.indexOf('/') + 1);
-		if (!/^[0-9]+$/.test(prefix))
+		if (!/^[0-9]{1,3}$/.test(prefix))
 			return _('The network prefix must be a number.');
 	}
 
@@ -155,8 +155,8 @@ function validateNetwork(sectionId, value) {
 		if (octets.length !== 4)
 			return _('Enter a valid IPv4 address or prefix.');
 		for (index = 0; index < octets.length; index++)
-			if (!/^[0-9]{1,3}$/.test(octets[index]) ||
-			    Number(octets[index]) < 0 || Number(octets[index]) > 255)
+			if (!/^(0|[1-9][0-9]{0,2})$/.test(octets[index]) ||
+			    Number(octets[index]) > 255)
 				return _('Enter a valid IPv4 address or prefix.');
 		limit = 32;
 	}
@@ -592,6 +592,7 @@ return L.view.extend({
 
 		o = s.option(form.Value, 'source_ports', _('Source ports'));
 		o.placeholder = '1024-65535';
+		o.description = _('Ports and ranges separated by commas. Repeated or overlapping entries are merged.');
 		o.validate = validatePortList;
 		o.depends('preset', 'custom');
 		o.modalonly = true;
@@ -599,6 +600,7 @@ return L.view.extend({
 
 		o = s.option(form.Value, 'destination_ports', _('Destination ports'));
 		o.placeholder = '53,443,27000-27100';
+		o.description = _('Ports and ranges separated by commas. Repeated or overlapping entries are merged.');
 		o.validate = validatePortList;
 		o.depends('preset', 'custom');
 		o.modalonly = true;

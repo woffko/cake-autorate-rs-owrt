@@ -571,7 +571,8 @@ impl SelectedClassifier {
             Some(batch.as_bytes()),
         )?;
         if !checked.status.success() {
-            return Err("selected classifier batch failed validation".into());
+            return Err(rejected_rule_message(&self.environment, &self.desired)
+                .unwrap_or_else(|| "selected classifier batch failed validation".into()));
         }
         attest()?;
         self.attest_before()?;
