@@ -572,6 +572,28 @@ option in Review carries `download-raw-below-server-comparison` or
 the user confirms that the line or server may have been slower during the
 test. Raw fallback options keep their own acknowledgement list.
 
+## Time limits and clock changes
+
+Each Speed Test, Rating and Auto-Tune run has a time limit (45 minutes for
+Auto-Tune). It is counted on the router's monotonic uptime clock from the moment
+the coordinator accepts the job, so setting the system time, an NTP correction
+or a time-zone change during a run neither shortens nor extends it. The request
+still records its wall-clock creation time and deadline for display and audit. A
+job does not survive a reboot: its journal lives under `/var/run`, which a reboot
+clears, and one that somehow survives carries the old boot ID and is never
+resumed.
+
+The instance publishes its runtime state with a wall-clock stamp. After a clock
+step the last publication looks too old, or ahead of the router's clock, for
+about a second; the run waits for the next publication instead of failing.
+
+Scheduled calibration follows the calendar (time-of-day window, interval, daily
+and monthly traffic budgets), so it uses the wall clock. It does not start while
+the clock is clearly unset (before 2026-01-01), and not while the clock is
+earlier than the last successful scheduled run. A wrong but plausible time cannot
+be told from a right one; the other gates (ready route and runtime, quiet
+window, budgets) still apply to it.
+
 ## Background traffic and conservative continuation
 
 Retrying on a quiet link is the preferred action. **Continue conservatively**
