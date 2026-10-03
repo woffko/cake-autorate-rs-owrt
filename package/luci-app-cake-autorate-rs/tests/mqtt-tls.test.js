@@ -105,9 +105,9 @@ assert.doesNotMatch(description('mqtt_host'), /plain MQTT/, 'the plain-MQTT noti
 assert.match(description('mqtt_host'), /certificate must be valid for exactly this name or address/);
 assert.match(description('mqtt_port'), /8883 with TLS and 1883 without/);
 assert.match(description('mqtt_tls'), /NTP/);
-assert.match(description('mqtt_tls'), /restarted/);
+assert.match(description('mqtt_tls'), /keeps trying and connects by itself/);
 assert.match(description('mqtt_tls_ca_file'), /only the certificates in it are trusted/);
-assert.match(description('mqtt_tls_ca_file'), /owned by root/);
+assert.match(description('mqtt_tls_ca_file'), /owned by root[^]*at most 1 MiB/);
 assert.match(description('mqtt_tls_verify'), /pose as the broker/);
 assert.match(description('mqtt_password'), /Without TLS[^]*unencrypted/);
 

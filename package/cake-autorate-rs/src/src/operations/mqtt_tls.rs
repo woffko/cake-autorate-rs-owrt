@@ -10,7 +10,8 @@
 //!
 //! Certificate validity is judged by the system clock. A router that has not
 //! synchronised its time yet may refuse a certificate as not yet valid; the
-//! publisher then exits and procd restarts it.
+//! publisher then keeps retrying (`connect_with_retry`) and connects by itself
+//! once the clock is right.
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
@@ -32,8 +33,11 @@ pub(super) type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 /// The whole handshake, not each read: a broker that dribbles bytes cannot
 /// keep the publisher in it.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_CA_FILE_BYTES: u64 = 256 * 1024;
-const MAX_CA_CERTIFICATES: usize = 64;
+/// Large enough for a system CA bundle (`ca-certificates.crt` holds about 120
+/// certificates in under 200 KB), which an operator may name instead of a
+/// private CA.
+const MAX_CA_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_CA_CERTIFICATES: usize = 512;
 /// The CA file decides whom the publisher trusts with the broker password, so
 /// only root may own it.
 const TRUSTED_FILE_OWNER: u32 = 0;
@@ -113,7 +117,7 @@ pub(super) fn read_ca_certificates(path: &str) -> Result<Vec<CertificateDer<'sta
         return Err("the MQTT CA file must not be writable by group or others".to_string());
     }
     if metadata.len() == 0 || metadata.len() > MAX_CA_FILE_BYTES {
-        return Err("the MQTT CA file is empty or larger than 256 KiB".to_string());
+        return Err("the MQTT CA file is empty or larger than 1 MiB".to_string());
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     Read::by_ref(&mut file)
@@ -121,13 +125,13 @@ pub(super) fn read_ca_certificates(path: &str) -> Result<Vec<CertificateDer<'sta
         .read_to_end(&mut bytes)
         .map_err(|error| format!("unable to read the MQTT CA file: {error}"))?;
     if bytes.len() as u64 > MAX_CA_FILE_BYTES {
-        return Err("the MQTT CA file is larger than 256 KiB".to_string());
+        return Err("the MQTT CA file is larger than 1 MiB".to_string());
     }
     let mut certificates = Vec::new();
     for item in CertificateDer::pem_slice_iter(&bytes) {
         let certificate = item.map_err(|_| "the MQTT CA file is not valid PEM".to_string())?;
         if certificates.len() == MAX_CA_CERTIFICATES {
-            return Err("the MQTT CA file holds more than 64 certificates".to_string());
+            return Err("the MQTT CA file holds more than 512 certificates".to_string());
         }
         certificates.push(certificate);
     }

@@ -376,6 +376,21 @@ fn the_ca_file_must_be_a_safe_pem_file_with_certificates() {
     let both = write_file(&root, "both.pem", two.as_bytes(), 0o600);
     assert_eq!(tls::read_ca_certificates(&both).unwrap().len(), 2);
 
+    // A bundle like the system's ca-bundle: a few hundred certificates are fine.
+    let bundle = (0..200)
+        .map(|index| Authority::new(&format!("Bundle CA {index}")).pem())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(bundle.len() > 100_000 && bundle.len() < 1024 * 1024);
+    let big = write_file(&root, "bundle.pem", bundle.as_bytes(), 0o644);
+    assert_eq!(tls::read_ca_certificates(&big).unwrap().len(), 200);
+    assert!(tls::client_config(true, &big).is_ok());
+    let too_many = (0..513).map(|_| pem.clone()).collect::<Vec<_>>().join("\n");
+    let excess = write_file(&root, "excess.pem", too_many.as_bytes(), 0o644);
+    assert!(tls::read_ca_certificates(&excess)
+        .unwrap_err()
+        .contains("more than 512"));
+
     let refused = |path: &str, message: &str| {
         let error = tls::read_ca_certificates(path).unwrap_err();
         assert!(error.contains(message), "{path}: {error}");
@@ -399,8 +414,8 @@ fn the_ca_file_must_be_a_safe_pem_file_with_certificates() {
     );
     refused(&write_file(&root, "empty.pem", b"", 0o600), "empty");
     refused(
-        &write_file(&root, "large.pem", &vec![b'A'; 300 * 1024], 0o600),
-        "256 KiB",
+        &write_file(&root, "large.pem", &vec![b'A'; 2 * 1024 * 1024], 0o600),
+        "1 MiB",
     );
     refused(
         &write_file(&root, "text.pem", b"not a certificate\n", 0o600),
