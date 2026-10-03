@@ -3,6 +3,7 @@ use super::autotune_runtime::{
     speedtest_unshaped_topology, AbsentRuntimeBaseline, AutotuneRuntimePermit, RuntimePermitKind,
 };
 use super::autotune_runtime_store::RuntimeOverrideStore;
+use super::deadline::{self, OperationDeadline};
 use super::full_autotune::AutotuneRuntimeControl;
 use super::identity::{
     monotonic_boot_ms, read_kernel_uuid, ProcessIdentity, DEFAULT_BOOT_ID_PATH, DEFAULT_PROC_ROOT,
@@ -417,6 +418,8 @@ struct CakeCounterSnapshot {
 }
 
 pub(crate) struct EmbeddedSpeedtestSession {
+    /// The operation's deadline on the boot clock.
+    deadline: OperationDeadline,
     route_pin: NftRoutePin,
     probe_pin: Option<NftRoutePin>,
     credentials: BackendCredentials,
@@ -603,6 +606,7 @@ impl EmbeddedSpeedtestSession {
 
     pub(crate) fn open(
         request: &OperationRequest,
+        deadline: OperationDeadline,
         worker_run_id: &str,
         scratch_path: &Path,
         terminate: &AtomicBool,
@@ -612,7 +616,7 @@ impl EmbeddedSpeedtestSession {
         }
         let credentials = backend_credentials()?;
         let route_pin = acquire_route_pin_when_ready(
-            || wait_for_route_ready(request, terminate).map(|_| ()),
+            || wait_for_route_ready(request, deadline, terminate).map(|_| ()),
             || {
                 NftRoutePin::acquire(
                     request,
@@ -645,6 +649,7 @@ impl EmbeddedSpeedtestSession {
             None
         };
         Ok(Self {
+            deadline,
             route_pin,
             probe_pin,
             owned_checkpoint,
@@ -711,6 +716,7 @@ impl EmbeddedSpeedtestSession {
             }
         };
         Self {
+            deadline: OperationDeadline::at_boot_ms(u64::MAX),
             probe_pin: None,
             owned_checkpoint: None,
             owned_ledger: None,
@@ -1724,28 +1730,34 @@ where
     // Sum of the route-window debits enforced against the budget, reported
     // for every terminal state including byte-limit and other failures.
     let debited = std::cell::Cell::new(0_u64);
-    let terminal = match rating::wait_for_permit(
-        &permit_path,
-        &request.identity.job_id,
-        &worker_run_id,
-        request.deadline_unix_ms,
-        terminate,
-    ) {
-        Ok(true) => match run_speedtest(
-            &request,
+    let terminal = match deadline::load_for_worker(&request_path, &request) {
+        Err(error) => SpeedtestTerminal::Failed {
+            code: rating::bounded_error_code(&error),
+        },
+        Ok(operation_deadline) => match rating::wait_for_permit(
+            &permit_path,
+            &request.identity.job_id,
             &worker_run_id,
+            operation_deadline,
             terminate,
-            &terminal_path,
-            &debited,
         ) {
-            Ok(terminal) => terminal,
+            Ok(true) => match run_speedtest(
+                &request,
+                operation_deadline,
+                &worker_run_id,
+                terminate,
+                &terminal_path,
+                &debited,
+            ) {
+                Ok(terminal) => terminal,
+                Err(error) => SpeedtestTerminal::Failed {
+                    code: rating::bounded_error_code(&error),
+                },
+            },
+            Ok(false) => SpeedtestTerminal::Cancelled,
             Err(error) => SpeedtestTerminal::Failed {
                 code: rating::bounded_error_code(&error),
             },
-        },
-        Ok(false) => SpeedtestTerminal::Cancelled,
-        Err(error) => SpeedtestTerminal::Failed {
-            code: rating::bounded_error_code(&error),
         },
     };
     rating::atomic_private_write(
@@ -1758,6 +1770,7 @@ where
 
 fn run_speedtest(
     request: &OperationRequest,
+    deadline: OperationDeadline,
     worker_run_id: &str,
     terminate: &AtomicBool,
     terminal_path: &Path,
@@ -1772,6 +1785,7 @@ fn run_speedtest(
     match request.speedtest_topology {
         Some(super::protocol::SpeedtestTopology::Current) => run_embedded_speedtest_debited(
             request,
+            deadline,
             worker_run_id,
             direction,
             terminate,
@@ -1780,6 +1794,7 @@ fn run_speedtest(
         ),
         Some(super::protocol::SpeedtestTopology::Unshaped) => run_unshaped_speedtest(
             request,
+            deadline,
             worker_run_id,
             direction,
             terminate,
@@ -1792,6 +1807,7 @@ fn run_speedtest(
 
 fn run_unshaped_speedtest(
     request: &OperationRequest,
+    deadline: OperationDeadline,
     worker_run_id: &str,
     direction: SpeedtestDirection,
     terminate: &AtomicBool,
@@ -1805,6 +1821,7 @@ fn run_unshaped_speedtest(
             || {
                 run_embedded_speedtest_debited(
                     request,
+                    deadline,
                     worker_run_id,
                     direction,
                     terminate,
@@ -1851,6 +1868,7 @@ fn run_unshaped_speedtest(
 
     let measurement = run_embedded_speedtest_debited(
         request,
+        deadline,
         worker_run_id,
         direction,
         terminate,
@@ -1925,6 +1943,7 @@ fn read_unshaped_runtime_permit(
 
 pub(crate) fn run_embedded_speedtest(
     request: &OperationRequest,
+    deadline: OperationDeadline,
     worker_run_id: &str,
     direction: SpeedtestDirection,
     terminate: &AtomicBool,
@@ -1932,6 +1951,7 @@ pub(crate) fn run_embedded_speedtest(
 ) -> Result<SpeedtestTerminal, String> {
     run_embedded_speedtest_with_load_sample(
         request,
+        deadline,
         worker_run_id,
         direction,
         terminate,
@@ -1942,6 +1962,7 @@ pub(crate) fn run_embedded_speedtest(
 
 fn run_embedded_speedtest_debited(
     request: &OperationRequest,
+    deadline: OperationDeadline,
     worker_run_id: &str,
     direction: SpeedtestDirection,
     terminate: &AtomicBool,
@@ -1950,6 +1971,7 @@ fn run_embedded_speedtest_debited(
 ) -> Result<SpeedtestTerminal, String> {
     run_embedded_speedtest_with_load_sample_and_debit(
         request,
+        deadline,
         worker_run_id,
         direction,
         terminate,
@@ -1969,6 +1991,7 @@ fn run_embedded_speedtest_debited(
 
 pub(crate) fn run_embedded_speedtest_with_load_sample(
     request: &OperationRequest,
+    deadline: OperationDeadline,
     worker_run_id: &str,
     direction: SpeedtestDirection,
     terminate: &AtomicBool,
@@ -1976,6 +1999,7 @@ pub(crate) fn run_embedded_speedtest_with_load_sample(
 ) -> Result<(SpeedtestTerminal, Option<SpeedtestLoadSample>), String> {
     run_embedded_speedtest_with_load_sample_and_debit(
         request,
+        deadline,
         worker_run_id,
         direction,
         terminate,
@@ -1986,6 +2010,7 @@ pub(crate) fn run_embedded_speedtest_with_load_sample(
 
 fn run_embedded_speedtest_with_load_sample_and_debit(
     request: &OperationRequest,
+    deadline: OperationDeadline,
     worker_run_id: &str,
     direction: SpeedtestDirection,
     terminate: &AtomicBool,
@@ -1994,30 +2019,38 @@ fn run_embedded_speedtest_with_load_sample_and_debit(
 ) -> Result<(SpeedtestTerminal, Option<SpeedtestLoadSample>), String> {
     let mut remaining_traffic_budget = request.traffic_budget;
     let traffic_safety_reserve_bytes = standalone_speedtest_stop_reserve_bytes(request, direction)?;
-    with_embedded_speedtest_session(request, worker_run_id, terminate, scratch_path, |session| {
-        run_embedded_speedtest_with_load_sample_in_session_and_debit(
-            session,
-            request,
-            worker_run_id,
-            direction,
-            traffic_safety_reserve_bytes,
-            &mut remaining_traffic_budget,
-            terminate,
-            scratch_path,
-            on_traffic_debit,
-        )
-    })
+    with_embedded_speedtest_session(
+        request,
+        deadline,
+        worker_run_id,
+        terminate,
+        scratch_path,
+        |session| {
+            run_embedded_speedtest_with_load_sample_in_session_and_debit(
+                session,
+                request,
+                worker_run_id,
+                direction,
+                traffic_safety_reserve_bytes,
+                &mut remaining_traffic_budget,
+                terminate,
+                scratch_path,
+                on_traffic_debit,
+            )
+        },
+    )
 }
 
 pub(crate) fn with_embedded_speedtest_session<T>(
     request: &OperationRequest,
+    deadline: OperationDeadline,
     worker_run_id: &str,
     terminate: &AtomicBool,
     scratch_path: &Path,
     action: impl FnOnce(&mut EmbeddedSpeedtestSession) -> Result<T, String>,
 ) -> Result<T, String> {
     let mut session =
-        EmbeddedSpeedtestSession::open(request, worker_run_id, scratch_path, terminate)?;
+        EmbeddedSpeedtestSession::open(request, deadline, worker_run_id, scratch_path, terminate)?;
     let result = action(&mut session);
     session.close()?;
     result
@@ -2083,9 +2116,10 @@ pub(crate) fn run_embedded_speedtest_with_accounting_in_session_and_debit(
             bounded_request.traffic_budget = budget
                 .checked_sub(traffic_safety_reserve_bytes)
                 .ok_or_else(|| SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.to_string())?;
-            let initial_route = wait_for_route_ready(request, terminate)?;
+            let initial_route = wait_for_route_ready(request, session.deadline, terminate)?;
             let outcome = run_speedtest_with_pin(
                 &bounded_request,
+                session.deadline,
                 direction,
                 accounting,
                 attest_accounting_epoch,
@@ -2186,6 +2220,7 @@ pub(crate) fn qualify_embedded_speedtest_server_in_session(
                 .ok_or_else(|| SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.to_string())?;
             let outcome = run_speedtest_go_server_list_attempt(
                 &bounded_request,
+                session.deadline,
                 terminate,
                 &scratch_path.with_extension("server-list"),
                 session.credentials,
@@ -2260,12 +2295,13 @@ pub(crate) fn qualify_embedded_speedtest_server_in_session(
                         .ok_or_else(|| SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.to_string())?;
                     let outcome = run_speedtest_with_pin(
                         &bounded_request,
+                        session.deadline,
                         SpeedtestDirection::Both,
                         accounting,
                         attest_accounting_epoch,
                         terminate,
                         &scratch_path.with_extension(format!("server-attempt-{}", index + 1)),
-                        wait_for_route_ready(request, terminate)?,
+                        wait_for_route_ready(request, session.deadline, terminate)?,
                         session.credentials,
                         candidate,
                         &session.route_pin,
@@ -2593,13 +2629,14 @@ fn speedtest_go_server_list_arguments(request: &OperationRequest) -> Result<Vec<
 
 fn run_speedtest_go_server_list_attempt(
     request: &OperationRequest,
+    deadline: OperationDeadline,
     terminate: &AtomicBool,
     scratch_path: &Path,
     credentials: BackendCredentials,
     mut budget_watch: Option<OwnedBudgetWatch<'_>>,
 ) -> Result<Vec<u64>, String> {
     let arguments = speedtest_go_server_list_arguments(request)?;
-    let initial_route = wait_for_route_ready(request, terminate)?;
+    let initial_route = wait_for_route_ready(request, deadline, terminate)?;
     let counters_before = interface_counters(&request.route.l3_device)?;
     let (mut output_guard, stdout, stderr) = BackendOutputGuard::create(scratch_path)?;
     if budget_watch
@@ -3370,6 +3407,7 @@ fn qualification_cpu_warning(
 
 fn run_speedtest_with_pin(
     request: &OperationRequest,
+    operation_deadline: OperationDeadline,
     direction: SpeedtestDirection,
     accounting: &SpeedtestAccountingPlan,
     attest_accounting_epoch: &mut dyn FnMut() -> Result<(), String>,
@@ -3413,7 +3451,7 @@ fn run_speedtest_with_pin(
     };
     let controlled_before = route_pin.traffic_counters()?;
     let started = Instant::now();
-    let deadline_ms = request.deadline_unix_ms.saturating_sub(rating::epoch_ms()?);
+    let deadline_ms = operation_deadline.remaining_ms()?;
     if deadline_ms == 0 {
         return Err("speedtest-deadline-expired".to_string());
     }
@@ -3775,12 +3813,13 @@ fn attest_route(request: &OperationRequest) -> Result<RouteSnapshot, String> {
 /// deadline or explicit cancellation.
 fn wait_for_route_ready(
     request: &OperationRequest,
+    deadline: OperationDeadline,
     terminate: &AtomicBool,
 ) -> Result<RouteSnapshot, String> {
     wait_for_route_ready_with(
         || attest_route(request),
         || terminate.load(Ordering::Relaxed),
-        || Ok(rating::epoch_ms()? >= request.deadline_unix_ms),
+        || deadline.expired(),
         || thread::sleep(ROUTE_RECHECK_INTERVAL),
     )
 }
@@ -6929,6 +6968,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             }
         };
         let mut session = EmbeddedSpeedtestSession {
+            deadline: OperationDeadline::at_boot_ms(u64::MAX),
             probe_pin: None,
             owned_checkpoint: None,
             owned_ledger: None,
@@ -7023,6 +7063,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         operation.speedtest_server_id = None;
         let worker_run_id = "6".repeat(32);
         let session = EmbeddedSpeedtestSession {
+            deadline: OperationDeadline::at_boot_ms(u64::MAX),
             probe_pin: None,
             owned_checkpoint: None,
             owned_ledger: None,
@@ -7783,6 +7824,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             .publish_bound(&path, &operation.identity.job_id, &worker, &digest)
             .unwrap();
         let session = EmbeddedSpeedtestSession {
+            deadline: OperationDeadline::at_boot_ms(u64::MAX),
             route_pin: NftRoutePin {
                 table: None,
                 owner: None,
@@ -7917,6 +7959,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             .publish_bound(&path, &operation.identity.job_id, &worker, &digest)
             .unwrap();
         let session = EmbeddedSpeedtestSession {
+            deadline: OperationDeadline::at_boot_ms(u64::MAX),
             route_pin: NftRoutePin {
                 table: None,
                 owner: None,

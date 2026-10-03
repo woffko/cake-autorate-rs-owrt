@@ -25,6 +25,7 @@ use super::autotune_runtime::{
     TemporaryTopologyStage,
 };
 use super::autotune_runtime_store::{RuntimeOverrideCheckpoint, RuntimeOverrideStore};
+use super::deadline::{self, OperationDeadline};
 use super::identity::{
     monotonic_boot_ms, read_kernel_uuid, ProcessIdentity, DEFAULT_BOOT_ID_PATH,
     DEFAULT_RANDOM_UUID_PATH,
@@ -15948,15 +15949,16 @@ fn restart_measurement_epoch(
     Ok(())
 }
 
+/// A publication stamped ahead of this clock (the clock was stepped back) is
+/// not current yet, like a stale one; the wait loop re-reads until the
+/// instance republishes with the new time or the permit deadline passes.
 fn runtime_measurement_basis_ready(
     snapshot: &super::rating::RatingRuntimeSnapshot,
     now_unix_ms: u64,
 ) -> Result<bool, String> {
-    if snapshot.updated_unix_ms > now_unix_ms.saturating_add(5_000) {
-        return Err("native Auto-Tune runtime snapshot timestamp is in the future".to_string());
-    }
     Ok(
-        now_unix_ms.saturating_sub(snapshot.updated_unix_ms) <= 5_000
+        super::rating::publication_age(snapshot.updated_unix_ms, now_unix_ms)
+            == super::rating::PublicationAge::Fresh
             && matches!(snapshot.uplink_state.as_str(), "ACTIVE" | "STANDBY")
             && snapshot.route_test_ready
             && snapshot.sqm_runtime_managed
@@ -17855,13 +17857,17 @@ where
     {
         return Err("native Auto-Tune terminal path is not bound to its worker run".to_string());
     }
-    let admitted = wait_for_permit(
-        &operation_permit_path,
-        &request.identity.job_id,
-        &worker_run_id,
-        request.deadline_unix_ms,
-        terminate,
-    );
+    let loaded_deadline = deadline::load_for_worker(&request_path, &request);
+    let admitted = match &loaded_deadline {
+        Ok(operation_deadline) => wait_for_permit(
+            &operation_permit_path,
+            &request.identity.job_id,
+            &worker_run_id,
+            *operation_deadline,
+            terminate,
+        ),
+        Err(error) => Err(error.clone()),
+    };
     if request.traffic_policy_explicit && !matches!(&admitted, Ok(true)) {
         publish_unstarted_traffic_receipt(job_directory, &request, &worker_run_id)?;
         let terminal = match admitted {
@@ -17882,6 +17888,7 @@ where
     if !admitted? {
         return Ok(());
     }
+    let operation_deadline = loaded_deadline?;
     let evidence_store = AutotuneEvidenceStore::open(job_directory)?;
     if !evidence_store.load()?.is_empty() {
         return Err("native Auto-Tune worker found pre-existing run evidence".to_string());
@@ -17895,11 +17902,18 @@ where
             |instance| Ok(Config::from_uci(instance)?.run_dir()),
         )?;
         let store = RuntimeOverrideStore::open(&runtime_directory)?;
-        let permit = wait_for_runtime_permit(&store, &request, &worker_run_id, terminate)?
-            .ok_or_else(|| "native Auto-Tune was cancelled before runtime admission".to_string())?;
+        let permit = wait_for_runtime_permit(
+            &store,
+            &request,
+            operation_deadline,
+            &worker_run_id,
+            terminate,
+        )?
+        .ok_or_else(|| "native Auto-Tune was cancelled before runtime admission".to_string())?;
         let speedtest_session_path = job_directory.join("autotune-speedtest-session");
         let mut speedtest_session = EmbeddedSpeedtestSession::open(
             &request,
+            operation_deadline,
             &worker_run_id,
             &speedtest_session_path,
             terminate,
@@ -19439,6 +19453,7 @@ pub(crate) fn validate_runtime_permit_admission(
 fn wait_for_runtime_permit(
     store: &RuntimeOverrideStore,
     request: &OperationRequest,
+    operation_deadline: OperationDeadline,
     worker_run_id: &str,
     terminate: &AtomicBool,
 ) -> Result<Option<super::autotune_runtime::AutotuneRuntimePermit>, String> {
@@ -19454,7 +19469,7 @@ fn wait_for_runtime_permit(
             validate_runtime_permit_admission(&permit, request, worker_run_id, &worker, &boot_id)?;
             return Ok(Some(permit));
         }
-        if epoch_ms()? >= request.deadline_unix_ms {
+        if operation_deadline.expired()? {
             return Err(
                 "native Auto-Tune operation deadline expired before runtime permit".to_string(),
             );
@@ -20115,9 +20130,58 @@ mod tests {
         unselected_standby.route_test_ready = false;
         assert!(!runtime_measurement_basis_ready(&unselected_standby, 100_000).unwrap());
 
-        let mut future = runtime;
+        // A publication stamped ahead of this clock (the clock was stepped
+        // back) is not current yet; it is a wait, not an error, and the next
+        // publication with the new time is ready again.
+        let mut future = runtime.clone();
         future.updated_unix_ms = 105_001;
-        assert!(runtime_measurement_basis_ready(&future, 100_000).is_err());
+        assert!(!runtime_measurement_basis_ready(&future, 100_000).unwrap());
+        future.updated_unix_ms = 3_600_000;
+        assert!(!runtime_measurement_basis_ready(&future, 100_000).unwrap());
+        future.updated_unix_ms = 105_000;
+        assert!(runtime_measurement_basis_ready(&future, 100_000).unwrap());
+        // A step forward makes the last publication look old for one cycle.
+        assert!(!runtime_measurement_basis_ready(&runtime, 3_600_000).unwrap());
+        let mut republished = runtime;
+        republished.updated_unix_ms = 3_600_000;
+        assert!(runtime_measurement_basis_ready(&republished, 3_600_000).unwrap());
+    }
+
+    #[test]
+    fn the_runtime_permit_wait_follows_the_boot_clock_not_the_wall_clock() {
+        use super::super::identity::test_clock::ScriptedClocks;
+        let clocks = ScriptedClocks::install(70_000, 1_790_000_000_000);
+        let directory = private_temp_directory("permit-wait-clock");
+        let store = RuntimeOverrideStore::open(&directory).unwrap();
+        let operation = request(CalibrationStrategy::FullRaw, 1_000_000);
+        let worker_run_id = "6".repeat(32);
+        let live = OperationDeadline::at_boot_ms(clocks.boot() + 60_000);
+
+        // Ten hours forward: a wall-clock deadline would have expired. The
+        // wait ends only because it is cancelled.
+        clocks.step_wall_forward(36_000_000);
+        let cancel = AtomicBool::new(false);
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(150));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            wait_for_runtime_permit(&store, &operation, live, &worker_run_id, &cancel)
+        });
+        assert!(outcome.unwrap().is_none());
+
+        // The boot clock reaches the deadline while the wall clock is two days
+        // behind: expiry, not another two days of waiting.
+        clocks.step_wall_back(172_800_000);
+        clocks.advance(60_000);
+        let never = AtomicBool::new(false);
+        let error =
+            wait_for_runtime_permit(&store, &operation, live, &worker_run_id, &never).unwrap_err();
+        assert!(
+            error.contains("operation deadline expired before runtime permit"),
+            "{error}"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

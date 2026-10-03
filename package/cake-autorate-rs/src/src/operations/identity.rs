@@ -257,7 +257,70 @@ pub fn process_stat_path(proc_root: &Path, pid: u32) -> PathBuf {
 }
 
 pub fn monotonic_boot_ms() -> Result<u64, String> {
+    #[cfg(test)]
+    if let Some(value) = test_clock::boot_ms() {
+        return Ok(value);
+    }
     monotonic_boot_ms_from(Path::new(DEFAULT_UPTIME_PATH))
+}
+
+/// Scripted clocks for tests. The overrides are per thread, so tests that do
+/// not install them keep reading the real clocks.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BOOT_MS: Cell<Option<u64>> = const { Cell::new(None) };
+        static WALL_MS: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn boot_ms() -> Option<u64> {
+        BOOT_MS.with(Cell::get)
+    }
+
+    pub(crate) fn wall_ms() -> Option<u64> {
+        WALL_MS.with(Cell::get)
+    }
+
+    /// Holds the scripted boot and wall clocks of this thread; the real clocks
+    /// come back when it is dropped.
+    pub(crate) struct ScriptedClocks;
+
+    impl ScriptedClocks {
+        pub(crate) fn install(boot_ms: u64, wall_ms: u64) -> Self {
+            BOOT_MS.with(|value| value.set(Some(boot_ms)));
+            WALL_MS.with(|value| value.set(Some(wall_ms)));
+            Self
+        }
+
+        /// Time passes: both clocks advance.
+        pub(crate) fn advance(&self, milliseconds: u64) {
+            BOOT_MS.with(|value| value.set(value.get().map(|now| now + milliseconds)));
+            WALL_MS.with(|value| value.set(value.get().map(|now| now + milliseconds)));
+        }
+
+        /// A clock step (NTP, `date -s`): only the wall clock moves.
+        pub(crate) fn step_wall_forward(&self, milliseconds: u64) {
+            WALL_MS.with(|value| value.set(value.get().map(|now| now + milliseconds)));
+        }
+
+        pub(crate) fn step_wall_back(&self, milliseconds: u64) {
+            WALL_MS
+                .with(|value| value.set(value.get().map(|now| now.saturating_sub(milliseconds))));
+        }
+
+        pub(crate) fn boot(&self) -> u64 {
+            boot_ms().expect("scripted boot clock is installed")
+        }
+    }
+
+    impl Drop for ScriptedClocks {
+        fn drop(&mut self) {
+            BOOT_MS.with(|value| value.set(None));
+            WALL_MS.with(|value| value.set(None));
+        }
+    }
 }
 
 pub fn monotonic_boot_ms_from(path: &Path) -> Result<u64, String> {

@@ -18,6 +18,7 @@ use super::autotune_runtime_driver::{
     RuntimeRestoreObservation,
 };
 use super::autotune_runtime_store::{RuntimeOverrideCheckpoint, RuntimeOverrideStore};
+use super::deadline::OperationDeadline;
 use super::event_loop::CalibrationEventLoop;
 use super::full_autotune::{
     attest_capture_admission, publish_capture_snapshot, read_capture_request,
@@ -5363,28 +5364,27 @@ fn dispatch_idle_phase_time(
 
 fn owner_deadline(
     store: &RuntimeOverrideStore,
-    request: &OperationRequest,
+    operation_deadline: OperationDeadline,
     outcome: RuntimeDriverOutcome,
 ) -> Result<Option<Duration>, String> {
     if outcome == RuntimeDriverOutcome::Restored {
         return Ok(None);
     }
-    owner_authority_deadline(store, request)
+    owner_authority_deadline(store, operation_deadline)
 }
 
 fn owner_authority_deadline(
     store: &RuntimeOverrideStore,
-    request: &OperationRequest,
+    operation_deadline: OperationDeadline,
 ) -> Result<Option<Duration>, String> {
+    let now = monotonic_boot_ms()?;
     if let Some(permit) = store.read_permit()? {
-        let now = monotonic_boot_ms()?;
         return Ok(Some(Duration::from_millis(
             permit.deadline_boot_ms.saturating_sub(now),
         )));
     }
-    let now = super::rating::epoch_ms()?;
     Ok(Some(Duration::from_millis(
-        request.deadline_unix_ms.saturating_sub(now),
+        operation_deadline.remaining_ms_at(now),
     )))
 }
 
@@ -5514,6 +5514,7 @@ where
     {
         return Err("bootstrap runtime request is not in its exact job directory".to_string());
     }
+    let operation_deadline = super::deadline::load_for_worker(&request_path, &request)?;
     ensure_runtime_directory(&runtime_dir)?;
     let _owner_lock = BootstrapRuntimeOwnerLock::acquire(&runtime_dir, terminate)?;
     if terminate.load(Ordering::SeqCst) {
@@ -5658,7 +5659,10 @@ where
                 | LoadedCounterReactorWait::TransportCompletion
                 | LoadedCounterReactorWait::Inactive => None,
             };
-            let timeout = earliest_deadline(owner_authority_deadline(&store, &request)?, sampling);
+            let timeout = earliest_deadline(
+                owner_authority_deadline(&store, operation_deadline)?,
+                sampling,
+            );
             let _ = events.wait(capture.poll_fd(), timeout)?;
             continue;
         }
@@ -5807,7 +5811,7 @@ where
         {
             return Ok(());
         }
-        if permit.is_none() && super::rating::epoch_ms()? >= request.deadline_unix_ms {
+        if permit.is_none() && operation_deadline.expired()? {
             return Err(
                 "bootstrap runtime permit was not published before the deadline".to_string(),
             );
@@ -5821,7 +5825,7 @@ where
             continue;
         }
         let timeout = earliest_deadline(
-            owner_deadline(&store, &request, outcome)?,
+            owner_deadline(&store, operation_deadline, outcome)?,
             capture.next_sample_deadline()?,
         );
         let _ = events.wait(capture.poll_fd(), timeout)?;

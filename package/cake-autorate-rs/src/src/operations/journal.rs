@@ -1,10 +1,13 @@
-use super::identity::{CoordinatorIdentity, ProcessIdentity};
+use super::deadline::{self, DeadlineAnchor, OperationDeadline};
+use super::identity::{monotonic_boot_ms, CoordinatorIdentity, ProcessIdentity};
 use super::protocol::{OperationRequest, OperationState, MAX_OPERATION_RECORD_BYTES};
 use super::state;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const RUNTIME_OWNER_JOURNAL_HEADER: &str = "cake-autorate-calibration\t3\tjournal";
 const PUBLICATION_JOURNAL_HEADER: &str = "cake-autorate-calibration\t4\tjournal";
@@ -969,6 +972,7 @@ pub struct JournalScan {
 pub struct JournalStore {
     jobs_dir: PathBuf,
     coordinator: CoordinatorIdentity,
+    deadlines: Mutex<BTreeMap<String, OperationDeadline>>,
 }
 
 impl JournalStore {
@@ -978,6 +982,7 @@ impl JournalStore {
         let store = Self {
             jobs_dir,
             coordinator,
+            deadlines: Mutex::new(BTreeMap::new()),
         };
         store.finish_interrupted_retirements()?;
         Ok(store)
@@ -999,11 +1004,18 @@ impl JournalStore {
         {
             return Err("journal coordinator identity is stale".to_string());
         }
+        // The operation's duration is anchored on the boot clock at admission;
+        // the request keeps its wall-clock fields unchanged. Read before the
+        // directory exists, so a clock failure leaves nothing behind.
+        let anchor =
+            DeadlineAnchor::admit(request, &self.coordinator.boot_id, monotonic_boot_ms()?)?;
         let job_dir = self.jobs_dir.join(&journal.job_id);
         fs::create_dir(&job_dir)
             .map_err(|error| format!("unable to create job journal directory: {error}"))?;
         fs::set_permissions(&job_dir, fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("unable to secure job journal directory: {error}"))?;
+        // The state file is written last because it is what makes the job
+        // visible to a scan.
         if let Err(error) = atomic_write(
             &job_dir,
             REQUEST_FILE,
@@ -1011,6 +1023,7 @@ impl JournalStore {
             &self.coordinator.generation,
             0,
         )
+        .and_then(|_| deadline::write_anchor(&job_dir, &anchor))
         .and_then(|_| {
             atomic_write(
                 &job_dir,
@@ -1022,7 +1035,35 @@ impl JournalStore {
         }) {
             return Err(format!("unable to initialize job journal: {error}"));
         }
+        if let Ok(mut cache) = self.deadlines.lock() {
+            cache.insert(
+                journal.job_id.clone(),
+                OperationDeadline::at_boot_ms(anchor.deadline_boot_ms),
+            );
+        }
         Ok(())
+    }
+
+    /// The monotonic deadline of an admitted job. It is read from the job
+    /// directory once; a job that predates anchors gets one from its remaining
+    /// wall-clock time, stored so that every process agrees on it.
+    pub fn deadline(&self, request: &OperationRequest) -> Result<OperationDeadline, String> {
+        let job_id = &request.identity.job_id;
+        if let Some(value) = self
+            .deadlines
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(job_id).copied())
+        {
+            return Ok(value);
+        }
+        let job_dir = self.jobs_dir.join(job_id);
+        secure_existing_job_dir(&job_dir)?;
+        let value = deadline::load_on_boot(&job_dir, request, &self.coordinator.boot_id, true)?;
+        if let Ok(mut cache) = self.deadlines.lock() {
+            cache.insert(job_id.clone(), value);
+        }
+        Ok(value)
     }
 
     pub fn update(&self, journal: &JobJournal) -> Result<(), String> {
@@ -1208,6 +1249,9 @@ impl JournalStore {
         sync_directory(&self.jobs_dir)?;
         fs::remove_dir_all(&retired)
             .map_err(|error| format!("unable to remove retired settled journal: {error}"))?;
+        if let Ok(mut cache) = self.deadlines.lock() {
+            cache.remove(&expected.journal.job_id);
+        }
         sync_directory(&self.jobs_dir)
     }
 
@@ -1764,6 +1808,73 @@ mod tests {
         assert!(scan.unsafe_entries.is_empty());
         assert_eq!(scan.jobs.len(), 1);
         assert_eq!(scan.jobs[0].disposition, JournalDisposition::Queued);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn admission_anchors_the_deadline_beside_the_request_and_it_survives_a_clock_step() {
+        use crate::operations::identity::test_clock::ScriptedClocks;
+        let clocks = ScriptedClocks::install(2_000_000, 1_790_000_000_000);
+        let root = temp_root("deadline-anchor");
+        cleanup(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let coordinator = coordinator();
+        let store = JournalStore::open(&root, coordinator.clone()).unwrap();
+        let mut request = request();
+        request.created_unix_ms = 1_790_000_000_000;
+        request.deadline_unix_ms = request.created_unix_ms + 45 * 60_000;
+        let journal = JobJournal::queued(&request, &coordinator, true).unwrap();
+        store.create(&request, &journal).unwrap();
+        let job_dir = root.join(JOBS_DIR).join(&journal.job_id);
+        assert_eq!(
+            fs::metadata(job_dir.join(deadline::DEADLINE_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        // The request keeps its wall-clock fields unchanged.
+        assert_eq!(
+            OperationRequest::decode(&fs::read_to_string(job_dir.join(REQUEST_FILE)).unwrap())
+                .unwrap(),
+            request
+        );
+        let expected = OperationDeadline::at_boot_ms(2_000_000 + 45 * 60_000);
+        assert_eq!(store.deadline(&request).unwrap(), expected);
+
+        // A step of the wall clock, and a coordinator restart in the same
+        // boot, leave the deadline where admission put it.
+        clocks.advance(60_000);
+        clocks.step_wall_forward(6 * 3_600_000);
+        drop(store);
+        let reopened = JournalStore::open(&root, coordinator.clone()).unwrap();
+        assert_eq!(reopened.deadline(&request).unwrap(), expected);
+        clocks.step_wall_back(12 * 3_600_000);
+        assert_eq!(reopened.deadline(&request).unwrap(), expected);
+
+        // Another boot refuses the anchor; the journal scan treats the job as
+        // interrupted by the same boot ID.
+        let mut next_boot = coordinator;
+        next_boot.boot_id = "99999999999999999999999999999999".to_string();
+        let after_reboot = JournalStore::open(&root, next_boot).unwrap();
+        assert_eq!(
+            after_reboot.deadline(&request).unwrap_err(),
+            "operation-deadline-from-another-boot"
+        );
+
+        // Retirement removes the anchor with the job and forgets the cache.
+        let mut settled = journal.clone();
+        settled.state = OperationState::Cancelled;
+        settled.sequence += 1;
+        reopened.update(&settled).unwrap();
+        let proc_root = root.join("proc");
+        fs::create_dir(&proc_root).unwrap();
+        let scanned = reopened.scan(&proc_root).unwrap().jobs.remove(0);
+        reopened.retire_settled_job(&scanned, &proc_root).unwrap();
+        assert!(!job_dir.exists());
+        assert!(reopened.deadline(&request).is_err());
         cleanup(&root);
     }
 

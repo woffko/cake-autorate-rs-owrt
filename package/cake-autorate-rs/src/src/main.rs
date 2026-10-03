@@ -5633,6 +5633,8 @@ struct Controller {
     rating_runtime_faulted: bool,
     #[cfg(feature = "calibration")]
     last_rejected_rating_capture_token: Option<String>,
+    #[cfg(feature = "calibration")]
+    rating_capture_window: Option<RatingCaptureWindow>,
 }
 
 #[cfg(all(test, feature = "calibration"))]
@@ -5685,6 +5687,72 @@ fn rating_capture_request_is_admissible(
         && deadline
             .map(|value| value.is_finite() && value > now_epoch)
             .unwrap_or(false)
+}
+
+/// A rating capture request on the monotonic clock. The request file carries a
+/// wall-clock deadline in seconds and its format does not change. The deadline
+/// is read once, when the request first appears or changes, and followed on the
+/// monotonic clock from then on: a clock step cannot end a live capture early
+/// or keep an abandoned one alive.
+#[cfg(feature = "calibration")]
+#[derive(Clone, Debug)]
+struct RatingCaptureWindow {
+    token: String,
+    published_s: f64,
+    expires_at: Instant,
+}
+
+#[cfg(feature = "calibration")]
+impl RatingCaptureWindow {
+    /// Longest remaining time a published deadline is believed.
+    const MAX_REMAINING_S: f64 = 7_200.0;
+
+    fn open(token: &str, published_s: f64, now_epoch: f64, now: Instant) -> Self {
+        let remaining_s = (published_s - now_epoch).clamp(0.0, Self::MAX_REMAINING_S);
+        Self {
+            token: token.to_string(),
+            published_s,
+            // The remaining time is clamped to two hours, so the sum cannot
+            // overflow; a window that somehow could expires at once.
+            expires_at: now
+                .checked_add(Duration::from_secs_f64(remaining_s))
+                .unwrap_or(now),
+        }
+    }
+
+    fn follows(&self, token: &str, published: Option<f64>) -> bool {
+        self.token == token
+            && published.is_some_and(|value| value.to_bits() == self.published_s.to_bits())
+    }
+
+    fn live_at(&self, now: Instant) -> bool {
+        now < self.expires_at
+    }
+}
+
+/// Whether the published rating capture request may drive a capture now. The
+/// wall clock (`now_epoch`) is consulted only when a request first appears or
+/// changes; afterwards `window` follows the monotonic clock (`now`).
+#[cfg(feature = "calibration")]
+fn rating_capture_admissible(
+    window: &mut Option<RatingCaptureWindow>,
+    token: &str,
+    mode: &str,
+    published: Option<f64>,
+    now: Instant,
+    now_epoch: f64,
+) -> bool {
+    if !window
+        .as_ref()
+        .is_some_and(|window| window.follows(token, published))
+    {
+        *window = published
+            .filter(|_| rating_capture_request_is_admissible(token, mode, published, now_epoch))
+            .map(|value| RatingCaptureWindow::open(token, value, now_epoch, now));
+    }
+    window.as_ref().is_some_and(|window| window.live_at(now))
+        && operations::rating::capture_job_id_is_valid(token)
+        && matches!(mode, "automatic" | "client")
 }
 
 impl Controller {
@@ -5972,6 +6040,8 @@ impl Controller {
             rating_runtime_faulted: false,
             #[cfg(feature = "calibration")]
             last_rejected_rating_capture_token: None,
+            #[cfg(feature = "calibration")]
+            rating_capture_window: None,
             dl_baseline_us: HashMap::new(),
             ul_baseline_us: HashMap::new(),
             baseline_epoch: now,
@@ -6558,7 +6628,14 @@ impl Controller {
             .next()
             .and_then(|value| value.parse::<f64>().ok())
             .unwrap_or(0.0);
-        if rating_capture_request_is_admissible(token, mode, deadline, epoch_secs()) {
+        if rating_capture_admissible(
+            &mut self.rating_capture_window,
+            token,
+            mode,
+            deadline,
+            now,
+            epoch_secs(),
+        ) {
             self.last_rejected_rating_capture_token = None;
             let capture_started = self.rating_load.set_capture(
                 Some(token),
@@ -15384,22 +15461,23 @@ mod tests {
         parse_uci_values, pinger_command, pinger_line_is_timeout, private_cake_args,
         probe_loop_required, published_applied_cake_rate_kbps, published_runtime_qdisc_kind,
         qdisc_output_has_cake, quality_grade_result_json, rate_sample_is_recent,
-        rating_capture_request_is_admissible, reflector_bad_reflectors, reflector_health_json,
-        reflector_spare_reflectors, reject_autotune_capture_after_io_with_clock,
-        root_cake_bandwidth_kbps, root_cake_qdisc, run, run_autotune_proposal_cli, run_sqm_helper,
-        runtime_driver_holds_controller, sample_is_stale, select_autotune_capture_rates,
-        shaper_update_due, status_publish_due, stop_managed_sqm_with, throughput_floor,
-        transport_error_code, transport_probe_control_allows_start, transport_probe_interval_s,
+        rating_capture_admissible, rating_capture_request_is_admissible, reflector_bad_reflectors,
+        reflector_health_json, reflector_spare_reflectors,
+        reject_autotune_capture_after_io_with_clock, root_cake_bandwidth_kbps, root_cake_qdisc,
+        run, run_autotune_proposal_cli, run_sqm_helper, runtime_driver_holds_controller,
+        sample_is_stale, select_autotune_capture_rates, shaper_update_due, status_publish_due,
+        stop_managed_sqm_with, throughput_floor, transport_error_code,
+        transport_probe_control_allows_start, transport_probe_interval_s,
         transport_probe_route_identities, transport_probe_runtime_required,
         transport_result_matches_route, uplink_error_code, validated_conservative_samples,
         wait_for_runtime_topology, AdaptiveCapacityStatusContext, AdaptiveCeilingDirection,
         AutotuneSpeedtestRateMonitor, AutotuneTransportCaptureKey, AutotuneTransportControl,
         AutotuneTransportFlight, AutotuneTransportReadiness, AutotuneTransportSettlement,
         CakeLinkLayer, CakeQdiscKind, Config, Controller, MemoryInfo, PrivateIngressState,
-        PrivateRootState, RateMonitor, RateSample, ReflectorHealth, ReflectorState, RouteSnapshot,
-        Sample, SpeedtestCounterRateMonitor, SqmRecoveryError, SqmTopologyErrorKind,
-        ThroughputGuardInput, TransportLatencyTracker, TransportProbeResult, UplinkState,
-        AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE, CAKE_GROWTH_UPDATE_MIN_INTERVAL,
+        PrivateRootState, RateMonitor, RateSample, RatingCaptureWindow, ReflectorHealth,
+        ReflectorState, RouteSnapshot, Sample, SpeedtestCounterRateMonitor, SqmRecoveryError,
+        SqmTopologyErrorKind, ThroughputGuardInput, TransportLatencyTracker, TransportProbeResult,
+        UplinkState, AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE, CAKE_GROWTH_UPDATE_MIN_INTERVAL,
         CALIBRATIONCTL_SCHEDULER_STATUS_USAGE, CALIBRATION_CAPABILITIES_V3,
         STATUS_PUBLISH_INTERVAL, TERMINATE, TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
     };
@@ -15459,6 +15537,119 @@ mod tests {
         assert!(json.contains("\"partial\":true"));
         assert!(json.contains("\"completion_reason\":\"download_incomplete\""));
         assert!(json.contains("\"ul\":{\"grade\":\"A\""));
+    }
+
+    #[cfg(feature = "calibration")]
+    #[test]
+    fn a_rating_capture_deadline_is_followed_on_the_monotonic_clock() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let other = "fedcba9876543210fedcba9876543210";
+        let start = Instant::now();
+        let mut window = None;
+
+        // First sight: the request expires 30 s from the wall clock now.
+        assert!(rating_capture_admissible(
+            &mut window,
+            token,
+            "automatic",
+            Some(1_000_030.0),
+            start,
+            1_000_000.0
+        ));
+        // The wall clock is stepped an hour forward, then a day back; the same
+        // publication neither expires early nor lives longer.
+        for stepped_epoch in [1_003_600.0, 913_600.0, 1_000_000.0] {
+            assert!(rating_capture_admissible(
+                &mut window,
+                token,
+                "automatic",
+                Some(1_000_030.0),
+                start + Duration::from_secs(29),
+                stepped_epoch
+            ));
+            assert!(!rating_capture_admissible(
+                &mut window,
+                token,
+                "automatic",
+                Some(1_000_030.0),
+                start + Duration::from_secs(30),
+                stepped_epoch
+            ));
+        }
+        // A republished request (new deadline value) is read again once.
+        assert!(rating_capture_admissible(
+            &mut window,
+            token,
+            "automatic",
+            Some(1_003_660.0),
+            start + Duration::from_secs(31),
+            1_003_600.5
+        ));
+        // 59.5 s remained when it was read at +31 s: live until +90.5 s.
+        assert!(rating_capture_admissible(
+            &mut window,
+            token,
+            "automatic",
+            Some(1_003_660.0),
+            start + Duration::from_secs(90),
+            1_003_600.5
+        ));
+        assert!(!rating_capture_admissible(
+            &mut window,
+            token,
+            "automatic",
+            Some(1_003_660.0),
+            start + Duration::from_secs(91),
+            1_003_600.5
+        ));
+        // Another job's request starts its own window; a removed request
+        // forgets the old one.
+        assert!(rating_capture_admissible(
+            &mut window,
+            other,
+            "client",
+            Some(2_000_010.0),
+            start,
+            2_000_000.0
+        ));
+        assert!(!rating_capture_admissible(
+            &mut window,
+            "",
+            "",
+            None,
+            start,
+            2_000_000.0
+        ));
+        assert!(window.is_none());
+        // A request that is already past, or malformed, is never admitted.
+        assert!(!rating_capture_admissible(
+            &mut window,
+            token,
+            "automatic",
+            Some(999_999.0),
+            start,
+            1_000_000.0
+        ));
+        assert!(!rating_capture_admissible(
+            &mut window,
+            token,
+            "manual",
+            Some(1_000_030.0),
+            start,
+            1_000_000.0
+        ));
+        assert!(!rating_capture_admissible(
+            &mut window,
+            token,
+            "automatic",
+            Some(f64::NAN),
+            start,
+            1_000_000.0
+        ));
+        // A far-future value is believed for two hours at most.
+        let far = RatingCaptureWindow::open(token, 1e15, 1_000_000.0, start);
+        assert!(far.live_at(start + Duration::from_secs(7_199)));
+        assert!(!far.live_at(start + Duration::from_secs(7_201)));
     }
 
     #[test]

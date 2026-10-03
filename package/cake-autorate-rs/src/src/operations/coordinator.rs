@@ -29,6 +29,7 @@ use super::{
     },
     autotune_runtime_store::RuntimeOverrideStore,
     bootstrap_runtime_owner::read_bootstrap_runtime_owner_claim,
+    deadline::OperationDeadline,
     event_loop::{install_child_signal_handler, CalibrationEventLoop},
     full_autotune::{self, AutotuneTerminal, RuntimeAckState},
     identity::{monotonic_boot_ms, CoordinatorIdentity, ProcessIdentity, DEFAULT_PROC_ROOT},
@@ -272,8 +273,12 @@ fn native_runtime_snapshot_path(request: &OperationRequest) -> PathBuf {
 /// state gate runs before the heavyweight UCI/route/tc attestor, so a sleeping
 /// or booting instance does not cause repeated shell work.  No elapsed retry
 /// count changes the outcome: the current atomic snapshot is authoritative.
-fn native_runtime_snapshot_readiness(request: &OperationRequest) -> NativeRuntimeSnapshotReadiness {
-    let now_unix_ms = match rating::epoch_ms() {
+fn native_runtime_snapshot_readiness(
+    request: &OperationRequest,
+    deadline: OperationDeadline,
+) -> NativeRuntimeSnapshotReadiness {
+    let clocks = monotonic_boot_ms().and_then(|boot| rating::epoch_ms().map(|unix| (boot, unix)));
+    let (now_boot_ms, now_unix_ms) = match clocks {
         Ok(value) => value,
         Err(error) => {
             return NativeRuntimeSnapshotReadiness::Unsafe {
@@ -283,18 +288,22 @@ fn native_runtime_snapshot_readiness(request: &OperationRequest) -> NativeRuntim
         }
     };
     native_runtime_snapshot_readiness_at(
-        request,
         &native_runtime_snapshot_path(request),
+        deadline,
+        now_boot_ms,
         now_unix_ms,
     )
 }
 
+/// The operation deadline is judged on the boot clock; the wall clock only
+/// ages the instance's own wall-clock-stamped publication.
 fn native_runtime_snapshot_readiness_at(
-    request: &OperationRequest,
     path: &Path,
+    deadline: OperationDeadline,
+    now_boot_ms: u64,
     now_unix_ms: u64,
 ) -> NativeRuntimeSnapshotReadiness {
-    if now_unix_ms >= request.deadline_unix_ms {
+    if deadline.expired_at(now_boot_ms) {
         return NativeRuntimeSnapshotReadiness::Unsafe {
             code: "operation-deadline-expired".to_string(),
             message: "the immutable operation deadline expired while waiting for instance runtime"
@@ -325,17 +334,23 @@ fn native_runtime_snapshot_readiness_at(
             }
         }
     };
-    if snapshot.updated_unix_ms > now_unix_ms.saturating_add(5_000) {
-        return NativeRuntimeSnapshotReadiness::Unsafe {
-            code: "runtime-snapshot-clock-drift".to_string(),
-            message: "the instance runtime snapshot timestamp is in the future".to_string(),
-        };
-    }
-    if now_unix_ms.saturating_sub(snapshot.updated_unix_ms) > 5_000 {
-        return NativeRuntimeSnapshotReadiness::Waiting {
-            code: "runtime-snapshot-stale".to_string(),
-            message: "the instance runtime snapshot is stale".to_string(),
-        };
+    // A snapshot stamped ahead of this clock means the wall clock was stepped
+    // back after the instance published it; the next publication carries the
+    // new time. That is a wait, never a failure of the operation.
+    match rating::publication_age(snapshot.updated_unix_ms, now_unix_ms) {
+        rating::PublicationAge::Fresh => {}
+        rating::PublicationAge::Ahead => {
+            return NativeRuntimeSnapshotReadiness::Waiting {
+                code: "runtime-snapshot-clock-ahead".to_string(),
+                message: "the instance runtime snapshot is stamped ahead of this clock".to_string(),
+            };
+        }
+        rating::PublicationAge::Stale => {
+            return NativeRuntimeSnapshotReadiness::Waiting {
+                code: "runtime-snapshot-stale".to_string(),
+                message: "the instance runtime snapshot is stale".to_string(),
+            };
+        }
     }
     if !snapshot.route_test_ready {
         return NativeRuntimeSnapshotReadiness::Waiting {
@@ -3956,16 +3971,18 @@ impl CalibrationDaemon {
             }
         }
 
-        let now_unix_ms = rating::epoch_ms()?;
+        let now_boot_ms = monotonic_boot_ms()?;
         for job in &self.jobs {
             if state::terminal(job.journal.state) {
                 continue;
             }
-            if job.request.deadline_unix_ms > now_unix_ms {
-                reduce_timeout(
-                    &mut timeout,
-                    Duration::from_millis(job.request.deadline_unix_ms - now_unix_ms),
-                );
+            // A job whose deadline cannot be read (another boot) is settled
+            // by recovery, not by a timer.
+            if let Ok(deadline) = self.journal_store.deadline(&job.request) {
+                let remaining_ms = deadline.remaining_ms_at(now_boot_ms);
+                if remaining_ms > 0 {
+                    reduce_timeout(&mut timeout, Duration::from_millis(remaining_ms));
+                }
             }
         }
         if let Some(calendar) = self
@@ -6016,14 +6033,17 @@ impl CalibrationDaemon {
                 "bootstrap runtime namespace seed differs from its permit identity".to_string(),
             );
         }
-        let now_unix_ms = rating::epoch_ms()?;
-        let remaining_ms = request.deadline_unix_ms.saturating_sub(now_unix_ms);
+        let now_boot_ms = monotonic_boot_ms()?;
+        let remaining_ms = self
+            .journal_store
+            .deadline(request)?
+            .remaining_ms_at(now_boot_ms);
         if remaining_ms < 15_000 {
             return Err(
                 "operation deadline is too close for a bootstrap runtime probe".to_string(),
             );
         }
-        let deadline_boot_ms = monotonic_boot_ms()?
+        let deadline_boot_ms = now_boot_ms
             .checked_add(remaining_ms.min(NATIVE_AUTOTUNE_RUNTIME_PERMIT_MAX_MS))
             .ok_or_else(|| "bootstrap runtime probe deadline overflow".to_string())?;
         let policy = full_autotune::native_autotune_runtime_permit_policy(request)?;
@@ -6089,7 +6109,16 @@ impl CalibrationDaemon {
                 message: "operation does not own a native runtime override".to_string(),
             };
         }
-        let snapshot = match native_runtime_snapshot_readiness(request) {
+        let operation_deadline = match self.journal_store.deadline(request) {
+            Ok(value) => value,
+            Err(message) => {
+                return RuntimePermitReadiness::Unsafe {
+                    code: "operation-deadline-unavailable".to_string(),
+                    message,
+                }
+            }
+        };
+        let snapshot = match native_runtime_snapshot_readiness(request, operation_deadline) {
             NativeRuntimeSnapshotReadiness::Ready(snapshot) => snapshot,
             NativeRuntimeSnapshotReadiness::Waiting { code, message } => {
                 return RuntimePermitReadiness::Waiting { code, message }
@@ -6144,12 +6173,11 @@ impl CalibrationDaemon {
             }
             .round()
             .max(100.0) as u64;
-            let now_unix_ms = rating::epoch_ms()?;
-            let remaining_ms = request.deadline_unix_ms.saturating_sub(now_unix_ms);
+            let now_boot_ms = super::identity::monotonic_boot_ms()?;
+            let remaining_ms = operation_deadline.remaining_ms_at(now_boot_ms);
             if remaining_ms < 15_000 {
                 return Err("operation deadline is too close for a runtime probe".to_string());
             }
-            let now_boot_ms = super::identity::monotonic_boot_ms()?;
             let deadline_boot_ms = now_boot_ms
                 .checked_add(remaining_ms.min(NATIVE_AUTOTUNE_RUNTIME_PERMIT_MAX_MS))
                 .ok_or_else(|| "runtime probe deadline overflow".to_string())?;
@@ -7140,26 +7168,33 @@ impl CalibrationDaemon {
         };
         let request = self.jobs[index].request.clone();
         let job_id = request.identity.job_id.clone();
-        let now_unix_ms = match rating::epoch_ms() {
+        let operation_deadline = match self.journal_store.deadline(&request) {
             Ok(value) => value,
+            Err(error) => {
+                self.fail_queued_before_mutation(index, "operation-deadline-unavailable", &error);
+                return false;
+            }
+        };
+        match operation_deadline.expired() {
+            Ok(false) => {}
+            Ok(true) => {
+                self.fail_queued_before_mutation(
+                    index,
+                    "operation-deadline-expired",
+                    "the immutable operation deadline expired while waiting for runtime",
+                );
+                return false;
+            }
             Err(error) => {
                 self.fail_queued_before_mutation(index, "runtime-clock-unavailable", &error);
                 return false;
             }
-        };
-        if now_unix_ms >= request.deadline_unix_ms {
-            self.fail_queued_before_mutation(
-                index,
-                "operation-deadline-expired",
-                "the immutable operation deadline expired while waiting for runtime",
-            );
-            return false;
         }
         if request.target_state == OperationTargetState::ExistingManaged
             && request_requires_native_runtime(&request)
             && self.supports_native_request(&request)
         {
-            match native_runtime_snapshot_readiness(&request) {
+            match native_runtime_snapshot_readiness(&request, operation_deadline) {
                 NativeRuntimeSnapshotReadiness::Ready(_) => {}
                 NativeRuntimeSnapshotReadiness::Unsafe { code, message } => {
                     self.fail_queued_before_mutation(index, &code, &message);
@@ -11044,6 +11079,14 @@ mod tests {
         request.service_dl_cap_kbps = Some(900_000);
         request.service_ul_cap_kbps = Some(100_000);
         request.validate().unwrap();
+        // The permit takes its deadline from the admitted job's anchor.
+        daemon
+            .journal_store
+            .create(
+                &request,
+                &JobJournal::queued(&request, &daemon.coordinator, true).unwrap(),
+            )
+            .unwrap();
         let permit_id = "9".repeat(32);
         let baseline = AbsentRuntimeBaseline {
             planned_sqm_section: "wan_sqm".to_string(),
@@ -13379,12 +13422,14 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let snapshot_path = root.join("rating-runtime");
-        let mut request = operation_request('a', 'b', "wan");
-        request.deadline_unix_ms = 2_000_000;
+        // The operation deadline is judged on the boot clock; the wall clock
+        // (`now`) only ages the instance's own publication.
+        let deadline = OperationDeadline::at_boot_ms(2_000_000);
+        let boot = 1_000_000;
         let now = 1_000_000;
 
         assert!(matches!(
-            native_runtime_snapshot_readiness_at(&request, &snapshot_path, now),
+            native_runtime_snapshot_readiness_at(&snapshot_path, deadline, boot, now),
             NativeRuntimeSnapshotReadiness::Waiting { ref code, .. }
                 if code == "runtime-snapshot-missing"
         ));
@@ -13393,7 +13438,7 @@ mod tests {
         fs::write(&snapshot_path, snapshot.encode().unwrap()).unwrap();
         fs::set_permissions(&snapshot_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(matches!(
-            native_runtime_snapshot_readiness_at(&request, &snapshot_path, now),
+            native_runtime_snapshot_readiness_at(&snapshot_path, deadline, boot, now),
             NativeRuntimeSnapshotReadiness::Ready(_)
         ));
 
@@ -13420,7 +13465,7 @@ mod tests {
             .replace("upload_qdisc_kind=\n", "");
         fs::write(&snapshot_path, retired_v3).unwrap();
         assert!(matches!(
-            native_runtime_snapshot_readiness_at(&request, &snapshot_path, now),
+            native_runtime_snapshot_readiness_at(&snapshot_path, deadline, boot, now),
             NativeRuntimeSnapshotReadiness::Unsafe { ref code, .. }
                 if code == "runtime-snapshot-invalid"
         ));
@@ -13429,7 +13474,7 @@ mod tests {
         snapshot.route_test_ready = false;
         fs::write(&snapshot_path, snapshot.encode().unwrap()).unwrap();
         assert!(matches!(
-            native_runtime_snapshot_readiness_at(&request, &snapshot_path, now),
+            native_runtime_snapshot_readiness_at(&snapshot_path, deadline, boot, now),
             NativeRuntimeSnapshotReadiness::Waiting { ref code, .. }
                 if code == "runtime-route-not-ready"
         ));
@@ -13439,18 +13484,120 @@ mod tests {
         snapshot.capture_observed_unix_ms = now - 5_001;
         fs::write(&snapshot_path, snapshot.encode().unwrap()).unwrap();
         assert!(matches!(
-            native_runtime_snapshot_readiness_at(&request, &snapshot_path, now),
+            native_runtime_snapshot_readiness_at(&snapshot_path, deadline, boot, now),
             NativeRuntimeSnapshotReadiness::Waiting { ref code, .. }
                 if code == "runtime-snapshot-stale"
         ));
 
+        // A publication stamped ahead of this clock (the clock was stepped
+        // back) is a wait, not a failure; a fresh publication clears it.
         snapshot.updated_unix_ms = now + 5_001;
         fs::write(&snapshot_path, snapshot.encode().unwrap()).unwrap();
         assert!(matches!(
-            native_runtime_snapshot_readiness_at(&request, &snapshot_path, now),
-            NativeRuntimeSnapshotReadiness::Unsafe { ref code, .. }
-                if code == "runtime-snapshot-clock-drift"
+            native_runtime_snapshot_readiness_at(&snapshot_path, deadline, boot, now),
+            NativeRuntimeSnapshotReadiness::Waiting { ref code, .. }
+                if code == "runtime-snapshot-clock-ahead"
         ));
+        snapshot.updated_unix_ms = now;
+        snapshot.capture_observed_unix_ms = now;
+        fs::write(&snapshot_path, snapshot.encode().unwrap()).unwrap();
+        assert!(matches!(
+            native_runtime_snapshot_readiness_at(&snapshot_path, deadline, boot, now),
+            NativeRuntimeSnapshotReadiness::Ready(_)
+        ));
+
+        // The deadline follows the boot clock only: the same snapshot is
+        // ready until the boot clock reaches it, whatever the wall clock says.
+        for wall in [0, now, now + 3_600_000, u64::MAX / 2] {
+            let verdict = native_runtime_snapshot_readiness_at(
+                &snapshot_path,
+                deadline,
+                deadline.boot_ms() - 1,
+                wall,
+            );
+            assert!(!matches!(
+                verdict,
+                NativeRuntimeSnapshotReadiness::Unsafe { ref code, .. }
+                    if code == "operation-deadline-expired"
+            ));
+            assert!(matches!(
+                native_runtime_snapshot_readiness_at(
+                    &snapshot_path,
+                    deadline,
+                    deadline.boot_ms(),
+                    wall,
+                ),
+                NativeRuntimeSnapshotReadiness::Unsafe { ref code, .. }
+                    if code == "operation-deadline-expired"
+            ));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn ready_runtime_attestor(_: &OperationRequest) -> RuntimeAttestation {
+        RuntimeAttestation::Ready
+    }
+
+    fn queued_job_with_budget(daemon: &mut CalibrationDaemon, request: &OperationRequest) {
+        let journal = JobJournal::queued(request, &daemon.coordinator, true).unwrap();
+        daemon.journal_store.create(request, &journal).unwrap();
+        daemon.jobs.push(ScannedJob {
+            request: request.clone(),
+            journal,
+            disposition: JournalDisposition::Queued,
+        });
+    }
+
+    #[test]
+    fn a_wall_clock_step_neither_expires_nor_extends_a_queued_job() {
+        use crate::operations::identity::test_clock::ScriptedClocks;
+        let clocks = ScriptedClocks::install(5_000_000, 1_790_000_000_000);
+        let root = temp_path("deadline-clock-step");
+        let mut daemon =
+            CalibrationDaemon::bind_with_components(&root, true, Some(ready_runtime_attestor))
+                .unwrap();
+        daemon.native_autotune = true;
+        let mut request = operation_request('a', 'b', "wan");
+        request.created_unix_ms = 1_790_000_000_000;
+        request.deadline_unix_ms = request.created_unix_ms + 10 * 60_000;
+        queued_job_with_budget(&mut daemon, &request);
+
+        // Waiting for the instance's runtime snapshot: not failed, with the
+        // ten minutes still ahead.
+        assert!(!daemon.runtime_preflight_ready(0));
+        assert_eq!(daemon.jobs[0].journal.state, OperationState::Queued);
+        assert_eq!(
+            daemon.next_event_timeout().unwrap(),
+            Some(Duration::from_secs(600))
+        );
+
+        // An hour forward: the old wall-clock comparison failed the job here.
+        clocks.advance(4 * 60_000);
+        clocks.step_wall_forward(3_600_000);
+        assert!(!daemon.runtime_preflight_ready(0));
+        assert_eq!(daemon.jobs[0].journal.state, OperationState::Queued);
+        assert_eq!(
+            daemon.next_event_timeout().unwrap(),
+            Some(Duration::from_secs(360))
+        );
+
+        // Two hours back: the old comparison granted two more hours.
+        clocks.step_wall_back(2 * 3_600_000);
+        assert_eq!(
+            daemon.next_event_timeout().unwrap(),
+            Some(Duration::from_secs(360))
+        );
+        clocks.advance(6 * 60_000 - 10);
+        assert!(!daemon.runtime_preflight_ready(0));
+        assert_eq!(daemon.jobs[0].journal.state, OperationState::Queued);
+        clocks.advance(10);
+        assert!(!daemon.runtime_preflight_ready(0));
+        assert_eq!(daemon.jobs[0].journal.state, OperationState::Failed);
+        assert_eq!(
+            daemon.jobs[0].journal.diagnostic_code.as_deref(),
+            Some("operation-deadline-expired")
+        );
+        drop(daemon);
         fs::remove_dir_all(root).unwrap();
     }
 

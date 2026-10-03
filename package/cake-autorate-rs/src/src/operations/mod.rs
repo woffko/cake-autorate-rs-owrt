@@ -48,6 +48,8 @@ pub(crate) mod controller_input;
 #[cfg(feature = "calibration")]
 pub mod coordinator;
 pub(crate) mod cpu_profile;
+#[cfg(feature = "calibration")]
+pub mod deadline;
 pub mod event_loop;
 #[cfg(feature = "calibration")]
 pub mod full_autotune;
@@ -291,6 +293,7 @@ mod timer_ownership_tests {
         ),
         ("coordinator", include_str!("coordinator.rs")),
         ("committed_uci", include_str!("committed_uci.rs")),
+        ("deadline", include_str!("deadline.rs")),
         ("controller_input", include_str!("controller_input.rs")),
         ("uci_transaction", include_str!("uci_transaction.rs")),
         ("cpu_profile", include_str!("cpu_profile.rs")),

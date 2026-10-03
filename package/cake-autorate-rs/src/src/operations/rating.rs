@@ -1,4 +1,5 @@
 use super::autotune_runtime::RuntimeQdiscKind;
+use super::deadline::{self, OperationDeadline};
 use super::protocol::{OperationKind, OperationRequest, SpeedtestDirection};
 use super::speedtest::{self, SpeedtestTerminal};
 use crate::quality_grade::QUALITY_GRADE_METHOD;
@@ -106,7 +107,7 @@ struct CaptureGuard {
     path: PathBuf,
     job_id: String,
     mode: &'static str,
-    deadline_s: u64,
+    deadline: OperationDeadline,
     phase: &'static str,
     background_dl: f64,
     background_ul: f64,
@@ -119,7 +120,7 @@ impl CaptureGuard {
             path,
             job_id,
             mode: "client",
-            deadline_s: 0,
+            deadline: OperationDeadline::at_boot_ms(0),
             phase: "AUTO",
             background_dl: 0.0,
             background_ul: 0.0,
@@ -131,7 +132,7 @@ impl CaptureGuard {
         &mut self,
         mode: &'static str,
         phase: &'static str,
-        deadline_unix_ms: u64,
+        deadline: OperationDeadline,
         background_dl: f64,
         background_ul: f64,
     ) -> Result<(), String> {
@@ -141,7 +142,7 @@ impl CaptureGuard {
             return Err("rating-capture-mode-or-phase-invalid".to_string());
         }
         self.mode = mode;
-        self.deadline_s = deadline_unix_ms / 1000;
+        self.deadline = deadline;
         self.phase = phase;
         self.background_dl = background_dl;
         self.background_ul = background_ul;
@@ -159,14 +160,15 @@ impl CaptureGuard {
     }
 
     fn publish(&self) -> Result<(), String> {
+        // The capture request format carries a wall-clock deadline in seconds.
+        // It is derived from the remaining monotonic time at every
+        // publication, so a clock step between publications cannot leave a
+        // stale instant behind; the instance controller then follows its own
+        // monotonic clock from the moment it first sees this value.
+        let deadline_s = self.deadline.wall_clock_unix_ms()? / 1000;
         let content = format!(
             "{}|{}|{}|{}|{:.3}|{:.3}\n",
-            self.job_id,
-            self.mode,
-            self.deadline_s,
-            self.phase,
-            self.background_dl,
-            self.background_ul,
+            self.job_id, self.mode, deadline_s, self.phase, self.background_dl, self.background_ul,
         );
         atomic_private_write(&self.path, content.as_bytes())
     }
@@ -865,23 +867,34 @@ where
         return Err("rating worker accepts rating operations only".to_string());
     }
 
-    let terminal = match wait_for_permit(
-        &permit_path,
-        &request.identity.job_id,
-        &worker_run_id,
-        request.deadline_unix_ms,
-        terminate,
-    ) {
-        Ok(true) => match run_rating(&request, &worker_run_id, &terminal_path, terminate) {
-            Ok(terminal) => terminal,
-            Err(error) if error == "rating-cancelled" => RatingTerminal::Cancelled,
+    let terminal = match deadline::load_for_worker(&request_path, &request) {
+        Err(error) => RatingTerminal::Failed {
+            code: bounded_error_code(&error),
+        },
+        Ok(operation_deadline) => match wait_for_permit(
+            &permit_path,
+            &request.identity.job_id,
+            &worker_run_id,
+            operation_deadline,
+            terminate,
+        ) {
+            Ok(true) => match run_rating(
+                &request,
+                operation_deadline,
+                &worker_run_id,
+                &terminal_path,
+                terminate,
+            ) {
+                Ok(terminal) => terminal,
+                Err(error) if error == "rating-cancelled" => RatingTerminal::Cancelled,
+                Err(error) => RatingTerminal::Failed {
+                    code: bounded_error_code(&error),
+                },
+            },
+            Ok(false) => RatingTerminal::Cancelled,
             Err(error) => RatingTerminal::Failed {
                 code: bounded_error_code(&error),
             },
-        },
-        Ok(false) => RatingTerminal::Cancelled,
-        Err(error) => RatingTerminal::Failed {
-            code: bounded_error_code(&error),
         },
     };
     let content = terminal.encode(&request.identity.job_id, &worker_run_id)?;
@@ -892,7 +905,7 @@ pub(crate) fn wait_for_permit(
     path: &Path,
     job_id: &str,
     worker_run_id: &str,
-    operation_deadline_unix_ms: u64,
+    operation_deadline: OperationDeadline,
     terminate: &AtomicBool,
 ) -> Result<bool, String> {
     let expected_name = format!("permit-{worker_run_id}");
@@ -912,7 +925,7 @@ pub(crate) fn wait_for_permit(
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return Err("worker-permit-inspection-failed".to_string()),
         }
-        if epoch_ms()? >= operation_deadline_unix_ms {
+        if operation_deadline.expired()? {
             return Err("operation-deadline-expired-before-worker-permit".to_string());
         }
         thread::sleep(PERMIT_POLL_INTERVAL);
@@ -937,6 +950,7 @@ fn decode_permit(content: &str, job_id: &str, worker_run_id: &str) -> Result<(),
 
 fn run_rating(
     request: &OperationRequest,
+    operation_deadline: OperationDeadline,
     worker_run_id: &str,
     terminal_path: &Path,
     terminate: &AtomicBool,
@@ -968,7 +982,7 @@ fn run_rating(
     let capture_path = run_dir.join("rating-capture");
     let mut initial = None;
     let mut stable_runtime_publication = None;
-    while epoch_ms()? < request.deadline_unix_ms {
+    while !operation_deadline.expired()? {
         if terminate.load(Ordering::Relaxed) {
             return Ok(RatingTerminal::Cancelled);
         }
@@ -999,6 +1013,7 @@ fn run_rating(
     let background = wait_for_quiet(
         &snapshot_path,
         request,
+        operation_deadline,
         terminate,
         automatic,
         cfg.rating_capture_quiet_s,
@@ -1014,13 +1029,14 @@ fn run_rating(
     capture.arm(
         if automatic { "automatic" } else { "client" },
         initial_phase,
-        request.deadline_unix_ms,
+        operation_deadline,
         background.0,
         background.1,
     )?;
     let capture_generation = wait_capture_phase(
         &snapshot_path,
         request,
+        operation_deadline,
         terminate,
         automatic,
         initial_phase,
@@ -1030,6 +1046,7 @@ fn run_rating(
     if automatic {
         run_automatic_rating_load(
             request,
+            operation_deadline,
             worker_run_id,
             terminal_path,
             &snapshot_path,
@@ -1047,12 +1064,11 @@ fn run_rating(
     let mut complete_result = None;
     let mut last_owned_dl_samples = 0;
     let mut last_owned_ul_samples = 0;
-    while epoch_ms()? < request.deadline_unix_ms {
+    while !operation_deadline.expired()? {
         if terminate.load(Ordering::Relaxed) {
             return Ok(RatingTerminal::Cancelled);
         }
-        let snapshot =
-            wait_for_rating_snapshot(&snapshot_path, request.deadline_unix_ms, terminate)?;
+        let snapshot = wait_for_rating_snapshot(&snapshot_path, operation_deadline, terminate)?;
         if let Some(snapshot) = authoritative_rating_snapshot(
             &snapshot,
             epoch_ms()?,
@@ -1109,6 +1125,7 @@ fn run_rating(
 #[allow(clippy::too_many_arguments)]
 fn run_automatic_rating_load(
     request: &OperationRequest,
+    operation_deadline: OperationDeadline,
     worker_run_id: &str,
     terminal_path: &Path,
     snapshot_path: &Path,
@@ -1126,6 +1143,7 @@ fn run_automatic_rating_load(
     for direction in [SpeedtestDirection::Download, SpeedtestDirection::Upload] {
         run_automatic_direction(
             request,
+            operation_deadline,
             worker_run_id,
             terminal_path,
             snapshot_path,
@@ -1146,6 +1164,7 @@ fn run_automatic_rating_load(
     wait_capture_phase(
         snapshot_path,
         request,
+        operation_deadline,
         terminate,
         true,
         "IDLE",
@@ -1158,6 +1177,7 @@ fn run_automatic_rating_load(
 #[allow(clippy::too_many_arguments)]
 fn run_automatic_direction(
     request: &OperationRequest,
+    operation_deadline: OperationDeadline,
     worker_run_id: &str,
     terminal_path: &Path,
     snapshot_path: &Path,
@@ -1179,8 +1199,7 @@ fn run_automatic_direction(
         SpeedtestDirection::Both => return Err("automatic-rating-direction-invalid".to_string()),
     };
     for _ in 0..MAX_AUTOMATIC_DIRECTION_RUNS {
-        let snapshot =
-            wait_for_rating_snapshot(snapshot_path, request.deadline_unix_ms, terminate)?;
+        let snapshot = wait_for_rating_snapshot(snapshot_path, operation_deadline, terminate)?;
         if direction_samples_ready(&snapshot, direction) {
             return Ok(());
         }
@@ -1195,6 +1214,7 @@ fn run_automatic_direction(
         wait_capture_phase(
             snapshot_path,
             request,
+            operation_deadline,
             terminate,
             true,
             "IDLE",
@@ -1205,6 +1225,7 @@ fn run_automatic_direction(
         wait_for_quiet(
             snapshot_path,
             request,
+            operation_deadline,
             terminate,
             true,
             quiet_samples,
@@ -1219,6 +1240,7 @@ fn run_automatic_direction(
         wait_capture_phase(
             snapshot_path,
             request,
+            operation_deadline,
             terminate,
             true,
             phase,
@@ -1230,6 +1252,7 @@ fn run_automatic_direction(
         phase_request.traffic_budget = *remaining_budget;
         let terminal = speedtest::run_embedded_speedtest(
             &phase_request,
+            operation_deadline,
             worker_run_id,
             direction,
             terminate,
@@ -1242,6 +1265,7 @@ fn run_automatic_direction(
         wait_capture_phase(
             snapshot_path,
             request,
+            operation_deadline,
             terminate,
             true,
             "IDLE",
@@ -1263,6 +1287,7 @@ fn run_automatic_direction(
         wait_for_quiet(
             snapshot_path,
             request,
+            operation_deadline,
             terminate,
             true,
             quiet_samples,
@@ -1272,7 +1297,7 @@ fn run_automatic_direction(
             runtime_generation,
             Some(capture_generation),
         )?;
-        let drained = wait_for_rating_snapshot(snapshot_path, request.deadline_unix_ms, terminate)?;
+        let drained = wait_for_rating_snapshot(snapshot_path, operation_deadline, terminate)?;
         if owned_capture_contaminated(&drained, &request.identity.job_id, capture_generation) {
             return Err("capture-contaminated".to_string());
         }
@@ -1320,6 +1345,7 @@ fn consume_traffic_budget(
 fn wait_for_quiet(
     snapshot_path: &Path,
     request: &OperationRequest,
+    operation_deadline: OperationDeadline,
     terminate: &AtomicBool,
     require_test_route: bool,
     quiet_samples: usize,
@@ -1329,15 +1355,13 @@ fn wait_for_quiet(
     runtime_generation: u64,
     expected_capture_generation: Option<u64>,
 ) -> Result<(f64, f64), String> {
-    let deadline = epoch_ms()?
-        .saturating_add((quiet_timeout_s as u64) * 1000)
-        .min(request.deadline_unix_ms);
+    let deadline = operation_deadline.within_ms((quiet_timeout_s as u64).saturating_mul(1000))?;
     let mut quiet = QuietWindow::new(quiet_samples.max(2));
     loop {
         if terminate.load(Ordering::Relaxed) {
             return Err("rating-cancelled".to_string());
         }
-        if epoch_ms()? >= deadline {
+        if deadline.expired()? {
             return Err("quiet-window-timeout".to_string());
         }
         let snapshot = wait_for_rating_snapshot(snapshot_path, deadline, terminate)?;
@@ -1365,21 +1389,22 @@ fn wait_for_quiet(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wait_capture_phase(
     snapshot_path: &Path,
     request: &OperationRequest,
+    operation_deadline: OperationDeadline,
     terminate: &AtomicBool,
     require_test_route: bool,
     expected: &str,
     runtime_generation: u64,
     expected_capture_generation: Option<u64>,
 ) -> Result<u64, String> {
-    while epoch_ms()? < request.deadline_unix_ms {
+    while !operation_deadline.expired()? {
         if terminate.load(Ordering::Relaxed) {
             return Err("rating-cancelled".to_string());
         }
-        let snapshot =
-            wait_for_rating_snapshot(snapshot_path, request.deadline_unix_ms, terminate)?;
+        let snapshot = wait_for_rating_snapshot(snapshot_path, operation_deadline, terminate)?;
         if let Some(snapshot) = authoritative_rating_snapshot(
             &snapshot,
             epoch_ms()?,
@@ -1428,6 +1453,37 @@ fn observe_stable_runtime_publication(
     stable
 }
 
+/// How far a runtime publication's wall-clock stamp may differ from the
+/// reader's clock and still count as current.
+pub(crate) const RUNTIME_PUBLICATION_SKEW_MS: u64 = 5_000;
+
+/// How a runtime publication relates to the reader's wall clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationAge {
+    Fresh,
+    /// Published too long ago: the instance stalled, or the clock was stepped
+    /// forward after the publication.
+    Stale,
+    /// Stamped ahead of the reader: the clock was stepped back after the
+    /// publication.
+    Ahead,
+}
+
+/// The snapshot format carries wall-clock stamps only and does not change, so
+/// the reader's own wall clock is the sole reference. A step of that clock
+/// makes the last publication look stale or ahead for at most one publication
+/// interval; the instance republishes with the new time. Both outcomes mean
+/// "not current now" and callers wait; neither is a failure of the operation.
+pub(crate) fn publication_age(stamp_unix_ms: u64, now_unix_ms: u64) -> PublicationAge {
+    if stamp_unix_ms > now_unix_ms.saturating_add(RUNTIME_PUBLICATION_SKEW_MS) {
+        PublicationAge::Ahead
+    } else if now_unix_ms.saturating_sub(stamp_unix_ms) > RUNTIME_PUBLICATION_SKEW_MS {
+        PublicationAge::Stale
+    } else {
+        PublicationAge::Fresh
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RatingRuntimeReadiness {
     Ready,
@@ -1445,8 +1501,8 @@ fn rating_runtime_readiness(
     // routing or SQM became unsafe.  A stale snapshot must never contribute
     // samples or a completion acknowledgement, but it remains waitable until
     // the operation's existing immutable deadline.
-    if now_ms.saturating_sub(snapshot.updated_unix_ms) > 5_000
-        || now_ms.saturating_sub(snapshot.capture_observed_unix_ms) > 5_000
+    if publication_age(snapshot.updated_unix_ms, now_ms) != PublicationAge::Fresh
+        || publication_age(snapshot.capture_observed_unix_ms, now_ms) != PublicationAge::Fresh
     {
         return RatingRuntimeReadiness::Stale;
     }
@@ -1534,10 +1590,10 @@ fn read_rating_snapshot_if_present(path: &Path) -> Result<Option<RatingRuntimeSn
 
 fn wait_for_rating_snapshot(
     snapshot_path: &Path,
-    deadline_unix_ms: u64,
+    deadline: OperationDeadline,
     terminate: &AtomicBool,
 ) -> Result<RatingRuntimeSnapshot, String> {
-    while epoch_ms()? < deadline_unix_ms {
+    while !deadline.expired()? {
         if terminate.load(Ordering::Relaxed) {
             return Err("rating-cancelled".to_string());
         }
@@ -1635,6 +1691,10 @@ pub fn remove_matching_capture(path: &Path, job_id: &str) -> Result<(), String> 
 }
 
 pub(crate) fn epoch_ms() -> Result<u64, String> {
+    #[cfg(test)]
+    if let Some(value) = super::identity::test_clock::wall_ms() {
+        return Ok(value);
+    }
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "system clock predates the Unix epoch".to_string())?;
@@ -2034,12 +2094,173 @@ mod tests {
         // The deadline is only a watchdog for a broken waiter.  Keep it well
         // above host scheduling jitter so a loaded serial source gate cannot
         // turn a valid 20 ms republication into time-based test authority.
-        let result = wait_for_rating_snapshot(&path, epoch_ms().unwrap() + 10_000, &terminate)
+        let deadline = OperationDeadline::at_boot_ms(
+            super::super::identity::monotonic_boot_ms().unwrap() + 10_000,
+        );
+        let result = wait_for_rating_snapshot(&path, deadline, &terminate)
             .expect("temporary snapshot absence must remain waitable");
         assert_eq!(result, snapshot());
         publisher.join().unwrap();
 
         fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn publication_age_separates_stale_from_ahead_stamps() {
+        let now = 1_000_000;
+        assert_eq!(publication_age(now, now), PublicationAge::Fresh);
+        assert_eq!(publication_age(now - 5_000, now), PublicationAge::Fresh);
+        assert_eq!(publication_age(now - 5_001, now), PublicationAge::Stale);
+        assert_eq!(publication_age(now + 5_000, now), PublicationAge::Fresh);
+        assert_eq!(publication_age(now + 5_001, now), PublicationAge::Ahead);
+        assert_eq!(publication_age(0, now), PublicationAge::Stale);
+        assert_eq!(publication_age(u64::MAX, now), PublicationAge::Ahead);
+        assert_eq!(publication_age(0, 0), PublicationAge::Fresh);
+    }
+
+    #[test]
+    fn a_snapshot_stamped_ahead_of_the_reader_is_not_current_until_republished() {
+        let value = snapshot();
+        let now = value.updated_unix_ms;
+        let generation = Some(value.runtime_generation);
+        // The wall clock was stepped back by an hour after this publication.
+        let mut ahead = value.clone();
+        ahead.updated_unix_ms = now + 3_600_000;
+        ahead.capture_observed_unix_ms = ahead.updated_unix_ms;
+        assert_eq!(
+            rating_runtime_readiness(&ahead, now, true, generation),
+            RatingRuntimeReadiness::Stale
+        );
+        assert_eq!(
+            authoritative_rating_snapshot(&ahead, now, true, generation).unwrap(),
+            None
+        );
+        // The next publication carries the new time and is current again.
+        assert_eq!(
+            rating_runtime_readiness(&value, now, true, generation),
+            RatingRuntimeReadiness::Ready
+        );
+        // A step forward makes the last publication stale for one cycle only.
+        assert_eq!(
+            rating_runtime_readiness(&value, now + 3_600_000, true, generation),
+            RatingRuntimeReadiness::Stale
+        );
+    }
+
+    #[test]
+    fn the_permit_wait_follows_the_boot_clock_not_the_wall_clock() {
+        use super::super::identity::test_clock::ScriptedClocks;
+        let clocks = ScriptedClocks::install(60_000, 1_790_000_000_000);
+        let directory = test_dir("permit-clock-step");
+        let job_id = "0123456789abcdef0123456789abcdef";
+        let worker = "fedcba9876543210fedcba9876543210";
+        let permit_path = directory.join(format!("permit-{worker}"));
+        let terminate = AtomicBool::new(false);
+
+        // An hour forward would have expired a wall-clock deadline at once.
+        clocks.step_wall_forward(3_600_000);
+        let deadline = OperationDeadline::at_boot_ms(clocks.boot() + 60_000);
+        let publish = permit_path.clone();
+        let content = encode_permit(job_id, worker).unwrap();
+        let publisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            atomic_private_write(&publish, content.as_bytes()).unwrap();
+        });
+        assert_eq!(
+            wait_for_permit(&permit_path, job_id, worker, deadline, &terminate),
+            Ok(true)
+        );
+        publisher.join().unwrap();
+        fs::remove_file(&permit_path).unwrap();
+
+        // The boot clock reaches the deadline while the wall clock is two days
+        // behind, which would have granted two more days.
+        clocks.step_wall_back(172_800_000);
+        clocks.advance(60_000);
+        assert_eq!(
+            wait_for_permit(&permit_path, job_id, worker, deadline, &terminate),
+            Err("operation-deadline-expired-before-worker-permit".to_string())
+        );
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn the_runtime_wait_follows_the_boot_clock_not_the_wall_clock() {
+        use super::super::identity::test_clock::ScriptedClocks;
+        let clocks = ScriptedClocks::install(60_000, 1_790_000_000_000);
+        let directory = test_dir("snapshot-clock-step");
+        let path = directory.join("rating-runtime");
+        let terminate = AtomicBool::new(false);
+        let deadline = OperationDeadline::at_boot_ms(clocks.boot() + 30_000);
+
+        clocks.step_wall_forward(3_600_000);
+        let publish = path.clone();
+        let publisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            snapshot().write_atomic(&publish).unwrap();
+        });
+        assert_eq!(
+            wait_for_rating_snapshot(&path, deadline, &terminate).unwrap(),
+            snapshot()
+        );
+        publisher.join().unwrap();
+        fs::remove_file(&path).unwrap();
+
+        clocks.step_wall_back(7_200_000);
+        clocks.advance(30_000);
+        assert_eq!(
+            wait_for_rating_snapshot(&path, deadline, &terminate).unwrap_err(),
+            "operation-deadline-expired-waiting-for-rating-runtime"
+        );
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn the_capture_request_deadline_is_derived_again_at_every_publication() {
+        use super::super::identity::test_clock::ScriptedClocks;
+        let clocks = ScriptedClocks::install(50_000, 100_000);
+        let directory = test_dir("capture-clock-step");
+        let path = directory.join("rating-capture");
+        let job_id = "0123456789abcdef0123456789abcdef";
+        let mut capture = CaptureGuard::new(path.clone(), job_id.to_string());
+        capture
+            .arm(
+                "client",
+                "AUTO",
+                OperationDeadline::at_boot_ms(clocks.boot() + 60_000),
+                0.0,
+                0.0,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{job_id}|client|160|AUTO|0.000|0.000\n")
+        );
+        // Ten seconds pass and the wall clock is stepped an hour forward: 50 s
+        // remain, so the published wall-clock second moves with the step.
+        clocks.advance(10_000);
+        clocks.step_wall_forward(3_600_000);
+        capture.set_phase("DL").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{job_id}|client|3760|DL|0.000|0.000\n")
+        );
+        // A step back follows the same rule.
+        clocks.step_wall_back(3_000_000);
+        capture.set_phase("UL").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{job_id}|client|760|UL|0.000|0.000\n")
+        );
+        // An expired deadline publishes the present second, never a later one.
+        clocks.advance(50_000);
+        capture.set_phase("IDLE").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{job_id}|client|760|IDLE|0.000|0.000\n")
+        );
+        capture.cleanup().unwrap();
         fs::remove_dir(directory).unwrap();
     }
 
@@ -2062,9 +2283,18 @@ mod tests {
         let directory = test_dir("automatic-phases");
         let path = directory.join("rating-capture");
         let job_id = "0123456789abcdef0123456789abcdef";
+        let clocks = super::super::identity::test_clock::ScriptedClocks::install(50_000, 100_000);
         let mut capture = CaptureGuard::new(path.clone(), job_id.to_string());
+        // 23.999 s remain on the boot clock; the wall-clock second published
+        // for the controller is derived from them.
         capture
-            .arm("automatic", "IDLE", 123_999, 12.25, 3.5)
+            .arm(
+                "automatic",
+                "IDLE",
+                OperationDeadline::at_boot_ms(clocks.boot() + 23_999),
+                12.25,
+                3.5,
+            )
             .unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
