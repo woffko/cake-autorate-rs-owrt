@@ -716,6 +716,7 @@ fn normalize_ports(value: &str) -> Result<String, String> {
         .join(","))
 }
 
+#[cfg(test)]
 fn validate_ports(value: &str) -> Result<(), String> {
     normalize_ports(value).map(|_| ())
 }
@@ -781,6 +782,7 @@ fn normalize_network(value: &str) -> Result<(AddressFamily, String), String> {
     }
 }
 
+#[cfg(test)]
 fn network_family(value: &str) -> Result<AddressFamily, String> {
     normalize_network(value).map(|(family, _)| family)
 }
