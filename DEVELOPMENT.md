@@ -74,6 +74,50 @@ For Lite select `CONFIG_PACKAGE_cake-autorate-rs-lite=m` and
 `CONFIG_PACKAGE_luci-app-cake-autorate-rs-lite=m` instead of the two Full
 package symbols.
 
+## Overflow checks
+
+The daemon is built with integer overflow checks: an addition, subtraction or
+multiplication that overflows panics instead of wrapping silently. The OpenWrt
+SDK already turns this on for every Rust package
+(`CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true` in
+`feeds/packages/lang/rust/rust-values.mk`, identical in all twelve matrix SDKs),
+so the packages have always carried the checks; `[profile.release]` in
+`Cargo.toml` states it too, for builds outside the SDK. The environment variable
+of the SDK takes precedence over the manifest.
+
+A panic ends the thread that hit it. On the main thread of the controller it
+exits the process and procd respawns it (`respawn 3600 5 5`: up to five restarts
+in an hour); CAKE keeps the last rate it was given in the meantime, and the
+panic message reaches the system log because procd captures stderr. A Speed
+Test, Rating or Auto-Tune worker is a separate process: its job ends or goes to
+recovery and the coordinator carries on. Silent wrapping could instead feed a
+wrong number into a shaper rate or a deadline, which is why the checks stay on.
+
+The cost was measured against a build of the same source with the SDK default
+switched off in a private SDK copy:
+
+- Size, twelve architectures: the Full binary grows by 0.6% to 1.1%, the Lite
+  binary by 0% to 2.3% (the larger figures are one 64 KiB segment step; the
+  packages, which are compressed, grow by 0.3% to 0.7%).
+- CPU on the test VM (x86_64, 3 minutes idle and 4 minutes of repeated capped
+  Speed Tests, each build measured twice): the controller used 0.39% (checks on)
+  and 0.36% (off) of one core idle, 1.22% and 1.23% under load; the difference
+  is inside the spread between repeated runs of the same build.
+- Arithmetic-heavy code (the Auto-Tune search and the controller's text parsers,
+  release profile, one pinned core): about 1.4% slower with the checks.
+
+A release build must contain `-C overflow-checks=on` in the `rustc` command line
+of the daemon in its SDK build log (`V=s`); check it for every architecture
+rather than assuming the SDK default.
+
+Every subtraction and multiplication that clippy's `arithmetic_side_effects`
+lint flags was read against its guard: counter deltas use `checked_sub` or an
+explicit reset check, offsets in the netlink and DNS parsers are compared with
+the remaining length first, and search brackets are strict by construction.
+None depends on an unvalidated input. The Auto-Tune search, the routed DNS
+answer parser and the controller's text parsers were also run with the checks
+on against about 3.4 million random and mutated inputs without a panic.
+
 ## Tests against a real nftables
 
 Two ignored unit tests apply the traffic-classifier rules to a real nftables in

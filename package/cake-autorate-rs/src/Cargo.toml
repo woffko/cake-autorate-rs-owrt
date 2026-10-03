@@ -33,3 +33,6 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+# Integer overflow panics instead of wrapping. The OpenWrt SDK sets the same for
+# every Rust package; keeping it here makes builds outside the SDK match.
+overflow-checks = true
