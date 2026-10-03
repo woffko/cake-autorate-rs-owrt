@@ -24,6 +24,10 @@ socket2 = { version = "0.6.4", features = ["all"], optional = true }
 tungstenite = { version = "0.29.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
 webpki-roots = { version = "0.26.11", optional = true }
 
+[dev-dependencies]
+# Test-only: certificates for the in-process TLS broker of the MQTT publisher tests.
+rcgen = "0.13"
+
 [[bin]]
 name = "cake-autorated"
 path = "src/main.rs"

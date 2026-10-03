@@ -15,12 +15,15 @@ const COMMAND_OUTPUT_LIMIT: usize = 128 * 1024;
 
 struct Environment {
     uci: PathBuf,
+    /// Opens the TLS session of a TLS broker, without any MQTT packet.
+    tls_probe: fn(&MqttPublisherConfig) -> Result<String, String>,
 }
 
 impl Environment {
     fn live() -> Self {
         Self {
             uci: env_path("CAKE_AUTORATE_UCI_BIN", "/sbin/uci"),
+            tls_probe: MqttPublisherConfig::check_tls_handshake,
         }
     }
 }
@@ -96,6 +99,9 @@ fn mqtt_status(section: &str, mode: &str, environment: &Environment) -> Result<S
         "mqtt_enabled",
         "mqtt_host",
         "mqtt_port",
+        "mqtt_tls",
+        "mqtt_tls_ca_file",
+        "mqtt_tls_verify",
         "mqtt_username",
         "mqtt_password",
         "mqtt_discovery_prefix",
@@ -134,8 +140,30 @@ fn mqtt_status(section: &str, mode: &str, environment: &Environment) -> Result<S
         uci_section.options.get("mqtt_publish_cpu_stats").cloned(),
         false,
     );
+    let tls = bool_value(uci_section.options.get("mqtt_tls").cloned(), false);
+    let tls_verify = bool_value(uci_section.options.get("mqtt_tls_verify").cloned(), true);
+    let tls_ca_file = uci_section
+        .options
+        .get("mqtt_tls_ca_file")
+        .is_some_and(|value| !value.is_empty());
+    // A plain broker is never contacted by this command. With TLS the handshake
+    // is tried, because that is where a certificate problem shows.
+    let mut handshake = "not_checked";
     let (available, reason) = match MqttPublisherConfig::from_section(section, &uci_section) {
-        Ok(Some(_)) => (true, "available".to_string()),
+        Ok(Some(config)) => match config.tls_problem() {
+            Some(problem) => (false, problem),
+            None if config.tls => match (environment.tls_probe)(&config) {
+                Ok(_) => {
+                    handshake = "ok";
+                    (true, "available".to_string())
+                }
+                Err(error) => {
+                    handshake = "failed";
+                    (false, error)
+                }
+            },
+            None => (true, "available".to_string()),
+        },
         Ok(None) => (false, "MQTT publisher is disabled".to_string()),
         Err(error) => (false, error),
     };
@@ -144,7 +172,9 @@ fn mqtt_status(section: &str, mode: &str, environment: &Environment) -> Result<S
             "{{\"section\":\"{}\",\"mode\":\"{}\",\"package\":\"{}\",",
             "\"installed\":{},\"enabled\":{},\"configured_host\":{},",
             "\"available\":{},\"summary_enabled\":{},\"cpu_enabled\":{},",
-            "\"publish_cpu\":{},\"log_to_file\":{},\"reason\":\"{}\",",
+            "\"publish_cpu\":{},\"log_to_file\":{},\"tls\":{},",
+            "\"tls_verify\":{},\"tls_ca_file\":{},\"tls_handshake\":\"{}\",",
+            "\"reason\":\"{}\",",
             "\"install_hint\":\"\"}}\n"
         ),
         json_escape(section),
@@ -158,6 +188,10 @@ fn mqtt_status(section: &str, mode: &str, environment: &Environment) -> Result<S
         bool_json(cpu),
         bool_json(publish_cpu),
         bool_json(log_to_file),
+        bool_json(tls),
+        bool_json(tls_verify),
+        bool_json(tls_ca_file),
+        handshake,
         json_escape(&reason),
     ))
 }
@@ -196,6 +230,18 @@ mod tests {
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
+    fn no_probe(_: &MqttPublisherConfig) -> Result<String, String> {
+        panic!("this status check must not contact the broker")
+    }
+
+    fn accepted_handshake(_: &MqttPublisherConfig) -> Result<String, String> {
+        Ok("MQTT TLS session established (TLSv1_3, server certificate verified)".to_string())
+    }
+
+    fn refused_handshake(_: &MqttPublisherConfig) -> Result<String, String> {
+        Err("MQTT TLS handshake failed: invalid peer certificate: UnknownIssuer".to_string())
+    }
+
     struct Fixture {
         root: PathBuf,
         environment: Environment,
@@ -210,6 +256,7 @@ mod tests {
             Self {
                 environment: Environment {
                     uci: root.join("uci"),
+                    tls_probe: no_probe,
                 },
                 root,
             }
@@ -245,10 +292,90 @@ mod tests {
                 "\"package\":\"built-in\",\"installed\":true,",
                 "\"enabled\":true,\"configured_host\":true,\"available\":true,",
                 "\"summary_enabled\":true,\"cpu_enabled\":true,\"publish_cpu\":true,",
-                "\"log_to_file\":true,\"reason\":\"available\",",
+                "\"log_to_file\":true,\"tls\":false,\"tls_verify\":true,",
+                "\"tls_ca_file\":false,\"tls_handshake\":\"not_checked\",",
+                "\"reason\":\"available\",",
                 "\"install_hint\":\"\"}\n"
             )
         );
+    }
+
+    /// A fake `uci` that answers the healthy options plus the given extra ones.
+    fn uci_with(fixture: &Fixture, extra: &[(&str, &str)]) {
+        let mut script = String::from(
+            "#!/bin/sh\ncase \"$*\" in\n*mqtt_enabled) printf '1\\n' ;;\n*cake-autorate.wan.enabled) printf '1\\n' ;;\n*mqtt_host) printf 'broker.invalid\\n' ;;\n*log_to_file) printf '1\\n' ;;\n*output_summary_stats) printf '1\\n' ;;\n",
+        );
+        for (name, value) in extra {
+            script.push_str(&format!("*.{name}) printf '%s\\n' '{value}' ;;\n"));
+        }
+        script.push_str("*) exit 1 ;;\nesac\n");
+        fixture.executable(&fixture.environment.uci, &script);
+    }
+
+    #[test]
+    fn status_reports_the_tls_mode_and_the_handshake_without_secrets() {
+        let mut fixture = Fixture::new();
+        fixture.environment.tls_probe = accepted_handshake;
+        uci_with(&fixture, &[("mqtt_tls", "1")]);
+        let output = mqtt_status("wan", "status", &fixture.environment).unwrap();
+        assert!(output.contains("\"tls\":true,\"tls_verify\":true,\"tls_ca_file\":false"));
+        assert!(output.contains("\"tls_handshake\":\"ok\""));
+        assert!(output.contains("\"available\":true"));
+        assert!(output.contains("\"reason\":\"available\""));
+
+        uci_with(
+            &fixture,
+            &[
+                ("mqtt_tls", "1"),
+                ("mqtt_tls_verify", "0"),
+                ("mqtt_password", "do-not-print"),
+            ],
+        );
+        let output = mqtt_status("wan", "status", &fixture.environment).unwrap();
+        assert!(output.contains("\"tls\":true,\"tls_verify\":false,\"tls_ca_file\":false"));
+        assert!(!output.contains("do-not-print"));
+
+        // A refused handshake is why the publisher is not ready.
+        fixture.environment.tls_probe = refused_handshake;
+        uci_with(&fixture, &[("mqtt_tls", "1")]);
+        let output = mqtt_status("wan", "status", &fixture.environment).unwrap();
+        assert!(output.contains("\"available\":false"));
+        assert!(output.contains("\"tls_handshake\":\"failed\""));
+        assert!(output.contains("invalid peer certificate: UnknownIssuer"));
+
+        // Plain MQTT and TLS options that are not in use never touch the
+        // network: the status of an upgraded publisher is what it was.
+        fixture.environment.tls_probe = no_probe;
+        uci_with(&fixture, &[("mqtt_tls_ca_file", "/nonexistent/ca.pem")]);
+        let output = mqtt_status("wan", "status", &fixture.environment).unwrap();
+        assert!(output.contains("\"tls\":false,\"tls_verify\":true,\"tls_ca_file\":true"));
+        assert!(output.contains("\"tls_handshake\":\"not_checked\""));
+        assert!(output.contains("\"available\":true"));
+    }
+
+    #[test]
+    fn status_says_why_the_ca_file_cannot_be_used_before_it_tries_the_broker() {
+        // `no_probe` panics: an unusable CA file ends the check at once.
+        let fixture = Fixture::new();
+        let ca = fixture.root.join("ca.pem");
+        let ca_path = ca.to_str().unwrap().to_string();
+        uci_with(
+            &fixture,
+            &[("mqtt_tls", "1"), ("mqtt_tls_ca_file", &ca_path)],
+        );
+        // Saved in the configuration but not installed yet.
+        let output = mqtt_status("wan", "status", &fixture.environment).unwrap();
+        assert!(output.contains("\"available\":false"));
+        assert!(output.contains("unable to open the MQTT CA file"));
+        assert!(output.contains("\"tls_ca_file\":true"));
+        assert!(output.contains("\"tls_handshake\":\"not_checked\""));
+
+        fs::write(&ca, "not a certificate\n").unwrap();
+        fs::set_permissions(&ca, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = mqtt_status("wan", "status", &fixture.environment).unwrap();
+        assert!(output.contains("\"available\":false"));
+        // The test user is not root, so the owner rule is what fires first.
+        assert!(output.contains("must be owned by root") || output.contains("no certificate"));
     }
 
     #[test]

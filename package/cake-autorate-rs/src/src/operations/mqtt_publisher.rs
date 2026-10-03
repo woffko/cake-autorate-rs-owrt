@@ -34,7 +34,14 @@ const MQTT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESOLVED_ADDRESSES: usize = 8;
 const MAX_LOG_READ_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_LINE_BYTES: usize = 64 * 1024;
+const MQTT_PORT: u16 = 1883;
+const MQTT_TLS_PORT: u16 = 8883;
+const MAX_CA_PATH_BYTES: usize = 1024;
 const PLAN_MAGIC: &[u8] = b"cake-autorate-mqtt-plan\0\x01";
+/// Version 2 adds the TLS settings and is used only for a TLS broker. A plain
+/// broker keeps the version-1 bytes, so an upgrade changes neither its plan nor
+/// the digest the publisher's restart decision is based on.
+const PLAN_MAGIC_TLS: &[u8] = b"cake-autorate-mqtt-plan\0\x02";
 pub(crate) const PRODUCTION_PLAN_ROOT: &str = "/var/run/cake-autorate-mqtt";
 static PLAN_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
@@ -43,6 +50,14 @@ pub(crate) struct MqttPublisherConfig {
     pub(crate) instance: String,
     pub(crate) host: String,
     pub(crate) port: u16,
+    /// TLS to the broker. Off unless `mqtt_tls=1`, so a configuration saved
+    /// before the option existed keeps speaking plain MQTT after an upgrade.
+    pub(crate) tls: bool,
+    /// Check the broker certificate and name. Always true without TLS.
+    pub(crate) tls_verify: bool,
+    /// PEM file that replaces the built-in roots; empty means the built-in
+    /// roots. Always empty without TLS or without verification.
+    pub(crate) tls_ca_file: String,
     pub(crate) username: String,
     pub(crate) password: String,
     pub(crate) discovery_prefix: String,
@@ -90,13 +105,23 @@ impl MqttPublisherConfig {
         }
 
         let host = required_text(section, "mqtt_host", 255)?;
+        let tls = bool_option(section, "mqtt_tls", false)?;
+        let default_port = if tls { MQTT_TLS_PORT } else { MQTT_PORT }.to_string();
         let port = option(section, "mqtt_port")
-            .unwrap_or("1883")
+            .unwrap_or(&default_port)
             .parse::<u16>()
             .map_err(|_| format!("MQTT instance {instance} has an invalid mqtt_port"))?;
         if port == 0 {
             return Err(format!("MQTT instance {instance} has an invalid mqtt_port"));
         }
+        // Settings that do not apply are dropped, so the plan and the
+        // publisher's restart decision depend only on what is in use.
+        let tls_verify = bool_option(section, "mqtt_tls_verify", true)? || !tls;
+        let tls_ca_file = if tls && tls_verify {
+            optional_text(section, "mqtt_tls_ca_file", MAX_CA_PATH_BYTES)?
+        } else {
+            String::new()
+        };
         let interval = option(section, "mqtt_min_interval_s")
             .unwrap_or("1")
             .parse::<u64>()
@@ -125,6 +150,9 @@ impl MqttPublisherConfig {
             instance: instance.to_string(),
             host,
             port,
+            tls,
+            tls_verify,
+            tls_ca_file,
             username,
             password,
             discovery_prefix,
@@ -137,6 +165,16 @@ impl MqttPublisherConfig {
         };
         config.validate_plan()?;
         Ok(Some(config))
+    }
+
+    /// Why the TLS trust settings cannot be used right now, if they cannot.
+    /// The plan only checks the CA path; the file may be installed after the
+    /// configuration is saved, so its state is judged when it is used and here.
+    pub(crate) fn tls_problem(&self) -> Option<String> {
+        if self.tls && self.tls_verify && !self.tls_ca_file.is_empty() {
+            return tls::check_ca_file(&self.tls_ca_file).err();
+        }
+        None
     }
 
     pub(crate) fn state_topic(&self) -> String {
@@ -159,6 +197,19 @@ impl MqttPublisherConfig {
         validate_text(&self.host, 255)?;
         if self.host.is_empty() || self.port == 0 {
             return Err("MQTT plan contains an invalid broker".to_string());
+        }
+        validate_text(&self.tls_ca_file, MAX_CA_PATH_BYTES)?;
+        if self.tls {
+            if !self.tls_verify && !self.tls_ca_file.is_empty() {
+                return Err("MQTT plan contains a CA file without verification".to_string());
+            }
+            if !self.tls_ca_file.is_empty()
+                && (!self.tls_ca_file.starts_with('/') || self.tls_ca_file.ends_with('/'))
+            {
+                return Err("MQTT plan contains an invalid CA file path".to_string());
+            }
+        } else if !self.tls_verify || !self.tls_ca_file.is_empty() {
+            return Err("MQTT plan contains TLS settings without TLS".to_string());
         }
         validate_text(&self.username, MAX_TEXT_BYTES)?;
         validate_text(&self.password, MAX_TEXT_BYTES)?;
@@ -197,7 +248,7 @@ impl MqttPublisherConfig {
     fn encode_plan(&self) -> Result<Vec<u8>, String> {
         self.validate_plan()?;
         let mut bytes = Vec::with_capacity(1024);
-        bytes.extend_from_slice(PLAN_MAGIC);
+        bytes.extend_from_slice(if self.tls { PLAN_MAGIC_TLS } else { PLAN_MAGIC });
         for value in [
             self.instance.as_str(),
             self.host.as_str(),
@@ -214,6 +265,10 @@ impl MqttPublisherConfig {
         bytes.extend_from_slice(&self.port.to_be_bytes());
         bytes.extend_from_slice(&self.min_interval.as_secs().to_be_bytes());
         bytes.push(u8::from(self.publish_cpu));
+        if self.tls {
+            bytes.push(u8::from(self.tls_verify));
+            push_plan_text(&mut bytes, &self.tls_ca_file)?;
+        }
         if bytes.len() > MAX_PLAN_BYTES {
             return Err("MQTT plan exceeds its byte bound".to_string());
         }
@@ -221,9 +276,15 @@ impl MqttPublisherConfig {
     }
 
     fn decode_plan(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > MAX_PLAN_BYTES || !bytes.starts_with(PLAN_MAGIC) {
+        let tls = if bytes.len() > MAX_PLAN_BYTES {
             return Err("MQTT plan header is invalid".to_string());
-        }
+        } else if bytes.starts_with(PLAN_MAGIC) {
+            false
+        } else if bytes.starts_with(PLAN_MAGIC_TLS) {
+            true
+        } else {
+            return Err("MQTT plan header is invalid".to_string());
+        };
         let mut reader = PlanReader::new(&bytes[PLAN_MAGIC.len()..]);
         let instance = reader.text()?;
         let host = reader.text()?;
@@ -241,6 +302,16 @@ impl MqttPublisherConfig {
             1 => true,
             _ => return Err("MQTT plan contains an invalid boolean".to_string()),
         };
+        let (tls_verify, tls_ca_file) = if tls {
+            let verify = match reader.byte()? {
+                0 => false,
+                1 => true,
+                _ => return Err("MQTT plan contains an invalid boolean".to_string()),
+            };
+            (verify, reader.text()?)
+        } else {
+            (true, String::new())
+        };
         if !reader.finished() {
             return Err("MQTT plan contains trailing data".to_string());
         }
@@ -248,6 +319,9 @@ impl MqttPublisherConfig {
             instance,
             host,
             port,
+            tls,
+            tls_verify,
+            tls_ca_file,
             username,
             password,
             discovery_prefix,
@@ -285,6 +359,9 @@ where
     let cpu_cores = cpu_core_count()?;
     start_notify::notify(&config);
     let mut client = MqttClient::connect(&config)?;
+    if let Some(summary) = client.tls_summary(config.tls_verify) {
+        eprintln!("{summary}");
+    }
     for message in discovery_messages(&config, cpu_cores)? {
         client.publish(&message.topic, message.payload.as_bytes(), message.retain)?;
     }
@@ -293,6 +370,10 @@ where
     let started = Instant::now();
     let mut aggregate = MqttAggregator::new(config.min_interval, config.publish_cpu);
     loop {
+        // With TLS one record can carry several MQTT packets. What rustls has
+        // already decrypted is invisible to poll on the socket, so look at it
+        // first and do not sleep while it is non-empty.
+        let buffered = client.has_buffered_input();
         let mut descriptors = [
             libc::pollfd {
                 fd: signals.as_raw_fd(),
@@ -319,7 +400,11 @@ where
             libc::poll(
                 descriptors.as_mut_ptr(),
                 descriptors.len() as libc::nfds_t,
-                if follower.needs_drain { 0 } else { -1 },
+                if follower.needs_drain || buffered {
+                    0
+                } else {
+                    -1
+                },
             )
         };
         if result < 0 {
@@ -338,8 +423,8 @@ where
         if descriptors[3].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err("MQTT broker connection closed".to_string());
         }
-        if descriptors[3].revents & libc::POLLIN != 0 {
-            client.read_unsolicited()?;
+        if buffered || descriptors[3].revents & libc::POLLIN != 0 {
+            client.read_ready_packets()?;
         }
         if descriptors[2].revents & libc::POLLIN != 0 {
             keepalive.drain()?;
@@ -471,6 +556,11 @@ pub(crate) fn require_no_selected_recovery(root: &Path) -> Result<(), String> {
 pub(crate) mod selected_plan;
 #[path = "mqtt_start_notify.rs"]
 pub(crate) mod start_notify;
+#[path = "mqtt_tls.rs"]
+mod tls;
+#[cfg(test)]
+#[path = "mqtt_tls_tests.rs"]
+mod tls_tests;
 
 fn push_plan_text(bytes: &mut Vec<u8>, value: &str) -> Result<(), String> {
     let length = u32::try_from(value.len()).map_err(|_| "MQTT plan field is too large")?;
@@ -1292,8 +1382,39 @@ pub(crate) fn publish_packet(
     Ok(packet)
 }
 
+/// The byte stream to the broker: plain TCP, or TCP wrapped in TLS.
+enum Transport {
+    Plain(TcpStream),
+    Tls(Box<tls::TlsStream>),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buffer),
+            Self::Tls(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buffer),
+            Self::Tls(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
 struct MqttClient {
-    stream: TcpStream,
+    stream: Transport,
     next_packet_id: u16,
 }
 
@@ -1306,54 +1427,88 @@ fn mqtt_client_id(instance: &str, pid: u32) -> String {
     format!("cake_{short}_{pid}")
 }
 
+/// Resolve the broker and open a TCP connection to the first address that
+/// answers, with the I/O timeouts of the publisher set.
+fn open_socket(config: &MqttPublisherConfig) -> Result<TcpStream, String> {
+    let addresses = (config.host.as_str(), config.port)
+        .to_socket_addrs()
+        .map_err(|error| format!("unable to resolve MQTT broker: {error}"))?
+        .take(MAX_RESOLVED_ADDRESSES)
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("MQTT broker resolved to no addresses".to_string());
+    }
+    let mut last_error = None;
+    let connect_started = Instant::now();
+    for address in addresses {
+        let remaining = MQTT_CONNECT_TIMEOUT.saturating_sub(connect_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(MQTT_IO_TIMEOUT))
+                    .map_err(|error| format!("unable to bound MQTT reads: {error}"))?;
+                stream
+                    .set_write_timeout(Some(MQTT_IO_TIMEOUT))
+                    .map_err(|error| format!("unable to bound MQTT writes: {error}"))?;
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "unable to connect to MQTT broker: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no address was attempted".to_string())
+    ))
+}
+
+impl MqttPublisherConfig {
+    /// Connect to the broker and complete the TLS handshake without sending
+    /// any MQTT packet, so that no credential leaves the router. This is what
+    /// `--mqtt-status` uses to say whether the certificate is accepted.
+    pub(crate) fn check_tls_handshake(&self) -> Result<String, String> {
+        let tls_config = tls::client_config(self.tls_verify, &self.tls_ca_file)?;
+        let socket = open_socket(self)?;
+        let mut stream = tls::connect(&tls_config, &self.host, socket)?;
+        let summary = tls::summary(&stream, self.tls_verify);
+        tls::close(&mut stream);
+        Ok(summary)
+    }
+}
+
 impl MqttClient {
     fn connect(config: &MqttPublisherConfig) -> Result<Self, String> {
-        let addresses = (config.host.as_str(), config.port)
-            .to_socket_addrs()
-            .map_err(|error| format!("unable to resolve MQTT broker: {error}"))?
-            .take(MAX_RESOLVED_ADDRESSES)
-            .collect::<Vec<_>>();
-        if addresses.is_empty() {
-            return Err("MQTT broker resolved to no addresses".to_string());
-        }
-        let mut last_error = None;
-        let connect_started = Instant::now();
-        for address in addresses {
-            let remaining = MQTT_CONNECT_TIMEOUT.saturating_sub(connect_started.elapsed());
-            if remaining.is_zero() {
-                break;
+        // A missing or unsafe CA file is a configuration error: report it
+        // before any name lookup or connection attempt.
+        let tls = if config.tls {
+            Some(tls::client_config(config.tls_verify, &config.tls_ca_file)?)
+        } else {
+            None
+        };
+        let socket = open_socket(config)?;
+        let mut stream = match &tls {
+            Some(tls_config) => {
+                Transport::Tls(Box::new(tls::connect(tls_config, &config.host, socket)?))
             }
-            match TcpStream::connect_timeout(&address, remaining) {
-                Ok(mut stream) => {
-                    stream
-                        .set_read_timeout(Some(MQTT_IO_TIMEOUT))
-                        .map_err(|error| format!("unable to bound MQTT reads: {error}"))?;
-                    stream
-                        .set_write_timeout(Some(MQTT_IO_TIMEOUT))
-                        .map_err(|error| format!("unable to bound MQTT writes: {error}"))?;
-                    let _ = stream.set_nodelay(true);
-                    let client_id = mqtt_client_id(&config.instance, std::process::id());
-                    stream
-                        .write_all(&connect_packet(config, &client_id)?)
-                        .map_err(|error| format!("unable to send MQTT CONNECT: {error}"))?;
-                    let (header, body) = read_packet(&mut stream)?;
-                    if header != 0x20 || body.len() != 2 || body[0] != 0 || body[1] != 0 {
-                        return Err("MQTT broker rejected the CONNECT request".to_string());
-                    }
-                    return Ok(Self {
-                        stream,
-                        next_packet_id: 1,
-                    });
-                }
-                Err(error) => last_error = Some(error),
-            }
+            None => Transport::Plain(socket),
+        };
+        let client_id = mqtt_client_id(&config.instance, std::process::id());
+        stream
+            .write_all(&connect_packet(config, &client_id)?)
+            .map_err(|error| format!("unable to send MQTT CONNECT: {error}"))?;
+        let (header, body) = read_packet(&mut stream)?;
+        if header != 0x20 || body.len() != 2 || body[0] != 0 || body[1] != 0 {
+            return Err("MQTT broker rejected the CONNECT request".to_string());
         }
-        Err(format!(
-            "unable to connect to MQTT broker: {}",
-            last_error
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "no address was attempted".to_string())
-        ))
+        Ok(Self {
+            stream,
+            next_packet_id: 1,
+        })
     }
 
     fn publish(&mut self, topic: &str, payload: &[u8], retain: bool) -> Result<(), String> {
@@ -1394,20 +1549,54 @@ impl MqttClient {
         }
     }
 
+    /// True when the broker's data is already decrypted and waiting in the TLS
+    /// layer. The socket is not readable then, so `poll` alone would leave it
+    /// unread until some unrelated event. Always false for plain MQTT.
+    fn has_buffered_input(&mut self) -> bool {
+        match &mut self.stream {
+            Transport::Plain(_) => false,
+            Transport::Tls(stream) => tls::has_buffered_input(stream),
+        }
+    }
+
+    /// Read the packet that made the socket readable and every packet that
+    /// arrived behind it in the same TLS record.
+    fn read_ready_packets(&mut self) -> Result<(), String> {
+        self.read_unsolicited()?;
+        while self.has_buffered_input() {
+            self.read_unsolicited()?;
+        }
+        Ok(())
+    }
+
+    fn tls_summary(&self, verified: bool) -> Option<String> {
+        match &self.stream {
+            Transport::Plain(_) => None,
+            Transport::Tls(stream) => Some(tls::summary(stream, verified)),
+        }
+    }
+
     fn disconnect(&mut self) -> Result<(), String> {
         self.stream
             .write_all(&[0xe0, 0x00])
-            .map_err(|error| format!("unable to send MQTT DISCONNECT: {error}"))
+            .map_err(|error| format!("unable to send MQTT DISCONNECT: {error}"))?;
+        if let Transport::Tls(stream) = &mut self.stream {
+            tls::close(stream);
+        }
+        Ok(())
     }
 }
 
 impl AsRawFd for MqttClient {
     fn as_raw_fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
+        match &self.stream {
+            Transport::Plain(stream) => stream.as_raw_fd(),
+            Transport::Tls(stream) => stream.sock.as_raw_fd(),
+        }
     }
 }
 
-fn read_packet(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), String> {
+fn read_packet<R: Read>(stream: &mut R) -> Result<(u8, Vec<u8>), String> {
     let mut header = [0u8; 1];
     stream
         .read_exact(&mut header)
