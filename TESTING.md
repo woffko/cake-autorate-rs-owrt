@@ -135,3 +135,68 @@ payloads and the public metadata pass a pinned secret scan.
 - Explicit policy routes were tested with a simulated VPN interface, not a
   real WireGuard or OpenVPN tunnel.
 - Lite was verified on the VM; physical routers ran Full.
+
+## Changes after RC27 r320/r128 (unreleased)
+
+These results cover the commits made after the r320/r128 release: the server
+switch window, the cap on measurement-basis restarts, strict traffic-rule
+validation, the finite-value check in the rating code, the plain-MQTT notice and
+the topology repeat fix described below.
+
+### Source gate and packages
+
+- Source gate, 53 commands: Full (1,758) and Lite (391) Rust tests, formatting,
+  LuCI JavaScript tests, TypeScript checks, real-UCI tests and a hash of 230
+  sources before and after the run, which did not change.
+- During development the package matrix covers x86_64 and the ARM test-router
+  architecture (aarch64_cortex-a76): both were built from that exact source in
+  the OpenWrt 25.12 SDK and verified for payload, metadata, dependencies and ELF
+  interpreter/ABI. The full 12-ABI matrix is built for a release.
+
+### Real nftables
+
+- Two ignored unit tests apply the traffic classifier to a real nftables 1.0.9
+  in a throw-away user and network namespace (procedure in
+  [DEVELOPMENT.md](DEVELOPMENT.md)). They showed that nftables merges repeated
+  and overlapping ports itself, that a leading `+` is a syntax error and that a
+  prefix with a leading zero is read as octal: r320 installed `10.0.0.0/024` as
+  `/20`, the current daemon renders and installs `/24`.
+- On the test VM (nftables 1.1.6) the same edge cases pass `nft -c`, and the
+  installed daemon renders a custom ruleset with repeated and overlapping ports
+  and a leading-zero prefix that `nft -c` accepts, with the prefix as `/24` and
+  the ports merged to `80-90,443,1000-2500`.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+- The candidate was installed with `apk`; the installed and the running daemon
+  binaries matched the verified build and the configuration files were
+  unchanged.
+- Server switching, Gaming, Full Raw Auto-Tune with an explicit Unlimited
+  policy, speed-test connections reset by a private nft table:
+  - `upload-search` (every backend connection reset while the upload rate is
+    searched): reached Review after two server switches with two measured CAKE
+    options next to SQM disabled; configuration and CAKE topology restored.
+  - `selected-server` (the selected server unreachable for the whole run):
+    each direction moved to another qualified server and the run reached
+    Review. One run found that every pair option missed the 50% retention floor
+    and offered SQM disabled only; another confirmed a pair that was not the
+    recommended one and offered a single `throughput_first` CAKE option
+    (614/281 Mbit/s) after the topology comparison.
+- The first candidate failed the `selected-server` scenario at the topology
+  comparison. Review is built on the first pair option that keeps the 50%
+  retained-capacity floor, which is not always the point the directional
+  searches recommended (183/93 Mbit/s kept about a quarter of the download
+  capacity; the confirmed pair was 748/282 Mbit/s). The raw repeats were shaped
+  at the confirmed pair but the journal replay demanded the recommended rate, so
+  the run failed after its long measurement; r320 has the same defect. The fix
+  binds each repeat to the confirmed pair. It is covered by a unit test, by an
+  offline replay of the real journal of the failed run and by the live run
+  above.
+
+### Known limits
+
+- A live run cannot force the situation in which the recommended pair misses the
+  retention floor; it depends on the link, so the unit test and the replay of a
+  real journal carry that path.
+- Lite and the physical routers were not run for these changes beyond the source
+  gate.
