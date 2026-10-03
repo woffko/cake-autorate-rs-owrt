@@ -585,7 +585,10 @@ resumed.
 
 The instance publishes its runtime state with a wall-clock stamp. After a clock
 step the last publication looks too old, or ahead of the router's clock, for
-about a second; the run waits for the next publication instead of failing.
+about a second; the run waits for the next publication instead of failing. A
+Rating run is the exception: its quality grade is collected in wall-clock
+windows, so a clock change during a Rating can discard the samples it has
+collected and the run ends incomplete. Repeat it.
 
 Scheduled calibration follows the calendar (time-of-day window, interval, daily
 and monthly traffic budgets), so it uses the wall clock. It does not start while

@@ -149,7 +149,12 @@ Speed Test, Rating or Auto-Tune early nor extend it.
 Controller sample timestamps (reflector response age, quality-grade windows),
 graph history, status timestamps, the configuration-transfer candidate expiry,
 the log-bundle header and the qdisc capability cache keep reading the wall
-clock; none of them bounds an operation.
+clock. None of them bounds an operation. The quality-grade windows do matter to
+Rating: a step of the wall clock during a Rating capture makes the controller
+drop the samples it has collected, so that run cannot complete and ends
+incomplete or contaminated at its deadline instead of early; it can be
+repeated. Speed Test and Full Auto-Tune measure on the boot clock; both were
+run on the test VM with steps of up to five hours in either direction.
 
 Unit tests script both clocks with `identity::test_clock::ScriptedClocks`
 (per thread, restored on drop): `advance` moves both, `step_wall_forward` and
