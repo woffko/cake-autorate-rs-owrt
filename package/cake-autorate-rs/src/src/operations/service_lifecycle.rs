@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1600,7 +1600,7 @@ fn observe_controller_start(
     }
 
     let boot_epoch = proc_boot_epoch(&paths.proc_root)?;
-    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let ticks_per_second = sys::clock_ticks_per_second();
     if ticks_per_second <= 0 {
         return Err("unable to determine controller clock tick rate".to_string());
     }
@@ -3796,14 +3796,9 @@ fn acquire_service_global_lock(paths: &ServicePaths) -> Result<ServiceGlobalLock
             .and_then(|value| value.parse::<i32>().ok())
             .filter(|value| *value == 8)
             .ok_or_else(|| "borrowed service lifecycle lock descriptor is invalid".to_string())?;
-        let raw = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-        if raw < 0 {
-            return Err(format!(
-                "unable to duplicate borrowed service lifecycle lock: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let borrowed = unsafe { File::from_raw_fd(raw) };
+        let borrowed = File::from(sys::duplicate_from(fd, 3).map_err(|error| {
+            format!("unable to duplicate borrowed service lifecycle lock: {error}")
+        })?);
         attest_borrowed_exclusive_lock(&guard_path, &borrowed)?;
         return Ok(ServiceGlobalLock::Borrowed { _guard: borrowed });
     }
@@ -3885,14 +3880,8 @@ fn capture_controller_pidfds(
         if selected.is_some_and(|(kind, name)| identity.kind != kind || identity.instance != name) {
             continue;
         }
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
-        if raw < 0 {
-            return Err(format!(
-                "unable to open controller pidfd: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let pidfd = sys::pidfd_open(identity.pid)
+            .map_err(|error| format!("unable to open controller pidfd: {error}"))?;
         if !controller_identity_matches(proc_root, &identity)? {
             return Err(format!(
                 "{} {} changed while opening pidfd",
@@ -3941,18 +3930,15 @@ fn wait_controller_pidfds(
             })
             .collect::<Vec<_>>();
         let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+        let result = match sys::poll(&mut pollfds, timeout_ms) {
+            Ok(ready) => ready,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("unable to wait for controller exits: {error}")),
+        };
         if result == 0 {
             return Err(
                 "managed processes did not stop before their watchdog deadline".to_string(),
             );
-        }
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(format!("unable to wait for controller exits: {error}"));
         }
         let mut index = 0usize;
         waiting.retain(|_| {
@@ -4452,11 +4438,10 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32, uid: u32, gid: u32) -> R
         .open(path)
         .map_err(|error| format!("unable to create {}: {error}", path.display()))?;
     let result = (|| {
-        if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+        if let Err(error) = std::os::unix::fs::fchown(&file, Some(uid), Some(gid)) {
             return Err(format!(
-                "unable to set ownership on {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
+                "unable to set ownership on {}: {error}",
+                path.display()
             ));
         }
         file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))
@@ -4771,7 +4756,7 @@ mod tests {
                 b"/usr/sbin/cake-autorated\0--instance\0lab\0",
             )
             .unwrap();
-            let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+            let ticks = sys::clock_ticks_per_second() as u64;
             fs::write(
                 proc_root.join("100/stat"),
                 format!(
@@ -6453,7 +6438,7 @@ mod tests {
                 b"/usr/sbin/cake-autorated\0--instance\0lab\0",
             )
             .unwrap();
-            let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+            let ticks = sys::clock_ticks_per_second() as u64;
             fs::write(
                 proc_root.join("100/stat"),
                 format!(
@@ -7727,7 +7712,7 @@ esac
         fs::create_dir(&proc_root).unwrap();
         fs::create_dir(&runtime_root).unwrap();
         fs::write(proc_root.join("stat"), b"cpu 1 2 3 4\nbtime 100\n").unwrap();
-        let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        let ticks_per_second = sys::clock_ticks_per_second() as u64;
         assert!(ticks_per_second > 0);
         let process = proc_root.join("100");
         fs::create_dir(&process).unwrap();

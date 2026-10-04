@@ -13,7 +13,7 @@ use super::{
 use crate::sys;
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -488,18 +488,18 @@ fn open_stable_pidfd(
     proc_root: &Path,
     identity: &ProcessIdentity,
 ) -> Result<Option<OwnedFd>, String> {
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
-    if raw < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) && !identity.still_matches(proc_root)? {
-            return Ok(None);
+    let pidfd = match sys::pidfd_open(identity.pid) {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            if error.raw_os_error() == Some(libc::ESRCH) && !identity.still_matches(proc_root)? {
+                return Ok(None);
+            }
+            return Err(format!(
+                "unable to open pidfd for calibration service process {}: {error}",
+                identity.pid
+            ));
         }
-        return Err(format!(
-            "unable to open pidfd for calibration service process {}: {error}",
-            identity.pid
-        ));
-    }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    };
     if !identity.still_matches(proc_root)? {
         return Ok(None);
     }
@@ -524,21 +524,26 @@ fn wait_pidfd(pidfd: &OwnedFd, timeout: Duration) -> Result<(), String> {
             events: libc::POLLIN,
             revents: 0,
         };
-        let status = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-        if status > 0 && descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            return Ok(());
-        }
-        if status == 0 {
+        let ready = match sys::poll(std::slice::from_mut(&mut descriptor), timeout_ms) {
+            Ok(ready) => ready,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(format!(
+                    "unable to wait for calibration service process exit: {error}"
+                ));
+            }
+        };
+        if ready == 0 {
             return Err(
                 "calibration service did not stop before its watchdog deadline".to_string(),
             );
         }
-        if status < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
+        if descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            return Ok(());
         }
         return Err(format!(
-            "unable to wait for calibration service process exit: {}",
-            io::Error::last_os_error()
+            "unable to wait for calibration service process exit: unexpected poll events {:#x}",
+            descriptor.revents
         ));
     }
 }

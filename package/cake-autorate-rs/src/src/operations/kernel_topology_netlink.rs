@@ -16,14 +16,15 @@ use super::kernel_topology::{
     MAX_FILTERS, MAX_NAMESPACE_IDENTITIES, MAX_OBSERVED_BYTES, MAX_PRIVATE_LINKS, MAX_QDISCS,
     MAX_UNKNOWN_ATTRIBUTES, TC_H_INGRESS, TC_H_MIN_EGRESS, TC_H_MIN_INGRESS, TC_H_ROOT,
 };
+use crate::sys;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-use std::mem::{self, size_of};
+use std::mem::size_of;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 const NLMSG_HEADER_LEN: usize = 16;
 const IFINFO_LEN: usize = 16;
@@ -2502,18 +2503,16 @@ pub struct LinuxNetlinkIo {
 #[cfg(target_os = "linux")]
 impl LinuxNetlinkIo {
     pub fn open() -> Result<Self, KernelTopologyError> {
-        let raw_fd = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                libc::NETLINK_ROUTE,
-            )
-        };
-        if raw_fd < 0 {
-            return Err(last_io_error("open NETLINK_ROUTE socket"));
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let fd = sys::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::NETLINK_ROUTE,
+        )
+        .map_err(|error| io_error("open NETLINK_ROUTE socket", &error))?;
         let enabled: libc::c_int = 1;
+        // SAFETY: setsockopt(2) reads size_of::<c_int>() bytes at the pointer,
+        // which is `enabled`, a live local of exactly that type; the socket is
+        // `fd`, which is open.
         let strict_result = unsafe {
             libc::setsockopt(
                 fd.as_raw_fd(),
@@ -2527,10 +2526,13 @@ impl LinuxNetlinkIo {
             return Err(last_io_error("enable NETLINK_GET_STRICT_CHK"));
         }
 
-        let mut local: libc::sockaddr_nl = unsafe { mem::zeroed() };
+        let mut local = sys::zeroed::<libc::sockaddr_nl>();
         local.nl_family = libc::AF_NETLINK as libc::sa_family_t;
         local.nl_pid = 0;
         local.nl_groups = 0;
+        // SAFETY: bind(2) reads one sockaddr_nl at the pointer: `local`, a fully
+        // initialised local that lives for the call, whose size is passed with
+        // it; the socket is `fd`, which is open.
         let bind_result = unsafe {
             libc::bind(
                 fd.as_raw_fd(),
@@ -2542,8 +2544,11 @@ impl LinuxNetlinkIo {
             return Err(last_io_error("bind NETLINK_ROUTE socket"));
         }
 
-        let mut bound: libc::sockaddr_nl = unsafe { mem::zeroed() };
+        let mut bound = sys::zeroed::<libc::sockaddr_nl>();
         let mut bound_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+        // SAFETY: getsockname(2) writes at most `bound_len` bytes, the size of a
+        // sockaddr_nl, into `bound`, a live local of exactly that type, and
+        // updates `bound_len`; the socket is `fd`, which is open.
         let name_result = unsafe {
             libc::getsockname(
                 fd.as_raw_fd(),
@@ -2595,7 +2600,7 @@ impl NetlinkIo for LinuxNetlinkIo {
         deadline: Instant,
     ) -> Result<(), KernelTopologyError> {
         validate_canonical_get_request(request, self.local_port_id)?;
-        let mut kernel: libc::sockaddr_nl = unsafe { mem::zeroed() };
+        let mut kernel = sys::zeroed::<libc::sockaddr_nl>();
         kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
         loop {
             if Instant::now() >= deadline {
@@ -2603,6 +2608,10 @@ impl NetlinkIo for LinuxNetlinkIo {
                     "NETLINK_ROUTE deadline expired".to_string(),
                 ));
             }
+            // SAFETY: sendto(2) reads `request.len()` bytes at the request
+            // pointer (a live slice) and one sockaddr_nl at `kernel` (a fully
+            // initialised local) together with its size; the socket is
+            // `self.fd`, which is open.
             let sent = unsafe {
                 libc::sendto(
                     self.fd.as_raw_fd(),
@@ -2647,16 +2656,21 @@ impl NetlinkIo for LinuxNetlinkIo {
         }
         loop {
             poll_fd(self.fd.as_raw_fd(), libc::POLLIN, deadline)?;
-            let mut sender: libc::sockaddr_nl = unsafe { mem::zeroed() };
+            let mut sender = sys::zeroed::<libc::sockaddr_nl>();
             let mut iovec = libc::iovec {
                 iov_base: buffer.as_mut_ptr().cast(),
                 iov_len: buffer.len(),
             };
-            let mut message: libc::msghdr = unsafe { mem::zeroed() };
+            let mut message = sys::zeroed::<libc::msghdr>();
             message.msg_name = (&mut sender as *mut libc::sockaddr_nl).cast();
             message.msg_namelen = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
             message.msg_iov = &mut iovec;
             message.msg_iovlen = 1;
+            // SAFETY: recvmsg(2) is given a msghdr whose name pointer is `sender`
+            // (with its size) and whose single iovec is `buffer` (with its
+            // length); `message`, `sender` and `iovec` are live locals and
+            // `buffer` is an exclusively borrowed slice for the call, and the
+            // kernel writes only within those lengths. The socket is `self.fd`.
             let received =
                 unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut message, libc::MSG_DONTWAIT) };
             if received > 0 {
@@ -2713,34 +2727,36 @@ fn poll_fd(
             events,
             revents: 0,
         };
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
-        if result > 0 {
-            if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                return Err(KernelTopologyError::Backend(
-                    "NETLINK_ROUTE socket reported a poll failure".to_string(),
-                ));
+        match sys::poll(std::slice::from_mut(&mut descriptor), timeout) {
+            Ok(0) => continue,
+            Ok(_) => {
+                if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    return Err(KernelTopologyError::Backend(
+                        "NETLINK_ROUTE socket reported a poll failure".to_string(),
+                    ));
+                }
+                if descriptor.revents & events != 0 {
+                    return Ok(());
+                }
             }
-            if descriptor.revents & events != 0 {
-                return Ok(());
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(KernelTopologyError::Backend(format!(
+                    "poll NETLINK_ROUTE socket: {error}"
+                )));
             }
-            continue;
         }
-        if result == 0 {
-            continue;
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(KernelTopologyError::Backend(format!(
-            "poll NETLINK_ROUTE socket: {error}"
-        )));
     }
 }
 
 #[cfg(target_os = "linux")]
 fn last_io_error(action: &str) -> KernelTopologyError {
-    KernelTopologyError::Backend(format!("{action}: {}", io::Error::last_os_error()))
+    io_error(action, &io::Error::last_os_error())
+}
+
+#[cfg(target_os = "linux")]
+fn io_error(action: &str, error: &io::Error) -> KernelTopologyError {
+    KernelTopologyError::Backend(format!("{action}: {error}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -2885,6 +2901,9 @@ fn decode_canonical_action_request_kind(request: &[u8]) -> Result<String, Kernel
 fn read_socket_netns_cookie(fd: libc::c_int) -> Result<u64, KernelTopologyError> {
     let mut cookie = 0u64;
     let mut cookie_len = size_of::<u64>() as libc::socklen_t;
+    // SAFETY: getsockopt(2) writes at most `cookie_len` bytes, the size of a
+    // u64, into `cookie`, a live local of that type, and updates `cookie_len`.
+    // The descriptor number comes from a socket the caller keeps open.
     let result = unsafe {
         libc::getsockopt(
             fd,

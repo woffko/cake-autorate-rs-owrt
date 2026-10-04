@@ -450,7 +450,8 @@ mod tests {
     use super::*;
     use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
     use crate::operations::protocol::SpeedtestDirection;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use crate::sys;
+    use std::os::fd::AsRawFd;
     use std::sync::{Condvar, Mutex};
 
     fn request(seed: char, sequence: u32) -> AutotuneCaptureRequest {
@@ -690,9 +691,7 @@ mod tests {
 
     #[test]
     fn completion_notifies_the_shared_reactor_wake() {
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let entered = Arc::new((Mutex::new(false), Condvar::new()));
         let reader_gate = Arc::clone(&gate);
@@ -727,11 +726,17 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 0);
+        assert_eq!(
+            sys::poll(std::slice::from_mut(&mut descriptor), 0).unwrap(),
+            0
+        );
         let (lock, release) = &*gate;
         *lock.lock().unwrap() = true;
         release.notify_all();
-        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 1_000) }, 1);
+        assert_eq!(
+            sys::poll(std::slice::from_mut(&mut descriptor), 1_000).unwrap(),
+            1
+        );
         assert_ne!(descriptor.revents & libc::POLLIN, 0);
         let completion = take_with_timeout(&mut sampler);
         assert_eq!(completion.request, capture);
@@ -739,9 +744,7 @@ mod tests {
 
     #[test]
     fn worker_exit_notifies_the_shared_reactor_wake() {
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let reader: Arc<CounterReader> = Arc::new(|_, _| Ok(None));
         let sampler =
             AutotuneCounterSampler::with_reader_and_wake(reader, Some(Arc::clone(&wake))).unwrap();
@@ -750,9 +753,15 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 0);
+        assert_eq!(
+            sys::poll(std::slice::from_mut(&mut descriptor), 0).unwrap(),
+            0
+        );
         drop(sampler);
-        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        assert_eq!(
+            sys::poll(std::slice::from_mut(&mut descriptor), 0).unwrap(),
+            1
+        );
         assert_ne!(descriptor.revents & libc::POLLIN, 0);
     }
 

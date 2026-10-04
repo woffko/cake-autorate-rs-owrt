@@ -15,6 +15,7 @@ use super::scheduler::{
 };
 use super::scheduler_config::ScheduledInstanceConfig;
 use super::scheduler_store::SchedulerStore;
+use crate::sys;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -63,7 +64,10 @@ pub fn local_calendar(
     }
     let raw = libc::time_t::try_from(now_unix_s)
         .map_err(|_| "scheduler wall clock is outside time_t".to_string())?;
-    let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
+    let mut local = sys::zeroed::<libc::tm>();
+    // SAFETY: localtime_r(3) reads the time_t behind `&raw` and writes one `tm`
+    // through `&mut local`, both live locals of exactly those types; the
+    // reentrant variant keeps no pointer to them and uses no static buffer.
     if unsafe { libc::localtime_r(&raw, &mut local) }.is_null() {
         return Err("scheduler could not resolve the local calendar".to_string());
     }
@@ -84,6 +88,8 @@ pub fn local_calendar(
         candidate.tm_min = 0;
         candidate.tm_sec = 0;
         candidate.tm_isdst = -1;
+        // SAFETY: mktime(3) reads and normalises the `tm` behind `&mut candidate`,
+        // a live, fully initialised local; it keeps no pointer to it.
         let mut next = unsafe { libc::mktime(&mut candidate) };
         if next < 0 {
             return Err("scheduler could not resolve the next local window".to_string());
@@ -101,6 +107,7 @@ pub fn local_calendar(
             candidate.tm_min = 0;
             candidate.tm_sec = 0;
             candidate.tm_isdst = -1;
+            // SAFETY: as for the first mktime(3) call above.
             next = unsafe { libc::mktime(&mut candidate) };
             if next < 0 {
                 return Err("scheduler could not resolve the next local day window".to_string());

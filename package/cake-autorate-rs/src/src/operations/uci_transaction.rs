@@ -14,8 +14,7 @@ use serde_json::{json, Value};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, String>;
@@ -88,19 +87,9 @@ pub(super) fn rename(
     } else {
         libc::RENAME_NOREPLACE
     };
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            from.file.as_raw_fd(),
-            old.as_ptr(),
-            to.file.as_raw_fd(),
-            new.as_ptr(),
-            flags,
-        )
-    };
-    if result != 0 {
+    if let Err(error) = sys::renameat2(&from.file, &old, &to.file, &new, flags) {
         // No non-atomic unlink/rename fallback, including unsupported kernels.
-        return Err(match std::io::Error::last_os_error().raw_os_error() {
+        return Err(match error.raw_os_error() {
             Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) => {
                 "uci-transaction-atomic-rename-unsupported"
             }
@@ -373,8 +362,10 @@ impl Journal {
             let name = format!("{}.swap", PACKAGES[i]);
             let file = write_new(&pending, &name, candidate[i])?;
             let original = &before[i].identity;
-            if unsafe { libc::fchown(file.as_raw_fd(), original.uid, original.gid) } != 0
-                || unsafe { libc::fchmod(file.as_raw_fd(), original.mode & 0o7777) } != 0
+            if std::os::unix::fs::fchown(&file, Some(original.uid), Some(original.gid)).is_err()
+                || file
+                    .set_permissions(fs::Permissions::from_mode(original.mode & 0o7777))
+                    .is_err()
             {
                 return Err("uci-transaction-metadata-copy-failed".into());
             }
@@ -1651,6 +1642,9 @@ mod tests {
         journal
             .publish(&config, |at| {
                 if at == step {
+                    // SAFETY: _exit(2) ends this test process at once with
+                    // status 78, which the parent test expects; it returns
+                    // never, touches no Rust state and runs no destructors.
                     unsafe { libc::_exit(78) }
                 }
                 Ok(())

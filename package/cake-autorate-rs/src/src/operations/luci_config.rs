@@ -117,11 +117,17 @@ fn uci_output(
         COMMAND_TIMEOUT,
         COMMAND_OUTPUT_LIMIT,
         || false,
-        |command| unsafe {
-            command.pre_exec(|| {
-                libc::umask(0o077);
-                Ok(())
-            });
+        |command| {
+            // SAFETY: the closure runs in the forked child before exec, where only
+            // async-signal-safe calls are allowed. It makes one umask(2) call,
+            // which cannot fail, touches no memory, allocates nothing and takes
+            // no lock, and it captures nothing.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o077);
+                    Ok(())
+                });
+            }
         },
     )
 }

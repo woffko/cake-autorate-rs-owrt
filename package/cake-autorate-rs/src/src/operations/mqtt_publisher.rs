@@ -19,7 +19,7 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -419,19 +419,12 @@ where
                 revents: 0,
             },
         ];
-        let result = unsafe {
-            libc::poll(
-                descriptors.as_mut_ptr(),
-                descriptors.len() as libc::nfds_t,
-                if follower.needs_drain || buffered {
-                    0
-                } else {
-                    -1
-                },
-            )
+        let timeout = if follower.needs_drain || buffered {
+            0
+        } else {
+            -1
         };
-        if result < 0 {
-            let error = io::Error::last_os_error();
+        if let Err(error) = sys::poll(&mut descriptors, timeout) {
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -529,16 +522,11 @@ fn wait_readable(descriptor: RawFd, pause: Duration) -> Result<bool, String> {
         revents: 0,
     };
     let milliseconds = libc::c_int::try_from(pause.as_millis()).unwrap_or(libc::c_int::MAX);
-    // SAFETY: `poll` is one valid pollfd that lives for the whole call.
-    let result = unsafe { libc::poll(&mut poll, 1, milliseconds) };
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            return Ok(false);
-        }
-        return Err(format!("MQTT retry wait failed: {error}"));
+    match sys::poll(std::slice::from_mut(&mut poll), milliseconds) {
+        Ok(_) => Ok(poll.revents & libc::POLLIN != 0),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+        Err(error) => Err(format!("MQTT retry wait failed: {error}")),
     }
-    Ok(poll.revents & libc::POLLIN != 0)
 }
 
 pub(crate) fn service_configs(package: &UciPackage) -> Result<Vec<MqttPublisherConfig>, String> {
@@ -1723,49 +1711,23 @@ struct SignalEvents(OwnedFd);
 
 impl SignalEvents {
     fn new() -> Result<Self, String> {
-        let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-        if unsafe { libc::sigemptyset(&mut mask) } != 0
-            || unsafe { libc::sigaddset(&mut mask, libc::SIGINT) } != 0
-            || unsafe { libc::sigaddset(&mut mask, libc::SIGTERM) } != 0
-        {
-            return Err(format!(
-                "unable to construct MQTT signal mask: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let block = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) };
-        if block != 0 {
-            return Err(format!(
-                "unable to block MQTT process signals: {}",
-                io::Error::from_raw_os_error(block)
-            ));
-        }
-        let raw = unsafe { libc::signalfd(-1, &mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
-        if raw < 0 {
-            return Err(format!(
-                "unable to create MQTT signal descriptor: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        Ok(Self(unsafe { OwnedFd::from_raw_fd(raw) }))
+        let mask = sys::signal_set(&[libc::SIGINT, libc::SIGTERM])
+            .map_err(|error| format!("unable to construct MQTT signal mask: {error}"))?;
+        sys::block_signals(&mask)
+            .map_err(|error| format!("unable to block MQTT process signals: {error}"))?;
+        let descriptor = sys::signalfd(&mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC)
+            .map_err(|error| format!("unable to create MQTT signal descriptor: {error}"))?;
+        Ok(Self(descriptor))
     }
 
     fn drain(&self) -> Result<(), String> {
-        let mut info = unsafe { std::mem::zeroed::<libc::signalfd_siginfo>() };
-        let read = unsafe {
-            libc::read(
-                self.0.as_raw_fd(),
-                (&mut info as *mut libc::signalfd_siginfo).cast(),
-                std::mem::size_of::<libc::signalfd_siginfo>(),
-            )
-        };
-        if read as usize != std::mem::size_of::<libc::signalfd_siginfo>() {
-            return Err(format!(
-                "unable to read MQTT signal descriptor: {}",
-                io::Error::last_os_error()
-            ));
+        // One whole record per read; its content is not needed, the wake-up is.
+        let mut record = [0_u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+        match sys::read(&self.0, &mut record) {
+            Ok(count) if count == record.len() => Ok(()),
+            Ok(_) => Err("unable to read MQTT signal descriptor: short read".to_string()),
+            Err(error) => Err(format!("unable to read MQTT signal descriptor: {error}")),
         }
-        Ok(())
     }
 }
 
@@ -1782,56 +1744,26 @@ impl MonotonicTimer {
         if interval.is_zero() {
             return Err("MQTT keepalive interval must be non-zero".to_string());
         }
-        let raw = unsafe {
-            libc::timerfd_create(
-                libc::CLOCK_MONOTONIC,
-                libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
-            )
-        };
-        if raw < 0 {
-            return Err(format!(
-                "unable to create MQTT keepalive timer: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+        let descriptor = sys::timerfd_create(
+            libc::CLOCK_MONOTONIC,
+            libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+        )
+        .map_err(|error| format!("unable to create MQTT keepalive timer: {error}"))?;
         let specification = libc::itimerspec {
             it_interval: duration_timespec(interval),
             it_value: duration_timespec(interval),
         };
-        if unsafe {
-            libc::timerfd_settime(
-                descriptor.as_raw_fd(),
-                0,
-                &specification,
-                std::ptr::null_mut(),
-            )
-        } != 0
-        {
-            return Err(format!(
-                "unable to arm MQTT keepalive timer: {}",
-                io::Error::last_os_error()
-            ));
-        }
+        sys::timerfd_settime(&descriptor, 0, &specification)
+            .map_err(|error| format!("unable to arm MQTT keepalive timer: {error}"))?;
         Ok(Self(descriptor))
     }
 
     fn drain(&self) -> Result<(), String> {
-        let mut expirations = 0u64;
-        let read = unsafe {
-            libc::read(
-                self.0.as_raw_fd(),
-                (&mut expirations as *mut u64).cast(),
-                std::mem::size_of::<u64>(),
-            )
-        };
-        if read as usize != std::mem::size_of::<u64>() {
-            return Err(format!(
-                "unable to read MQTT keepalive timer: {}",
-                io::Error::last_os_error()
-            ));
+        match sys::read_u64(&self.0) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("unable to read MQTT keepalive timer: short read".to_string()),
+            Err(error) => Err(format!("unable to read MQTT keepalive timer: {error}")),
         }
-        Ok(())
     }
 }
 
@@ -1856,15 +1788,10 @@ struct LogEvents {
 
 impl LogEvents {
     fn new(path: &Path) -> Result<Self, String> {
-        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if raw < 0 {
-            return Err(format!(
-                "unable to create MQTT log watcher: {}",
-                io::Error::last_os_error()
-            ));
-        }
+        let descriptor = sys::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC)
+            .map_err(|error| format!("unable to create MQTT log watcher: {error}"))?;
         let mut watcher = Self {
-            descriptor: unsafe { OwnedFd::from_raw_fd(raw) },
+            descriptor,
             file_watch: None,
         };
         let parent = path
@@ -1881,21 +1808,13 @@ impl LogEvents {
     fn add_watch(&self, path: &Path, mask: u32) -> Result<i32, String> {
         let encoded = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| "MQTT log watch path contains NUL".to_string())?;
-        let watch =
-            unsafe { libc::inotify_add_watch(self.descriptor.as_raw_fd(), encoded.as_ptr(), mask) };
-        if watch < 0 {
-            return Err(format!(
-                "unable to watch MQTT log {}: {}",
-                path.display(),
-                io::Error::last_os_error()
-            ));
-        }
-        Ok(watch)
+        sys::inotify_add_watch(&self.descriptor, &encoded, mask)
+            .map_err(|error| format!("unable to watch MQTT log {}: {error}", path.display()))
     }
 
     fn watch_file(&mut self, path: &Path) -> Result<(), String> {
         if let Some(watch) = self.file_watch.take() {
-            let _ = unsafe { libc::inotify_rm_watch(self.descriptor.as_raw_fd(), watch) };
+            let _ = sys::inotify_rm_watch(&self.descriptor, watch);
         }
         self.file_watch = Some(self.add_watch(
             path,
@@ -1907,27 +1826,13 @@ impl LogEvents {
     fn drain(&self) -> Result<(), String> {
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = unsafe {
-                libc::read(
-                    self.descriptor.as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                )
-            };
-            if read > 0 {
-                continue;
+            match sys::read(&self.descriptor, &mut buffer) {
+                Ok(0) => return Err("MQTT inotify descriptor reached EOF".to_string()),
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(format!("unable to read MQTT log events: {error}")),
             }
-            if read == 0 {
-                return Err("MQTT inotify descriptor reached EOF".to_string());
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::WouldBlock {
-                return Ok(());
-            }
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(format!("unable to read MQTT log events: {error}"));
         }
     }
 }

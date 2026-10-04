@@ -202,17 +202,32 @@ impl NativeApplyGlobalLock {
             .env("CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD", "8")
             .env("CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_MODE", "exclusive")
             .env("CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW", "1");
+        // SAFETY: the closure runs in the forked child before exec, where only
+        // async-signal-safe calls are allowed. `install_inherited_lock_fd` makes
+        // one dup2(2) and two fcntl(2) calls, plain system calls that allocate
+        // nothing and take no lock, and returns the OS error as
+        // `last_os_error()`, which does not allocate either. The closure copies
+        // one integer, the descriptor number of the lock file that `self`
+        // keeps open until the command has been spawned.
         unsafe {
             command.pre_exec(move || install_inherited_lock_fd(source_fd));
         }
     }
 }
 
+/// Runs between fork and exec: only async-signal-safe calls, no allocation.
 fn install_inherited_lock_fd(source_fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: dup2(2) takes two descriptor numbers and touches no memory. The
+    // source is the open lock file; the target (8) is replaced in this child
+    // only, which is about to exec.
     if source_fd != 8 && unsafe { libc::dup2(source_fd, 8) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: fcntl(2) with F_GETFD takes a descriptor number and touches no
+    // memory.
     let flags = unsafe { libc::fcntl(8, libc::F_GETFD) };
+    // SAFETY: fcntl(2) with F_SETFD takes a descriptor number and an integer
+    // flag word and touches no memory.
     if flags < 0 || unsafe { libc::fcntl(8, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
         return Err(std::io::Error::last_os_error());
     }

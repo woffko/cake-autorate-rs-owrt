@@ -2,9 +2,10 @@
 //! processes. This replaces the shipped shell/awk helper while preserving its
 //! operator-facing report.
 
+use crate::sys;
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 const DEFAULT_DURATION_SECONDS: u64 = 30;
@@ -64,7 +65,7 @@ fn profile(proc_root: &Path, duration: u64) -> Result<String, String> {
         return Err("no cake-autorate processes found".to_string());
     }
     let before = read_system_counters(&proc_root.join("stat"))?;
-    let clock_ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let clock_ticks = sys::clock_ticks_per_second();
     if clock_ticks <= 0 {
         return Err("unable to determine the process clock tick rate".to_string());
     }
@@ -273,14 +274,8 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn wait_measurement_window(seconds: u64) -> Result<(), String> {
-    let raw = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
-    if raw < 0 {
-        return Err(format!(
-            "unable to create the CPU profiler timer: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let timer = unsafe { OwnedFd::from_raw_fd(raw) };
+    let timer = sys::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC)
+        .map_err(|error| format!("unable to create the CPU profiler timer: {error}"))?;
     let specification = libc::itimerspec {
         it_interval: libc::timespec {
             tv_sec: 0,
@@ -291,13 +286,8 @@ fn wait_measurement_window(seconds: u64) -> Result<(), String> {
             tv_nsec: 0,
         },
     };
-    if unsafe { libc::timerfd_settime(timer.as_raw_fd(), 0, &specification, std::ptr::null_mut()) }
-        != 0
-    {
-        return Err(format!(
-            "unable to arm the CPU profiler timer: {}",
-            io::Error::last_os_error()
-        ));
+    if let Err(error) = sys::timerfd_settime(&timer, 0, &specification) {
+        return Err(format!("unable to arm the CPU profiler timer: {error}"));
     }
     let mut descriptor = libc::pollfd {
         fd: timer.as_raw_fd(),
@@ -305,27 +295,16 @@ fn wait_measurement_window(seconds: u64) -> Result<(), String> {
         revents: 0,
     };
     loop {
-        let ready = unsafe { libc::poll(&mut descriptor, 1, -1) };
-        if ready > 0 && descriptor.revents & libc::POLLIN != 0 {
-            break;
+        match sys::poll(std::slice::from_mut(&mut descriptor), -1) {
+            Ok(ready) if ready > 0 && descriptor.revents & libc::POLLIN != 0 => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            _ => return Err("CPU profiler timer wait failed".to_string()),
         }
-        if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err("CPU profiler timer wait failed".to_string());
     }
-    let mut expirations = 0u64;
-    let read = unsafe {
-        libc::read(
-            timer.as_raw_fd(),
-            (&mut expirations as *mut u64).cast(),
-            std::mem::size_of::<u64>(),
-        )
-    };
-    if read != std::mem::size_of::<u64>() as isize || expirations == 0 {
-        return Err("CPU profiler timer completion is invalid".to_string());
+    match sys::read_u64(&timer) {
+        Ok(Some(expirations)) if expirations != 0 => Ok(()),
+        _ => Err("CPU profiler timer completion is invalid".to_string()),
     }
-    Ok(())
 }
 
 #[cfg(test)]

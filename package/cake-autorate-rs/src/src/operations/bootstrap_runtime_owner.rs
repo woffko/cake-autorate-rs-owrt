@@ -1580,28 +1580,19 @@ impl BootstrapTransportRuntime {
 
     fn drain_wake(&self) -> Result<(), String> {
         loop {
-            let mut value = 0_u64;
-            let read = unsafe {
-                libc::read(
-                    self._wake.as_raw_fd(),
-                    (&mut value as *mut u64).cast::<libc::c_void>(),
-                    std::mem::size_of::<u64>(),
-                )
-            };
-            if read == std::mem::size_of::<u64>() as isize {
-                continue;
-            }
-            if read < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    return Ok(());
+            match sys::read_u64(&self._wake) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {
+                    return Err(
+                        "bootstrap transport wake descriptor returned a short read".to_string()
+                    )
                 }
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(format!("failed to drain bootstrap transport wake: {error}"))
                 }
-                return Err(format!("failed to drain bootstrap transport wake: {error}"));
             }
-            return Err("bootstrap transport wake descriptor returned a short read".to_string());
         }
     }
 
@@ -4034,26 +4025,19 @@ impl BootstrapCaptureRuntime {
         let Some(wake) = pinger.wake.as_ref() else {
             return Ok(());
         };
-        let value = 1_u64;
         loop {
-            let written = unsafe {
-                libc::write(
-                    wake.as_raw_fd(),
-                    (&value as *const u64).cast::<libc::c_void>(),
-                    std::mem::size_of::<u64>(),
-                )
-            };
-            if written == std::mem::size_of::<u64>() as isize {
-                return Ok(());
-            }
-            if written < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+            match sys::write_u64(wake.as_ref(), 1) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    return Err(
+                        "bootstrap pinger wake descriptor returned a short write".to_string()
+                    )
                 }
-                return Err(format!("failed to re-arm bootstrap pinger wake: {error}"));
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(format!("failed to re-arm bootstrap pinger wake: {error}"))
+                }
             }
-            return Err("bootstrap pinger wake descriptor returned a short write".to_string());
         }
     }
 
@@ -5869,7 +5853,7 @@ mod tests {
     };
     use std::cell::Cell;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::FromRawFd;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::AtomicU64;
 
@@ -7554,9 +7538,7 @@ mod tests {
         let boot_ms = monotonic_boot_ms().unwrap();
         let mut request = loaded_capture_request();
         request.deadline_boot_ms = boot_ms + 60_000;
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let sampler =
             super::super::autotune_counter::AutotuneCounterSampler::with_test_reader_and_wake(
                 |_| {
@@ -7669,9 +7651,7 @@ mod tests {
         let boot_ms = monotonic_boot_ms().unwrap();
         let mut request = loaded_capture_request();
         request.deadline_boot_ms = boot_ms + 60_000;
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let sampler =
             super::super::autotune_counter::AutotuneCounterSampler::with_test_reader_and_wake(
                 |_| {
@@ -7832,9 +7812,7 @@ mod tests {
             rx_bytes: 20_000_000,
             tx_bytes: 200_000,
         };
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let mut sampler =
             super::super::autotune_counter::AutotuneCounterSampler::with_test_reader_and_wake(
                 move |_| Ok(Some(counters)),
@@ -7904,16 +7882,9 @@ mod tests {
             capture.loaded_counter_cycle,
             LoadedCounterCycleState::BaselineReady
         );
-        let mut wake_count = 0_u64;
-        let wake_read = unsafe {
-            libc::read(
-                wake.as_raw_fd(),
-                (&mut wake_count as *mut u64).cast::<libc::c_void>(),
-                std::mem::size_of::<u64>(),
-            )
-        };
-        assert_eq!(wake_read, std::mem::size_of::<u64>() as isize);
-        assert!(wake_count >= 1);
+        assert!(sys::read_u64(&*wake)
+            .unwrap()
+            .is_some_and(|wake_count| wake_count >= 1));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -8116,9 +8087,7 @@ mod tests {
             .expand()
             .unwrap();
 
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::channel();
         let transport = BootstrapTransportRuntime {
@@ -8584,9 +8553,7 @@ mod tests {
         let policy = super::super::autotune_capture_policy::AutotuneCapturePolicyId::StandardV2
             .expand()
             .unwrap();
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let (request_tx, _request_rx) = mpsc::sync_channel(1);
         let (_result_tx, result_rx) = mpsc::channel();
         let transport = BootstrapTransportRuntime {
@@ -8902,9 +8869,7 @@ mod tests {
 
     #[test]
     fn bounded_pinger_drain_rearms_unread_channel_entries() {
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let (tx, lines) = mpsc::channel();
         for sequence in 0..=MAX_PINGER_LINES_PER_DRAIN {
             tx.send(Ok(crate::PingerLine {
@@ -8932,13 +8897,19 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        assert_eq!(
+            sys::poll(std::slice::from_mut(&mut descriptor), 0).unwrap(),
+            1
+        );
         assert_ne!(descriptor.revents & libc::POLLIN, 0);
 
         pinger.drain_wake().unwrap();
         let second = BootstrapCaptureRuntime::read_bounded_pinger_lines(&pinger).unwrap();
         assert_eq!(second.len(), 1);
-        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 0);
+        assert_eq!(
+            sys::poll(std::slice::from_mut(&mut descriptor), 0).unwrap(),
+            0
+        );
         drop(tx);
     }
 
@@ -9079,9 +9050,7 @@ mod tests {
                 .ready
         );
 
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::channel();
         let mut transport = BootstrapTransportRuntime {
@@ -9183,9 +9152,7 @@ mod tests {
             },
             phase: Some((true, false)),
         }]);
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::channel();
         let mut transport = BootstrapTransportRuntime {
@@ -9309,9 +9276,7 @@ mod tests {
             .iter()
             .any(|observation| observation.phase == Some((true, true))));
 
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let (request_tx, _request_rx) = mpsc::sync_channel(1);
         let (_result_tx, result_rx) = mpsc::channel();
         let mut transport = BootstrapTransportRuntime {
@@ -9390,9 +9355,7 @@ mod tests {
 
     #[test]
     fn transport_reschedules_after_partial_success_and_transient_failure() {
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::channel();
         let mut transport = BootstrapTransportRuntime {
@@ -10068,9 +10031,7 @@ mod tests {
             },
             phase: Some((true, false)),
         };
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(raw_wake >= 0);
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = Arc::new(sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap());
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (_result_tx, result_rx) = mpsc::channel();
         let transport = BootstrapTransportRuntime {

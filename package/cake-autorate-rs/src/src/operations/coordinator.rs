@@ -417,25 +417,8 @@ fn native_runtime_qdisc_kinds(
     Ok((download, upload))
 }
 
-extern "C" {
-    fn getsockopt(
-        socket: i32,
-        level: i32,
-        option_name: i32,
-        option_value: *mut c_void,
-        option_length: *mut u32,
-    ) -> i32;
-}
-
-const SOL_SOCKET: i32 = 1;
-const SO_PEERCRED: i32 = 17;
-
-#[repr(C)]
-struct PeerCredentials {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-}
+/// The kernel's `struct ucred`, as libc defines it for this target.
+type PeerCredentials = libc::ucred;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SchedulerAccountingAcknowledgement {
@@ -9221,11 +9204,17 @@ fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials, String> {
     };
     let mut length = u32::try_from(std::mem::size_of::<PeerCredentials>())
         .map_err(|_| "peer credential structure is too large".to_string())?;
+    // SAFETY: getsockopt(2) writes at most `length` bytes, which is the size of
+    // `PeerCredentials` (the kernel's struct ucred), into `credentials`, a live
+    // local of that type, and updates `length`; the descriptor is the stream's,
+    // which stays open for the call. The level and option numbers are libc's
+    // for this target: they differ on MIPS, where SOL_SOCKET is 0xffff and
+    // SO_PEERCRED is 18.
     let result = unsafe {
-        getsockopt(
+        libc::getsockopt(
             stream.as_raw_fd(),
-            SOL_SOCKET,
-            SO_PEERCRED,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
             (&mut credentials as *mut PeerCredentials).cast::<c_void>(),
             &mut length,
         )

@@ -1,14 +1,14 @@
 #[cfg(feature = "calibration")]
 use super::identity::ProcessIdentity;
+use crate::sys;
 use std::ffi::OsString;
 use std::fs;
 #[cfg(feature = "calibration")]
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -24,11 +24,6 @@ const WAIT_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(feature = "calibration")]
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
-
-extern "C" {
-    fn setsid() -> i32;
-    fn kill(pid: i32, signal: i32) -> i32;
-}
 
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
@@ -119,8 +114,12 @@ impl OwnedProcessGroupChild {
     // Keep a terminated leader waitable until its pipes have finished. Reaping
     // it earlier would release the PID used to identify the owned group.
     fn exited(&mut self) -> Result<bool, String> {
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let mut info = sys::zeroed::<libc::siginfo_t>();
         loop {
+            // SAFETY: waitid(2) takes the pid of this process's own child, an
+            // option set that only looks (WNOHANG, WNOWAIT: nothing is reaped
+            // and nothing blocks), and writes one siginfo_t through `info`, a
+            // live, exclusively borrowed local.
             if unsafe {
                 libc::waitid(
                     libc::P_PID,
@@ -130,6 +129,10 @@ impl OwnedProcessGroupChild {
                 )
             } == 0
             {
+                // SAFETY: `info` was zero-initialised and the successful waitid
+                // call above is the one that may have filled it, so reading its
+                // si_pid member is reading initialised memory; waitid leaves it
+                // zero when no child has changed state.
                 return Ok(unsafe { info.si_pid() } != 0);
             }
             let error = io::Error::last_os_error();
@@ -163,7 +166,7 @@ impl OwnedProcessGroupChild {
         if group <= 1 {
             return Err("refusing to signal an unsafe bounded command process group".to_string());
         }
-        let group_killed = unsafe { kill(-group, SIGKILL) } == 0;
+        let group_killed = sys::kill_process_group(group, SIGKILL).is_ok();
         if !group_killed {
             let _ = self.child.kill();
         }
@@ -199,14 +202,7 @@ impl ManagedChild {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
-        unsafe {
-            command.pre_exec(|| {
-                if setsid() < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        sys::lead_new_session(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("unable to launch operation worker: {error}"))?;
@@ -356,14 +352,7 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure(&mut command);
-    unsafe {
-        command.pre_exec(|| {
-            if setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    sys::lead_new_session(&mut command);
     let child = command
         .spawn()
         .map_err(|error| format!("unable to launch bounded command: {error}"))?;
@@ -372,21 +361,15 @@ where
         child,
         reaped: false,
     };
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.child.id(), 0_u32) };
-    if pidfd < 0 {
-        return Err(format!(
-            "unable to watch bounded command: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+    let pidfd = sys::pidfd_open(child.child.id())
+        .map_err(|error| format!("unable to watch bounded command: {error}"))?;
     let mut stdin = child.child.stdin.take();
     let input = input.unwrap_or_default();
     if input.is_empty() {
         stdin = None;
     }
     if let Some(pipe) = stdin.as_ref() {
-        set_nonblocking(pipe.as_raw_fd())?;
+        set_nonblocking(pipe)?;
     }
     let stdout = child
         .child
@@ -471,15 +454,7 @@ where
             .saturating_duration_since(Instant::now())
             .min(WAIT_INTERVAL);
         let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
-        let result = unsafe {
-            libc::poll(
-                descriptors.as_mut_ptr(),
-                descriptors.len() as libc::nfds_t,
-                timeout_ms,
-            )
-        };
-        if result < 0 {
-            let error = io::Error::last_os_error();
+        if let Err(error) = sys::poll(&mut descriptors, timeout_ms) {
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(format!("unable to wait for bounded command IO: {error}"));
             }
@@ -493,15 +468,9 @@ where
     }
 }
 
-fn set_nonblocking(fd: RawFd) -> Result<(), String> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(format!(
-            "unable to configure bounded command pipe: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    Ok(())
+fn set_nonblocking(pipe: impl AsFd) -> Result<(), String> {
+    sys::set_nonblocking(pipe)
+        .map_err(|error| format!("unable to configure bounded command pipe: {error}"))
 }
 
 fn poll_descriptor(fd: Option<RawFd>, events: i16) -> libc::pollfd {
@@ -517,9 +486,9 @@ struct BoundedPipeReader<R> {
     output: BoundedRead,
 }
 
-impl<R: Read + AsRawFd> BoundedPipeReader<R> {
+impl<R: Read + AsFd + AsRawFd> BoundedPipeReader<R> {
     fn new(pipe: R, limit: usize) -> Result<Self, String> {
-        set_nonblocking(pipe.as_raw_fd())?;
+        set_nonblocking(&pipe)?;
         Ok(Self {
             pipe: Some(pipe),
             output: BoundedRead {
@@ -600,15 +569,8 @@ fn signal_group(identity: &ProcessIdentity, signal: i32) -> Result<(), String> {
     if process_group <= 1 {
         return Err("refusing to signal an unsafe process group".to_string());
     }
-    let result = unsafe { kill(-process_group, signal) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "unable to signal operation process group: {}",
-            io::Error::last_os_error()
-        ))
-    }
+    sys::kill_process_group(process_group, signal)
+        .map_err(|error| format!("unable to signal operation process group: {error}"))
 }
 
 /// Read-only kernel proof; this never grants authority to signal a stale PGID.
@@ -624,13 +586,12 @@ pub fn process_group_retired(identity: &ProcessIdentity) -> Result<bool, String>
     {
         return Ok(false);
     }
-    // SAFETY: scalar pid_t arguments, a checked PGID > 1 and signal exactly 0.
-    // No signal is delivered, including when the old PGID has been reused.
-    // Only ESRCH proves absence; EPERM/other failures remain errors.
-    if unsafe { kill(-group, 0) } == 0 {
+    // Signal exactly 0 on a checked PGID > 1: no signal is delivered, including
+    // when the old PGID has been reused. Only ESRCH proves absence; EPERM and
+    // other failures remain errors.
+    let Err(error) = sys::kill_process_group(group, 0) else {
         return Ok(false);
-    }
-    let error = io::Error::last_os_error();
+    };
     if error.raw_os_error() == Some(libc::ESRCH) {
         Ok(true)
     } else {
@@ -674,6 +635,8 @@ mod tests {
     #[cfg(feature = "calibration")]
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    #[cfg(feature = "calibration")]
+    use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -815,10 +778,11 @@ mod tests {
         assert!(identity.still_matches(Path::new("/proc")).unwrap());
         assert!(signal_adopted_group(&identity, Path::new("/proc"), SIGTERM).unwrap());
         let mut status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(identity.pid as i32, &mut status, 0) },
-            identity.pid as i32
-        );
+        // SAFETY: waitpid(2) writes one int through `&mut status`, a live local,
+        // and reaps the worker that `ManagedChild::spawn` started above, which
+        // is a child of the test process and was signalled, so it exits.
+        let reaped = unsafe { libc::waitpid(identity.pid as i32, &mut status, 0) };
+        assert_eq!(reaped, identity.pid as i32);
         assert!(!identity.still_matches(Path::new("/proc")).unwrap());
     }
 

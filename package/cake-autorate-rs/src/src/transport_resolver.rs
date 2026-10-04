@@ -1,4 +1,5 @@
 //! System DNS in an owned, terminable helper rather than a detached thread.
+use crate::sys;
 #[cfg(any(feature = "transport-probes", test))]
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -63,8 +64,7 @@ pub(crate) fn serve<R: Read, W: Write>(
     if armed != 0 {
         return Err("transport-dns-parent-guard-failed".into());
     }
-    // SAFETY: getppid has no arguments or memory preconditions.
-    let actual_parent = unsafe { libc::getppid() };
+    let actual_parent = sys::parent_process_id();
     if actual_parent <= 0 || actual_parent as u32 != parent {
         return Err("transport-dns-parent-changed".into());
     }

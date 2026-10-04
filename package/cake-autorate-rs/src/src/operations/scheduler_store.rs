@@ -69,6 +69,10 @@ impl SchedulerStore {
             l_len: 0,
             l_pid: 0,
         };
+        // SAFETY: fcntl(2) with F_SETLK reads one `struct flock` through the
+        // pointer, which is `record_lock`, a fully initialised local that lives
+        // for the call (the kernel may write the struct back); the descriptor is
+        // the lock file, which `lock` keeps open.
         let status = unsafe {
             libc::fcntl(
                 lock.as_raw_fd(),

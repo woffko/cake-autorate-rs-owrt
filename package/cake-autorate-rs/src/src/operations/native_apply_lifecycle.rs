@@ -22,7 +22,7 @@ use crate::sys;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -861,14 +861,8 @@ fn controller_cmdline_matches(path: &Path, instance: &str) -> Result<bool, Strin
 }
 
 fn open_stable_pidfd(proc_root: &Path, identity: &ProcessIdentity) -> Result<OwnedFd, String> {
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
-    if raw < 0 {
-        return Err(format!(
-            "unable to open pidfd for selected controller: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    let fd = sys::pidfd_open(identity.pid)
+        .map_err(|error| format!("unable to open pidfd for selected controller: {error}"))?;
     if !identity.still_matches(proc_root)? {
         return Err("selected controller identity changed while opening pidfd".to_string());
     }
@@ -890,21 +884,26 @@ fn wait_pidfd(pidfd: &OwnedFd, timeout: Duration) -> Result<(), String> {
             events: libc::POLLIN,
             revents: 0,
         };
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-        if result > 0 && descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            return Ok(());
-        }
-        if result == 0 {
+        let ready = match sys::poll(std::slice::from_mut(&mut descriptor), timeout_ms) {
+            Ok(ready) => ready,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(format!(
+                    "unable to wait for selected controller exit: {error}"
+                ));
+            }
+        };
+        if ready == 0 {
             return Err(
                 "selected controller did not stop before its watchdog deadline".to_string(),
             );
         }
-        if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
+        if descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            return Ok(());
         }
         return Err(format!(
-            "unable to wait for selected controller exit: {}",
-            io::Error::last_os_error()
+            "unable to wait for selected controller exit: unexpected poll events {:#x}",
+            descriptor.revents
         ));
     }
 }

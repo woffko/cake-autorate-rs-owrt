@@ -5,10 +5,11 @@
 //! expose a calendar or safety deadline, but it never manufactures route,
 //! runtime, quiet-window, recovery, or accounting evidence.
 
+use crate::sys;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
@@ -57,22 +58,10 @@ struct WatchedProcess {
 
 impl CalibrationEventLoop {
     pub fn new() -> Result<Self, String> {
-        let inotify = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if inotify < 0 {
-            return Err(format!(
-                "unable to create calibration inotify descriptor: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let inotify = unsafe { OwnedFd::from_raw_fd(inotify) };
-        let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if wake < 0 {
-            return Err(format!(
-                "unable to create calibration wake descriptor: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let wake = unsafe { OwnedFd::from_raw_fd(wake) };
+        let inotify = sys::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC)
+            .map_err(|error| format!("unable to create calibration inotify descriptor: {error}"))?;
+        let wake = sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
+            .map_err(|error| format!("unable to create calibration wake descriptor: {error}"))?;
         ACTIVE_WAKE_FD
             .compare_exchange(
                 NO_WAKE_FD,
@@ -203,18 +192,18 @@ impl CalibrationEventLoop {
                 stale = true;
                 continue;
             }
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0_u32) };
-            if raw < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
+            let pidfd = match sys::pidfd_open(pid) {
+                Ok(pidfd) => pidfd,
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
                     stale = true;
                     continue;
                 }
-                return Err(format!(
-                    "unable to open calibration pidfd for process {pid}: {error}"
-                ));
-            }
-            let pidfd = unsafe { OwnedFd::from_raw_fd(raw as RawFd) };
+                Err(error) => {
+                    return Err(format!(
+                        "unable to open calibration pidfd for process {pid}: {error}"
+                    ));
+                }
+            };
             if !identity.still_matches(proc_root)? {
                 stale = true;
                 continue;
@@ -253,23 +242,16 @@ impl CalibrationEventLoop {
             revents: 0,
         }));
         let timeout_ms = poll_timeout_ms(timeout);
-        let status = unsafe {
-            libc::poll(
-                descriptors.as_mut_ptr(),
-                descriptors.len() as libc::nfds_t,
-                timeout_ms,
-            )
-        };
-        if status < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
+        let status = match sys::poll(&mut descriptors, timeout_ms) {
+            Ok(status) => status,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                 return Ok(EventReadiness {
                     signal: true,
                     ..EventReadiness::default()
                 });
             }
-            return Err(format!("calibration event poll failed: {error}"));
-        }
+            Err(error) => return Err(format!("calibration event poll failed: {error}")),
+        };
         if status == 0 {
             return Ok(EventReadiness {
                 deadline: true,
@@ -302,7 +284,7 @@ impl CalibrationEventLoop {
         };
         let signal = descriptors[2].revents & libc::POLLIN != 0;
         if signal {
-            drain_eventfd(self.wake.as_raw_fd())?;
+            drain_eventfd(&self.wake)?;
         }
         Ok(EventReadiness {
             control: descriptors[0].revents & libc::POLLIN != 0,
@@ -349,53 +331,44 @@ impl CalibrationEventLoop {
         }
         let bytes = std::ffi::CString::new(directory.as_os_str().as_encoded_bytes())
             .map_err(|_| "calibration event path contains NUL".to_string())?;
-        let descriptor = unsafe {
-            libc::inotify_add_watch(
-                self.inotify.as_raw_fd(),
-                bytes.as_ptr(),
-                WATCH_MASK | libc::IN_DONT_FOLLOW | libc::IN_ONLYDIR,
+        sys::inotify_add_watch(
+            &self.inotify,
+            &bytes,
+            WATCH_MASK | libc::IN_DONT_FOLLOW | libc::IN_ONLYDIR,
+        )
+        .map_err(|error| {
+            format!(
+                "unable to watch calibration event directory {}: {error}",
+                directory.display()
             )
-        };
-        if descriptor < 0 {
-            return Err(format!(
-                "unable to watch calibration event directory {}: {}",
-                directory.display(),
-                io::Error::last_os_error()
-            ));
-        }
-        Ok(descriptor)
+        })
     }
 
     fn drain_inotify(&mut self) -> Result<bool, String> {
         let mut buffer = vec![0_u8; INOTIFY_BUFFER_BYTES];
         let mut relevant = false;
         loop {
-            let count = unsafe {
-                libc::read(
-                    self.inotify.as_raw_fd(),
-                    buffer.as_mut_ptr().cast::<libc::c_void>(),
-                    buffer.len(),
-                )
+            let count = match sys::read(&self.inotify, &mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(relevant),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "unable to drain calibration filesystem events: {error}"
+                    ));
+                }
             };
-            if count < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    return Ok(relevant);
-                }
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(format!(
-                    "unable to drain calibration filesystem events: {error}"
-                ));
-            }
             if count == 0 {
                 return Err("calibration inotify descriptor reached unexpected EOF".to_string());
             }
-            let count = usize::try_from(count)
-                .map_err(|_| "calibration filesystem event count is invalid".to_string())?;
             let mut offset = 0_usize;
             while offset + std::mem::size_of::<libc::inotify_event>() <= count {
+                // SAFETY: the loop condition above guarantees that `offset` plus
+                // the size of an inotify_event is at most `count`, the number of
+                // bytes the kernel wrote into `buffer` (which is at least that
+                // long), so all the bytes read are initialised and inside the
+                // buffer. The event is plain integers and the read is unaligned
+                // because records follow each other at arbitrary byte offsets.
                 let event = unsafe {
                     std::ptr::read_unaligned(
                         buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
@@ -455,14 +428,16 @@ pub fn wake_from_signal() {
     if descriptor == NO_WAKE_FD {
         return;
     }
-    let value = 1_u64;
-    unsafe {
-        libc::write(
-            descriptor,
-            (&value as *const u64).cast::<libc::c_void>(),
-            std::mem::size_of::<u64>(),
-        );
-    }
+    // SAFETY: the number is the eventfd of the live event loop: `new` stores it
+    // and `Drop` clears it before the descriptor is closed at the end of the
+    // loop's life. A signal that lands in the instant between that clearing and
+    // the close can find a descriptor number that is about to be closed; the
+    // write is then refused, or at worst hits a descriptor that was reused in
+    // that instant, and the process is shutting down at that point.
+    let wake = unsafe { BorrowedFd::borrow_raw(descriptor) };
+    // Async-signal-safe: write(2) on an eventfd, no allocation, no lock. The
+    // result is ignored; a full counter already means "wake up".
+    let _ = sys::write_u64(wake, 1);
 }
 
 extern "C" fn handle_child_signal(_: libc::c_int) {
@@ -474,15 +449,15 @@ extern "C" fn handle_child_signal(_: libc::c_int) {
 }
 
 pub fn install_child_signal_handler() -> Result<(), String> {
-    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    let mut action = sys::zeroed::<libc::sigaction>();
     action.sa_sigaction = handle_child_signal as *const () as usize;
     action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
-    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
-        return Err(format!(
-            "unable to initialize SIGCHLD mask: {}",
-            io::Error::last_os_error()
-        ));
-    }
+    action.sa_mask = sys::signal_set(&[])
+        .map_err(|error| format!("unable to initialize SIGCHLD mask: {error}"))?;
+    // SAFETY: `action` is a fully initialised sigaction that lives for the call
+    // (zeroed, then handler, flags and an empty mask). The handler
+    // `handle_child_signal` has an empty body, so it is async-signal-safe. The
+    // previous action is not wanted, which a null pointer says.
     if unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } != 0 {
         return Err(format!(
             "unable to install calibration SIGCHLD handler: {}",
@@ -503,30 +478,17 @@ fn poll_timeout_ms(timeout: Option<Duration>) -> libc::c_int {
     i32::try_from(millis).unwrap_or(i32::MAX)
 }
 
-fn drain_eventfd(descriptor: RawFd) -> Result<(), String> {
+fn drain_eventfd(descriptor: &OwnedFd) -> Result<(), String> {
     loop {
-        let mut value = 0_u64;
-        let count = unsafe {
-            libc::read(
-                descriptor,
-                (&mut value as *mut u64).cast::<libc::c_void>(),
-                std::mem::size_of::<u64>(),
-            )
-        };
-        if count == std::mem::size_of::<u64>() as isize {
-            continue;
-        }
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::WouldBlock {
-                return Ok(());
+        match sys::read_u64(descriptor) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                return Err("calibration wake descriptor returned an invalid record".to_string())
             }
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(format!("unable to drain calibration wake events: {error}"));
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("unable to drain calibration wake events: {error}")),
         }
-        return Err("calibration wake descriptor returned an invalid record".to_string());
     }
 }
 

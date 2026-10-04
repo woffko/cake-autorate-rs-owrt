@@ -14,6 +14,9 @@
 //! else can overwrite `errno`. Functions that return an `OwnedFd` hand over a
 //! descriptor that nothing else owns.
 
+// Some wrappers are used by the Full build only.
+#![cfg_attr(not(feature = "calibration"), allow(dead_code))]
+
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -67,9 +70,7 @@ pub(crate) fn process_id() -> libc::pid_t {
     unsafe { libc::getpid() }
 }
 
-/// The process id of the caller's parent. It is usable in a `pre_exec` closure:
-/// it is a plain system call.
-#[cfg(feature = "calibration")]
+/// The process id of the caller's parent.
 pub(crate) fn parent_process_id() -> libc::pid_t {
     // SAFETY: getppid(2) takes no argument, reads and writes no memory and
     // cannot fail.
@@ -93,8 +94,12 @@ pub(crate) fn flock(file: impl AsFd, operation: libc::c_int) -> io::Result<()> {
     check(unsafe { libc::flock(file.as_fd().as_raw_fd(), operation) })
 }
 
-/// A pidfd for process `pid`: readable once the process has exited.
-pub(crate) fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
+/// A pidfd for process `pid`: readable once the process has exited. A number
+/// that is not a process id at all is `EINVAL`, as the kernel answers it.
+pub(crate) fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    };
     // SAFETY: pidfd_open(2), made through syscall(2), takes a process id and a
     // flags word (none). It reads and writes no memory.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -486,14 +491,16 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as libc::pid_t;
-        let pidfd = pidfd_open(pid).unwrap();
+        let pidfd = pidfd_open(pid as u32).unwrap();
         assert!(!readable(&pidfd, 0));
         kill(pid, libc::SIGKILL).unwrap();
         assert!(readable(&pidfd, 5_000));
         let status = child.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
-        let gone = pidfd_open(pid).unwrap_err();
+        let gone = pidfd_open(pid as u32).unwrap_err();
         assert_eq!(gone.raw_os_error(), Some(libc::ESRCH));
+        let invalid = pidfd_open(u32::MAX).unwrap_err();
+        assert_eq!(invalid.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]
@@ -571,14 +578,11 @@ mod tests {
     #[test]
     fn poll_times_out_and_reports_a_hung_up_pipe() {
         let mut ends = [0 as libc::c_int; 2];
-        // The only direct libc call of the tests: the standard library has no
-        // plain pipe.
+        // The standard library has no plain pipe.
         // SAFETY: pipe2(2) writes two descriptors into the array, which has room
         // for them; both are adopted at once.
-        assert_eq!(
-            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
-            0
-        );
+        let created = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(created, 0);
         let reader = adopt(ends[0]).unwrap();
         let writer = adopt(ends[1]).unwrap();
         let mut set = [libc::pollfd {

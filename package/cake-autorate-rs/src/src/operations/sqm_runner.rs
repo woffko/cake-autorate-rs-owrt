@@ -11,7 +11,7 @@ use crate::config_candidate::digest;
 use crate::sys;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
@@ -321,11 +321,9 @@ impl Runner<'_> {
         // or executable to a later operation's crash-artifact cleanup.
         let alias_lock = self.config.retain_alias_lease()?;
         fn high_fd(file: &File) -> Result<File> {
-            let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
-            if fd < 0 {
-                return Err("isolated-sqm-runner-lease-dup-failed".into());
-            }
-            Ok(unsafe { File::from_raw_fd(fd) })
+            sys::duplicate_from(file.as_raw_fd(), 64)
+                .map(File::from)
+                .map_err(|_| "isolated-sqm-runner-lease-dup-failed".into())
         }
         let alias_lock = high_fd(&alias_lock)?;
         let runner_lock = high_fd(&self.lock)?;
@@ -335,15 +333,24 @@ impl Runner<'_> {
             Duration::from_secs(30),
             16 * 1024,
             &should_cancel,
-            |command| unsafe {
-                command.pre_exec(move || {
-                    if libc::dup2(alias_lock.as_raw_fd(), 6) < 0
-                        || libc::dup2(runner_lock.as_raw_fd(), 7) < 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+            |command| {
+                // SAFETY: the closure runs in the forked child before exec, where
+                // only async-signal-safe calls are allowed. It makes two dup2(2)
+                // calls, plain system calls that allocate nothing and take no
+                // lock, on descriptors whose numbers it captured: the two lease
+                // files, which stay open in the parent (the closure owns them)
+                // until the command has been spawned. It returns the OS error as
+                // `last_os_error()`, which does not allocate either.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::dup2(alias_lock.as_raw_fd(), 6) < 0
+                            || libc::dup2(runner_lock.as_raw_fd(), 7) < 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
             },
         )
         .map_err(|error| {
@@ -519,7 +526,10 @@ mod tests {
         let fixture = Fixture::new();
         let fifo = fixture.root.join("continue");
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // SAFETY: mkfifo(3) reads the NUL-terminated path that `c_path` owns and
+        // takes a mode; it writes no memory.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(made, 0);
         let mut gate = OpenOptions::new()
             .read(true)
             .write(true)
@@ -546,9 +556,7 @@ mod tests {
             .trim()
             .parse::<libc::pid_t>()
             .unwrap();
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        assert!(pidfd >= 0);
-        let pidfd = unsafe { File::from_raw_fd(pidfd as i32) };
+        let pidfd = sys::pidfd_open(pid as u32).unwrap();
         let busy = ensure_idle(&fixture.run);
         let aliases = CommittedSnapshot::capture_fixture(&fixture.config, &fixture.run, |_| {
             panic!("live alias lease must reject before query")
@@ -560,7 +568,7 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(unsafe { libc::poll(&mut poll, 1, 2000) }, 1);
+        assert_eq!(sys::poll(std::slice::from_mut(&mut poll), 2000).unwrap(), 1);
         assert_eq!(busy.err().unwrap(), BUSY);
         assert_eq!(aliases.err().unwrap(), "committed-uci-workspace-busy");
         ensure_idle(&fixture.run).unwrap();

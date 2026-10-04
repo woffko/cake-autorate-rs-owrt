@@ -4,9 +4,9 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 #[cfg(feature = "calibration")]
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -113,16 +113,17 @@ extern "C" fn handle_signal(_: i32) {
 }
 
 fn install_signal_handlers() {
+    let handler = handle_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: signal(3) takes a signal number and the address of `handle_signal`,
+    // an `extern "C"` function that is async-signal-safe: it stores to an atomic
+    // flag and calls `wake_from_signal`, which loads an atomic and makes one
+    // write(2) on an eventfd; it allocates nothing, takes no lock and calls no
+    // other libc function. The previous handlers are not needed, so the return
+    // values are ignored.
     unsafe {
-        signal(2, handle_signal);
-        signal(15, handle_signal);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
     }
-}
-
-extern "C" {
-    fn signal(signum: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
-    #[cfg(test)]
-    fn kill(pid: i32, signal: i32) -> i32;
 }
 
 #[derive(Clone, Debug)]
@@ -3323,10 +3324,8 @@ impl SqmRecoveryError {
 
 #[cfg(test)]
 fn terminate_helper_process_group(child: &mut Child) {
-    let process_group = -(child.id() as i32);
-    unsafe {
-        kill(process_group, 15);
-    }
+    let process_group = child.id() as i32;
+    let _ = sys::kill_process_group(process_group, libc::SIGTERM);
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
         match child.try_wait() {
@@ -3335,9 +3334,7 @@ fn terminate_helper_process_group(child: &mut Child) {
             Err(_) => break,
         }
     }
-    unsafe {
-        kill(process_group, 9);
-    }
+    let _ = sys::kill_process_group(process_group, libc::SIGKILL);
     let _ = child.wait();
 }
 
@@ -12109,16 +12106,16 @@ impl PingerRuntime {
         let child = command
             .spawn()
             .map_err(|error| format!("failed to start bootstrap fping: {error}"))?;
-        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if raw_wake < 0 {
-            let mut child = child;
-            stop_child(&mut child);
-            return Err(format!(
-                "failed to create bootstrap pinger wake descriptor: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        let wake = match sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) {
+            Ok(wake) => Arc::new(wake),
+            Err(error) => {
+                let mut child = child;
+                stop_child(&mut child);
+                return Err(format!(
+                    "failed to create bootstrap pinger wake descriptor: {error}"
+                ));
+            }
+        };
         Self::from_children(
             vec![child],
             policy.pinger_method().to_string(),
@@ -12214,28 +12211,17 @@ impl PingerRuntime {
             return Ok(());
         };
         loop {
-            let mut value = 0_u64;
-            let read = unsafe {
-                libc::read(
-                    wake.as_raw_fd(),
-                    (&mut value as *mut u64).cast::<libc::c_void>(),
-                    std::mem::size_of::<u64>(),
-                )
-            };
-            if read == std::mem::size_of::<u64>() as isize {
-                continue;
-            }
-            if read < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    return Ok(());
+            match sys::read_u64(wake) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {
+                    return Err("bootstrap pinger wake descriptor returned a short read".to_string())
                 }
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(format!("failed to drain bootstrap pinger wake: {error}"))
                 }
-                return Err(format!("failed to drain bootstrap pinger wake: {error}"));
             }
-            return Err("bootstrap pinger wake descriptor returned a short read".to_string());
         }
     }
 
@@ -12267,14 +12253,7 @@ fn notify_pinger_wake(wake: Option<&OwnedFd>) {
     let Some(wake) = wake else {
         return;
     };
-    let value = 1_u64;
-    let _ = unsafe {
-        libc::write(
-            wake.as_raw_fd(),
-            (&value as *const u64).cast::<libc::c_void>(),
-            std::mem::size_of::<u64>(),
-        )
-    };
+    let _ = sys::write_u64(wake, 1);
 }
 
 fn spawn_pingers(

@@ -10,7 +10,6 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -2285,14 +2284,7 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    sys::lead_new_session(&mut command);
     let mut child = command.spawn().map_err(|error| {
         NativeSqmAttestationError::failed(format!(
             "unable to execute {}: {error}",
@@ -2350,9 +2342,8 @@ where
 
 fn kill_command_group(child: &mut std::process::Child) {
     if let Ok(group) = i32::try_from(child.id()) {
-        if group > 1 {
-            let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
-        }
+        // Groups of 1 and below are refused by the wrapper.
+        let _ = sys::kill_process_group(group, libc::SIGKILL);
     }
     let _ = child.kill();
     let _ = child.wait();

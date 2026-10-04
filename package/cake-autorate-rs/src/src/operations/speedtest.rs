@@ -26,6 +26,7 @@ use crate::owned_route_rules::{
 #[cfg(test)]
 use crate::owned_route_rules::{nft_egress_guard_batch, nft_owned_route_pin_batch};
 use crate::routing::{inspect_route, RouteIdentity, RouteSnapshot, RouteSpec};
+use crate::sys;
 use crate::Config;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -77,8 +78,6 @@ const MAX_UPLOAD_COUNTER_LAG_PERCENT: u128 = 5;
 const MIN_QUALIFICATION_COUNTER_CONFIDENCE_PERCENT: u128 = 80;
 const MIN_SHAPED_UPLOAD_PAYLOAD_WIRE_PERCENT: u128 = 60;
 const MAX_QUALIFICATION_DIAGNOSTIC_BYTES: usize = 1024;
-const SIGKILL: i32 = 9;
-const PR_SET_PDEATHSIG: i32 = 1;
 
 pub(crate) const SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED: &str = "speedtest-traffic-budget-exhausted";
 pub(crate) const SPEEDTEST_TRAFFIC_LIMIT_REACHED: &str = "speedtest-traffic-limit-reached";
@@ -190,21 +189,6 @@ pub(crate) fn minimum_full_autotune_traffic_budget_bytes(
         SpeedtestDirection::Both,
         traffic_stop_safety_reserve_bytes(download_bound_kbps, upload_bound_kbps),
     )
-}
-
-extern "C" {
-    fn kill(pid: i32, signal: i32) -> i32;
-    fn setgroups(size: usize, groups: *const u32) -> i32;
-    fn setresgid(real: u32, effective: u32, saved: u32) -> i32;
-    fn setresuid(real: u32, effective: u32, saved: u32) -> i32;
-    fn getppid() -> i32;
-    fn prctl(
-        option: i32,
-        argument2: usize,
-        argument3: usize,
-        argument4: usize,
-        argument5: usize,
-    ) -> i32;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1601,36 +1585,57 @@ impl BackendChild {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        // SAFETY: the closure runs in the forked child before exec, where only
+        // async-signal-safe calls are allowed. It makes five plain system calls
+        // (setgroups, setresgid, setresuid, prctl, getppid) on integers, one
+        // null pointer and the child's own state; the child has a single thread,
+        // so the set*id calls have nothing to synchronise with, and none of the
+        // calls allocates or takes a lock. Every error it returns is an OS error
+        // number (`last_os_error`, `from_raw_os_error`), which carries no heap
+        // data, so no allocation happens after fork. The closure owns copies of
+        // `credentials` (two integers) and `expected_parent`; nothing is shared
+        // with the parent.
         unsafe {
             command.pre_exec(move || {
-                if setgroups(0, std::ptr::null()) != 0 {
+                if libc::setgroups(0, std::ptr::null()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if setresgid(credentials.gid, credentials.gid, credentials.gid) != 0 {
+                if libc::setresgid(credentials.gid, credentials.gid, credentials.gid) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if setresuid(credentials.uid, credentials.uid, credentials.uid) != 0 {
+                if libc::setresuid(credentials.uid, credentials.uid, credentials.uid) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 // Linux clears PDEATHSIG when effective credentials change, so
                 // arm it only after the complete privilege drop. The parent
                 // check then closes the race in which the worker disappeared
                 // before prctl could bind the backend lifecycle to it.
-                if prctl(PR_SET_PDEATHSIG, SIGKILL as usize, 0, 0, 0) != 0 {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
-                if getppid() != i32::try_from(expected_parent).unwrap_or(-1) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "speedtest worker disappeared before backend exec",
-                    ));
+                if libc::getppid() != i32::try_from(expected_parent).unwrap_or(-1) {
+                    // No allocation after fork: an OS error code, which the
+                    // parent turns into the reason below.
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
                 }
                 Ok(())
             });
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("speedtest-backend-spawn-failed: {error}"))?;
+        let mut child = command.spawn().map_err(|error| {
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                "speedtest-backend-spawn-failed: the speedtest worker disappeared before the backend started"
+                    .to_string()
+            } else {
+                format!("speedtest-backend-spawn-failed: {error}")
+            }
+        })?;
         let identity = match ProcessIdentity::inspect(Path::new(DEFAULT_PROC_ROOT), child.id()) {
             Ok(identity) => identity,
             Err(error) => {
@@ -1664,7 +1669,7 @@ impl BackendChild {
         if self.identity.still_matches(Path::new(DEFAULT_PROC_ROOT))? {
             let pid = i32::try_from(self.identity.pid)
                 .map_err(|_| "speedtest-backend-pid-out-of-range".to_string())?;
-            if unsafe { kill(pid, SIGKILL) } != 0 {
+            if sys::kill(pid, libc::SIGKILL).is_err() {
                 return Err("speedtest-backend-kill-failed".to_string());
             }
         }
@@ -1686,7 +1691,7 @@ impl Drop for BackendChild {
             .unwrap_or(false)
         {
             if let Ok(pid) = i32::try_from(self.identity.pid) {
-                let _ = unsafe { kill(pid, SIGKILL) };
+                let _ = sys::kill(pid, libc::SIGKILL);
             }
         }
         let _ = self.child.wait();
