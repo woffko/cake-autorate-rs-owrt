@@ -547,3 +547,131 @@ process whose parent is the controller would remove the first cause.
   constants.
 - Lite and the physical routers were not run for these changes beyond the source
   gate and the package checks.
+
+## Changes after RC27 r320/r128: speedtest-go r6 (unreleased)
+
+These results cover the commit that gives the `speedtest-go` backend the TLS
+defaults of current Go and builds it as a position-independent executable
+(revision 6), and that raises the backend floor of the Full daemon package to
+`speedtest-go >= 1.7.10-r6`. No daemon source changed.
+
+### Source gate and packages
+
+- Source gate, 57 commands: Full (1,827) and Lite (407) Rust tests, formatting,
+  clippy with undocumented unsafe blocks denied, LuCI JavaScript tests,
+  TypeScript checks and real-UCI tests, and a hash of 236 sources (the new patch
+  is one of them) before and after the run, which did not change.
+- Backend: all twelve ABIs were built from the repository recipe in a clean
+  OpenWrt 25.12 SDK copy each (`tools/release-backend-matrix.py`). Every build
+  runs the package tests offline with the race detector (`go test -race -run
+  '^TestCake' -count=5`, which includes the six new TLS tests), and every APK is
+  verified for payload, metadata and ELF interpreter and ABI. For revision 6 the
+  verification also reads the Go build information of the shipped binary: the
+  seven settings must have their modern values (`tls3des=0`, `tlsrsakex=0`,
+  `tlssha1=0`, `tlsunsafeekm=0`, `rsa1024min=1`, `x509negativeserial=0`,
+  `tls10server=0`) and the ELF type must be `DYN` where Go can build a PIE and
+  `EXEC` where it cannot. All twelve passed. The SDK build logs of `mips_24kc`
+  and `mipsel_24kc` show the warning `PIE buildmode is not supported for
+  linux/mips`; the other ten built with `-buildmode=pie`.
+- Daemon: the Full and Lite packages for x86_64 and aarch64_cortex-a76 were
+  built from the same gate. The Full metadata depends on
+  `speedtest-go>=1.7.10-r6`, Lite has no backend dependency, and both rustc
+  invocations of every build use `-C overflow-checks=on`.
+
+| ABI | ELF type | binary r5 -> r6 | APK r5 -> r6 |
+|---|---|---:|---:|
+| x86_64 | DYN (PIE) | +20 KB (+0.2 %) | +6 KB (+0.2 %) |
+| aarch64 (4 ABIs) | DYN (PIE) | +12 KB (+0.1 %) | +6..7 KB (+0.2 %) |
+| arm (5 ABIs) | DYN (PIE) | +0.53 MB (+6.3 %) | +165 KB (+4.9 %) |
+| mips_24kc, mipsel_24kc | EXEC | unchanged | unchanged |
+
+The binaries are 8.1 to 9.6 MB, the APKs 3.2 to 3.6 MB. On 32-bit ARM the growth
+comes from the relocations a PIE needs (`.rel.dyn` of `arm_cortex-a9` goes from
+8 bytes to 283 KB) and from larger position-independent code (`.text` grows by
+235 KiB).
+
+### What changed
+
+- Patch 130 adds `cake_godebug.go` to the main package with one `//go:debug`
+  line for each of the seven settings, which the module's `go 1.19` line would
+  otherwise leave at their old values. The go command checks the directives when
+  the program is built, so a later toolchain that no longer knows a setting
+  breaks the build instead of ignoring the line. All other defaults of `go 1.19`
+  are unchanged on purpose, among them `httplaxcontentlength=1` and the two
+  settings that keep the hybrid post-quantum key exchange off (`tlsmlkem=0`,
+  `tlssecpmlkem=0`).
+- `cake_godebug_test.go` runs real handshakes over an in-memory pipe: a server
+  with only an RSA key exchange suite and a server with only a 3DES suite must be
+  refused, a TLS 1.0 client must be refused by a default server, TLS 1.2 and 1.3
+  must still work, a 512-bit RSA key must be refused, and a certificate whose
+  serial number is made negative must not parse. With the directive file removed,
+  five of the six tests fail (the sixth, TLS 1.2 and 1.3 still working, is the
+  control).
+- `PKG_ASLR_PIE_REGULAR:=1` in the recipe; `PKG_RELEASE:=6`; the Full package
+  requires `speedtest-go (>=1.7.10-r6)`; the package test, the backend README and
+  the main README follow.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+The VM runs the daemon of the previous goal (`99062905…`) throughout; only the
+backend changed. Backends were installed with `apk add --allow-untrusted` of the
+verified APK (`tools/goal-b-vm-backend.py`); every install was a single-package
+transaction, the installed binary was compared with the verified payload, and the
+hashes of the daemon and of the four configuration files and the boot ID were
+the same before and after.
+
+- Dependency floor, `apk add --simulate` with the Full daemon APK from the gate
+  above: with r4 installed the daemon alone is refused (`speedtest-go-1.7.10-r4
+  breaks cake-autorate-rs-1.0_rc27-r320[speedtest-go>=1.7.10-r6]`); with r5
+  installed the daemon alone and the daemon together with the r5 APK are both
+  refused; with r5 installed the daemon together with the r6 APK is accepted and
+  touches exactly the two packages; with r6 installed the daemon alone is
+  accepted. None of the simulations changed the installed state.
+- Server list: `speedtest-go --list` three times with r5 and three times with
+  r6 returned the same 20 servers in 0.9 to 1.1 s without an error. The list is
+  fetched from speedtest.net over HTTPS, so this is the TLS client of the
+  installed binary.
+- Servers of the list, probed from the build host with a small Go program built
+  by the same Go 1.26.7 (so the same TLS code, run once with the defaults of
+  current Go and once with the old defaults restored through `GODEBUG`:
+  `tls3des=1,tlsrsakex=1,tlssha1=1,tlsunsafeekm=1,rsa1024min=0,
+  x509negativeserial=1,tls10server=1`). The list names plain HTTP URLs on port
+  8080, but 11 of the 20 servers answer with a redirect to HTTPS, and all 11
+  negotiate TLS 1.3 (`TLS_AES_128_GCM_SHA256`), as do `www.speedtest.net` and
+  `speedtest-config.php`. Two runs of each kind gave the same status for every
+  server (a first, unsaved run saw one server reset the connection over plain
+  HTTP, before any TLS). So no server of the list needs a TLS feature that r6
+  turned off.
+- Speed Test (capped at 150 MB, current topology, through the daemon, no clock
+  steps), Tallinn #17372 except where noted. Kilobits per second, download /
+  upload:
+
+| backend | runs |
+|---|---|
+| r4 (before this work, same day) | 10,525 / 20,189 |
+| r5 | 10,496 / 19,889; 9,653 / 20,212; 6,235 / 12,660 (slow minute, 42.9 s) |
+| r6 | 9,729 / 20,234; 9,792 / 20,010; 9,758 / 20,047; 9,773 / 19,848 (server #37193) |
+
+  All completed in 23 to 25 s (the slow r5 run took 43 s), and the job logs of
+  the first r5 run and the first r6 run are empty. Server #37193 is one of the
+  11 that redirect to HTTPS. The first r5 run was 7 % faster than the next r6
+  runs, so r5 was installed again and measured: it gave 9,653 / 20,212, the same
+  as r6, so the difference came from the path and not from the backend. The link
+  varies by that much from one minute to the next.
+- r6 is installed on the VM now; the service and NTP are running.
+
+### Known limits
+
+- `mips_24kc` and `mipsel_24kc` stay non-PIE: Go does not support `-buildmode=pie`
+  there.
+- The new tests drive five of the seven settings. `tlssha1` and `tlsunsafeekm`
+  have no behavioural test; they are covered by the build-information check of
+  every shipped binary only. The comment in `cake_godebug.go` and the backend
+  README say that the tests fail when a weak default comes back, which is true
+  for those five.
+- Only the x86_64 binary was run (on the VM). The ARM, AArch64 and MIPS binaries
+  were built and inspected, not executed.
+- A server that redirects to a host which offers nothing but RSA key exchange,
+  3DES or SHA-1 signatures would now fail where r5 succeeded. None of the 20
+  servers of the list the VM sees do; other locations and later lists were not
+  checked.
