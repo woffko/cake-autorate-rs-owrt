@@ -635,6 +635,21 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_exec_os_error_reaches_the_parent_as_the_same_error_number() {
+        // The speed-test backend reports "the worker is gone" from its pre_exec
+        // closure as ESRCH, without allocating after fork, and the parent maps
+        // that number to a reason. This is the contract that relies on.
+        let mut command = Command::new("true");
+        // SAFETY: the closure returns at once without making any call or
+        // allocating, so it is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| Err(io::Error::from_raw_os_error(libc::ESRCH)));
+        }
+        let error = command.spawn().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
     fn set_nonblocking_makes_an_empty_pipe_report_would_block() {
         let mut child = Command::new("sleep")
             .arg("30")

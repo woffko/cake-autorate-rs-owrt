@@ -1566,6 +1566,17 @@ impl Drop for NftRoutePin {
     }
 }
 
+/// Why the backend could not be started. The `pre_exec` closure reports "the
+/// worker is gone" as ESRCH, because it must not allocate a message after fork.
+fn backend_spawn_error(error: &std::io::Error) -> String {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        "speedtest-backend-spawn-failed: the speedtest worker disappeared before the backend started"
+            .to_string()
+    } else {
+        format!("speedtest-backend-spawn-failed: {error}")
+    }
+}
+
 impl BackendChild {
     fn spawn(
         arguments: &[String],
@@ -1628,14 +1639,9 @@ impl BackendChild {
                 Ok(())
             });
         }
-        let mut child = command.spawn().map_err(|error| {
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                "speedtest-backend-spawn-failed: the speedtest worker disappeared before the backend started"
-                    .to_string()
-            } else {
-                format!("speedtest-backend-spawn-failed: {error}")
-            }
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| backend_spawn_error(&error))?;
         let identity = match ProcessIdentity::inspect(Path::new(DEFAULT_PROC_ROOT), child.id()) {
             Ok(identity) => identity,
             Err(error) => {
@@ -5428,6 +5434,19 @@ fn hex_decode(value: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_backend_that_lost_its_worker_says_so_and_other_errors_keep_their_text() {
+        let gone = std::io::Error::from_raw_os_error(libc::ESRCH);
+        let message = super::backend_spawn_error(&gone);
+        assert!(message.starts_with("speedtest-backend-spawn-failed: "));
+        assert!(message.contains("worker disappeared"));
+        let refused = std::io::Error::from_raw_os_error(libc::EPERM);
+        let message = super::backend_spawn_error(&refused);
+        assert!(message.starts_with("speedtest-backend-spawn-failed: "));
+        assert!(message.contains(&refused.to_string()));
+        assert!(!message.contains("disappeared"));
+    }
 
     #[test]
     fn r6_export_egress_guard_for_isolated_kernel_test() {
