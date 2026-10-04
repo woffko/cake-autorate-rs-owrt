@@ -10,6 +10,7 @@ use super::{
     },
     scheduler_runtime::attest_no_competing_calibration_processes,
 };
+use crate::sys;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -96,7 +97,7 @@ pub(crate) fn run_calibration_service<I>(mut args: I) -> Result<String, String>
 where
     I: Iterator<Item = String>,
 {
-    if unsafe { libc::geteuid() } != 0 {
+    if sys::effective_uid() != 0 {
         return Err("calibration service lifecycle requires root".to_string());
     }
     let operation = args.next();

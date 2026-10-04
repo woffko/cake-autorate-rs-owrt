@@ -59,6 +59,7 @@ use crate::autotune::{
     ValidationResult, ValidationThresholds, MAX_PROFILE_REVIEW_OPTIONS,
     MAX_PROFILE_SEARCH_OBSERVATIONS, MAX_RATE_KBPS,
 };
+use crate::sys;
 use crate::transport_quality::classify_quality;
 use crate::Config;
 use std::fs::{self, File, OpenOptions};
@@ -198,11 +199,6 @@ pub(crate) fn native_autotune_runtime_permit_policy(
         download_bounds: bounds(request.service_dl_cap_kbps, "download")?,
         upload_bounds: bounds(request.service_ul_cap_kbps, "upload")?,
     })
-}
-
-unsafe extern "C" {
-    fn geteuid() -> u32;
-    fn getpid() -> i32;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4758,8 +4754,7 @@ fn ensure_private_regular(path: &Path) -> Result<(), String> {
 }
 
 fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no arguments or memory side effects.
-    unsafe { geteuid() }
+    sys::effective_uid()
 }
 
 fn evidence_name(sequence: u32) -> Result<String, String> {
@@ -19457,7 +19452,7 @@ fn wait_for_runtime_permit(
     worker_run_id: &str,
     terminate: &AtomicBool,
 ) -> Result<Option<super::autotune_runtime::AutotuneRuntimePermit>, String> {
-    let raw_pid = unsafe { getpid() };
+    let raw_pid = sys::process_id();
     let pid = u32::try_from(raw_pid).map_err(|_| "Auto-Tune worker PID is invalid".to_string())?;
     let worker = ProcessIdentity::inspect(Path::new("/proc"), pid)?;
     let boot_id = read_kernel_uuid(Path::new(DEFAULT_BOOT_ID_PATH), "boot ID")?;

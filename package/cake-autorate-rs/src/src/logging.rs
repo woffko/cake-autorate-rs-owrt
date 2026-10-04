@@ -1,9 +1,9 @@
 //! Bounded daemon logs: one active file, one previous file, no child processes.
 //! A stable private advisory lock serializes the reserved sibling namespace.
 //! Existing timestamp archives are retired incrementally, never by a glob rm.
+use crate::sys;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ fn sibling(path: &Path, suffix: &str) -> io::Result<PathBuf> {
 fn owned_regular(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file()
         && metadata.nlink() == 1
-        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.uid() == sys::effective_uid()
 }
 
 fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
@@ -204,7 +204,7 @@ impl LogFile {
         let parent = fs::canonicalize(path.parent().unwrap_or_else(|| Path::new(".")))?;
         let directory = fs::symlink_metadata(&parent)?;
         if !directory.is_dir()
-            || directory.uid() != unsafe { libc::geteuid() }
+            || directory.uid() != sys::effective_uid()
             || directory.mode() & 0o022 != 0
         {
             return Err(invalid(
@@ -219,9 +219,7 @@ impl LogFile {
         if lock.metadata()?.len() != 0 {
             return Err(invalid("nonempty file occupies log lock path"));
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB)?;
         lock.set_permissions(fs::Permissions::from_mode(0o600))?;
         let previous = sibling(&path, ".old")?;
         let temporary = sibling(&path, ".tmp")?;

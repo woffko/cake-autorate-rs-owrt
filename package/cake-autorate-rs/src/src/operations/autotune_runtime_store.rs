@@ -7,6 +7,7 @@ use super::autotune_runtime::{
 };
 use super::full_autotune::{AutotuneRuntimeAck, AutotuneRuntimeControl, MeasurementTopology};
 use super::identity::ProcessIdentity;
+use crate::sys;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -35,11 +36,6 @@ const ABSENT_CHECKPOINT_HEADER: &str = "cake-autorate-autotune-runtime-checkpoin
 const NAMESPACE_CHECKPOINT_HEADER: &str = "cake-autorate-autotune-runtime-checkpoint\t4";
 const EXECUTABLE_ABSENT_CHECKPOINT_HEADER: &str = "cake-autorate-autotune-runtime-checkpoint\t5";
 static TEMP_SEQUENCE: AtomicU32 = AtomicU32::new(1);
-
-unsafe extern "C" {
-    fn geteuid() -> u32;
-    fn getpid() -> i32;
-}
 
 impl AutotuneRuntimePermit {
     pub fn encode(&self) -> Result<String, String> {
@@ -1519,7 +1515,7 @@ fn atomic_write(root: &Path, name: &str, contents: &str) -> Result<(), String> {
         return Err("runtime record exceeds its size bound".to_string());
     }
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let pid = unsafe { getpid() };
+    let pid = sys::process_id();
     let temp_name = format!(".tmp-{pid}-{sequence}");
     let temp_path = root.join(&temp_name);
     let final_path = root.join(name);
@@ -1625,7 +1621,7 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn effective_uid() -> u32 {
-    unsafe { geteuid() }
+    sys::effective_uid()
 }
 
 fn parse_u64(name: &str, value: &str) -> Result<u64, String> {

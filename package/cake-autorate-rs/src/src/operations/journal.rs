@@ -2,6 +2,7 @@ use super::deadline::{self, DeadlineAnchor, OperationDeadline};
 use super::identity::{monotonic_boot_ms, CoordinatorIdentity, ProcessIdentity};
 use super::protocol::{OperationRequest, OperationState, MAX_OPERATION_RECORD_BYTES};
 use super::state;
+use crate::sys;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -1337,7 +1338,7 @@ fn ensure_secure_dir(path: &Path) -> Result<(), String> {
         Ok(metadata) => {
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
-                || metadata.uid() != unsafe { geteuid() }
+                || metadata.uid() != sys::effective_uid()
             {
                 return Err(format!("{} is not a secure directory", path.display()));
             }
@@ -1363,7 +1364,7 @@ fn secure_existing_job_dir(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("unable to inspect job journal directory: {error}"))?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.mode() & 0o077 != 0
     {
         return Err("job journal directory is unsafe or foreign-owned".to_string());
@@ -1413,7 +1414,7 @@ fn read_bounded(path: &Path) -> Result<String, String> {
         .map_err(|error| format!("unable to inspect {}: {error}", path.display()))?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { geteuid() }
+        || metadata.uid() != sys::effective_uid()
     {
         return Err(format!("{} is unsafe or foreign-owned", path.display()));
     }
@@ -1504,10 +1505,6 @@ fn require_identifier(name: &str, value: &str, extra: &[u8]) -> Result<(), Strin
     Ok(())
 }
 
-extern "C" {
-    fn geteuid() -> u32;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1589,7 +1586,7 @@ mod tests {
     }
 
     fn temp_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("cake-journal-{}-{name}", unsafe { geteuid() }))
+        std::env::temp_dir().join(format!("cake-journal-{}-{name}", sys::effective_uid()))
     }
 
     #[test]

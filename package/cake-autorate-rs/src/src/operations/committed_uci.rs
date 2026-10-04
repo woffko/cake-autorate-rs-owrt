@@ -4,11 +4,11 @@
 use super::process::{run_bounded_command_output, SpawnSpec};
 use super::runtime_health::UciPackage;
 use super::uci_edits::{self, Edit};
+use crate::sys;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -58,7 +58,7 @@ pub(super) fn file_identity(path: &Path, file: &File, private: bool) -> Result<I
     let opened = io(file.metadata())?;
     for meta in [&named, &opened] {
         if !meta.is_file()
-            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.uid() != sys::effective_uid()
             || meta.mode() & if private { 0o077 } else { 0o022 } != 0
             || (private && meta.nlink() != 1)
         {
@@ -122,7 +122,7 @@ impl Directory {
         let named = io(fs::symlink_metadata(&self.path))?;
         let opened = io(self.file.metadata())?;
         if !named.is_dir()
-            || named.uid() != unsafe { libc::geteuid() }
+            || named.uid() != sys::effective_uid()
             || named.mode() & if self.private { 0o077 } else { 0o022 } != 0
             || named.dev() != opened.dev()
             || named.ino() != opened.ino()
@@ -216,7 +216,7 @@ impl Workspace {
         if file_identity(&root.path.join(".lock"), &lock, true)?.len != 0 {
             return Err("committed-uci-lock-unsafe".into());
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
             return Err("committed-uci-workspace-busy".into());
         }
         let config = Directory::open(&root.path.join("config"), true, true)?;
@@ -1058,9 +1058,8 @@ mod tests {
         let before = fs::read(fixture.config.join("cake-autorate")).unwrap();
         let snapshot = CommittedSnapshot::capture_with(&fixture.config, &fixture.run, |args| {
             let source = File::open(fixture.config.join("cake-autorate")).unwrap();
-            assert_eq!(
-                unsafe { libc::flock(source.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-                0,
+            assert!(
+                sys::flock(&source, libc::LOCK_EX | libc::LOCK_NB).is_ok(),
                 "source inode locks must not be held around libuci"
             );
             fake_query(args)

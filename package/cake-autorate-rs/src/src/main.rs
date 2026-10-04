@@ -57,6 +57,7 @@ mod reflector_defaults;
 mod routed_dns;
 mod routing;
 mod sqm_config;
+mod sys;
 #[cfg(feature = "transport-probes")]
 mod transport_probe;
 #[cfg(any(feature = "transport-probes", test))]

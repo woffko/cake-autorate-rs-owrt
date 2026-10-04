@@ -39,6 +39,7 @@ use super::runtime_health::{safe_name, UciPackage};
 use super::service_config::OpenWrtEnvironment;
 use super::sqm_identity::{attest_bootstrap_uci_absence, BootstrapAbsenceIdentity};
 use super::sqm_projection::{canonical_batch_for_package, plan_projection, ProjectionScope};
+use crate::sys;
 use crate::{root_cake_qdisc, root_cake_qdisc_count, tc_output, Config};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -210,7 +211,7 @@ impl NativeApplyMaterializationWorkspace {
                 format!("unable to inspect native Apply materialization residue: {error}")
             })?;
             if !metadata.file_type().is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != sys::effective_uid()
                 || metadata.mode() & 0o077 != 0
                 || metadata.len() != 0
             {
@@ -227,7 +228,7 @@ impl Drop for NativeApplyMaterializationWorkspace {
     fn drop(&mut self) {
         if fs::symlink_metadata(&self.root).is_ok_and(|metadata| {
             metadata.file_type().is_dir()
-                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.uid() == sys::effective_uid()
                 && metadata.mode() & 0o077 == 0
         }) {
             let _ = fs::remove_dir_all(&self.root);
@@ -520,7 +521,7 @@ impl OpenWrtNativeApplyBackend {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_dir()
-                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.uid() != sys::effective_uid()
                     || metadata.mode() & 0o077 != 0
                 {
                     return Err(
@@ -616,7 +617,7 @@ impl OpenWrtNativeApplyBackend {
                 format!("unable to inspect a native Apply private UCI file: {error}")
             })?;
             if !metadata.file_type().is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != sys::effective_uid()
                 || metadata.mode() & 0o077 != 0
                 || metadata.len() != 0
             {
@@ -699,7 +700,7 @@ impl OpenWrtNativeApplyBackend {
     }
 
     fn require_bootstrap_root(&self) -> Result<(), String> {
-        if unsafe { libc::geteuid() } == 0 {
+        if sys::effective_uid() == 0 {
             Ok(())
         } else {
             Err("native bootstrap Apply execution requires root".to_string())
@@ -1302,7 +1303,7 @@ impl NativeApplyTransactionBackend for OpenWrtNativeApplyBackend {
     }
 
     fn attest_before_apply(&mut self, plan: &NativeApplyExecutionPlan) -> Result<(), String> {
-        if unsafe { libc::geteuid() } != 0 {
+        if sys::effective_uid() != 0 {
             return Err("native Apply execution requires root".to_string());
         }
         super::service_lifecycle::require_no_pending_service_start()?;

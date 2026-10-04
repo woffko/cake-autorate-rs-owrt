@@ -8,6 +8,7 @@ use super::committed_uci::{file_identity, read_file, Directory, Identity};
 use super::process::{run_bounded_command_output_with_input, BoundedCommandOutput, SpawnSpec};
 use super::runtime_health::safe_interface;
 use crate::config_candidate::digest;
+use crate::sys;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -114,7 +115,7 @@ impl Profile {
         if file_identity(&workspace.path.join("lock"), &lock, true)?.len != 0 {
             return Err("isolated-sqm-runner-lock-invalid".into());
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
             return Err(BUSY.into());
         }
         inspect_workspace(&workspace)?;
@@ -228,7 +229,7 @@ pub(crate) fn ensure_idle(runtime_root: &Path) -> Result<()> {
         return Ok(());
     }
     let (_, lock, _) = read_file(&path.join("lock"), 0, true)?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return Err(BUSY.into());
     }
     if directory.names()?.iter().any(|name| name == "current") {

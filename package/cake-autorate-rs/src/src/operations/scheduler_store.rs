@@ -6,6 +6,7 @@
 //! any record. Production wiring remains disabled until this store and the
 //! scheduler admission path pass an isolated OpenWrt gate.
 
+use crate::sys;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -226,7 +227,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
         Ok(metadata) => {
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != sys::effective_uid()
             {
                 return Err(
                     "native scheduler store directory is unsafe or foreign-owned".to_string(),
@@ -311,7 +312,7 @@ fn is_exact_temp_name(name: &str) -> bool {
 fn validate_private_file(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.mode() & 0o077 != 0
     {
         return Err(format!(

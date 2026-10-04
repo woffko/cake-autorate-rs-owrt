@@ -79,6 +79,7 @@ use super::{
     },
     state,
 };
+use crate::sys;
 use crate::Config;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -417,7 +418,6 @@ fn native_runtime_qdisc_kinds(
 }
 
 extern "C" {
-    fn geteuid() -> u32;
     fn getsockopt(
         socket: i32,
         level: i32,
@@ -9152,7 +9152,7 @@ pub(crate) fn probe_calibration_coordinator_control(
         Err(error) => return Err(format!("unable to connect to calibrationd: {error}")),
     };
     let credentials = peer_credentials(&stream)?;
-    if credentials.uid != unsafe { libc::geteuid() }
+    if credentials.uid != sys::effective_uid()
         || u32::try_from(credentials.pid).ok() != Some(identity.pid)
     {
         return Err(format!(
@@ -9330,7 +9330,7 @@ fn remove_stale_socket(path: &Path) -> Result<(), String> {
 }
 
 fn euid() -> u32 {
-    unsafe { geteuid() }
+    sys::effective_uid()
 }
 
 fn reduce_timeout(current: &mut Option<Duration>, candidate: Duration) {

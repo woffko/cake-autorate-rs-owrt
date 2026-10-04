@@ -12,6 +12,7 @@
 
 use super::json_wire::json_escape;
 use super::runtime_health::{safe_name, UciPackage, UciSection};
+use crate::sys;
 use ring::digest::{digest, SHA256};
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -734,7 +735,7 @@ fn open_plan_root(root: &Path) -> Result<File, String> {
         .map_err(|error| format!("unable to reinspect MQTT plan directory: {error}"))?;
     if current.file_type().is_symlink()
         || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.nlink() < 2
         || metadata.mode() & 0o7777 != 0o700
         || current.dev() != metadata.dev()
@@ -767,7 +768,7 @@ fn inspect_plan_file(path: &Path) -> Result<Option<fs::Metadata>, String> {
         Ok(metadata) => {
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != sys::effective_uid()
                 || metadata.nlink() != 1
                 || metadata.mode() & 0o7777 != 0o600
                 || metadata.len() > MAX_PLAN_BYTES as u64
@@ -1956,7 +1957,7 @@ impl LogFollower {
             .map_err(|error| format!("unable to inspect MQTT log directory: {error}"))?;
         if parent_metadata.file_type().is_symlink()
             || !parent_metadata.is_dir()
-            || parent_metadata.uid() != unsafe { libc::geteuid() }
+            || parent_metadata.uid() != sys::effective_uid()
         {
             return Err("MQTT log directory identity is unsafe".to_string());
         }
@@ -2000,7 +2001,7 @@ impl LogFollower {
         };
         if current.as_ref().is_some_and(|metadata| {
             !metadata.file_type().is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != sys::effective_uid()
                 || metadata.nlink() != 1
         }) {
             return Err("MQTT log path is not an owned single-link regular file".to_string());
@@ -2084,7 +2085,7 @@ fn open_log_file(path: &Path) -> Result<(File, fs::Metadata), String> {
         .map_err(|error| format!("unable to inspect MQTT log: {error}"))?;
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.nlink() != 1
     {
         return Err("MQTT log path is not a regular file".to_string());

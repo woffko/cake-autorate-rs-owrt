@@ -1,3 +1,4 @@
+use crate::sys;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -84,10 +85,6 @@ mod proc_discovery_tests {
     }
 }
 
-extern "C" {
-    fn getpid() -> i32;
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -97,7 +94,7 @@ pub struct ProcessIdentity {
 
 impl ProcessIdentity {
     pub fn current() -> Result<Self, String> {
-        let raw_pid = unsafe { getpid() };
+        let raw_pid = sys::process_id();
         let pid = u32::try_from(raw_pid).map_err(|_| "process PID is invalid".to_string())?;
         Self::inspect(Path::new(DEFAULT_PROC_ROOT), pid)
     }
@@ -426,7 +423,7 @@ mod tests {
     #[test]
     fn exact_process_identity_detects_pid_reuse() {
         let root =
-            std::env::temp_dir().join(format!("cake-process-identity-{}", unsafe { getpid() }));
+            std::env::temp_dir().join(format!("cake-process-identity-{}", sys::process_id()));
         let proc_dir = root.join("42");
         fs::create_dir_all(&proc_dir).unwrap();
         let first = fake_stat(42, "worker", 41, 123);
@@ -443,9 +440,10 @@ mod tests {
 
     #[test]
     fn exact_process_identity_treats_a_matching_zombie_as_not_live() {
-        let root = std::env::temp_dir().join(format!("cake-process-zombie-identity-{}", unsafe {
-            getpid()
-        }));
+        let root = std::env::temp_dir().join(format!(
+            "cake-process-zombie-identity-{}",
+            sys::process_id()
+        ));
         let proc_dir = root.join("42");
         fs::create_dir_all(&proc_dir).unwrap();
         fs::write(proc_dir.join("stat"), fake_stat(42, "worker", 41, 123)).unwrap();
@@ -466,9 +464,10 @@ mod tests {
 
     #[test]
     fn exiting_process_does_not_require_identity_fields_that_the_kernel_released() {
-        let root = std::env::temp_dir().join(format!("cake-process-exiting-identity-{}", unsafe {
-            getpid()
-        }));
+        let root = std::env::temp_dir().join(format!(
+            "cake-process-exiting-identity-{}",
+            sys::process_id()
+        ));
         let proc_dir = root.join("42");
         fs::create_dir_all(&proc_dir).unwrap();
         fs::write(proc_dir.join("stat"), fake_stat(42, "worker", 41, 123)).unwrap();

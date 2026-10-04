@@ -9,6 +9,7 @@ use super::process::{
     run_bounded_command_output, run_bounded_command_output_with_input, SpawnSpec,
 };
 use super::runtime_health::{json_string_value, safe_interface, safe_name, UciPackage};
+use crate::sys;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -87,7 +88,7 @@ impl PrivateUciSavedir {
             let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|error| format!("unable to inspect service UCI residue: {error}"))?;
             if !metadata.file_type().is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != sys::effective_uid()
                 || metadata.mode() & 0o077 != 0
                 || metadata.len() != 0
             {
@@ -111,7 +112,7 @@ impl Drop for PrivateUciSavedir {
                 return;
             };
             if !metadata.file_type().is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != sys::effective_uid()
                 || metadata.mode() & 0o077 != 0
             {
                 return;
@@ -126,7 +127,7 @@ fn require_private_uci_directory(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("unable to inspect service UCI directory: {error}"))?;
     if !metadata.file_type().is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.mode() & 0o777 != 0o700
     {
         return Err("service UCI directory is not private and owner-controlled".to_string());

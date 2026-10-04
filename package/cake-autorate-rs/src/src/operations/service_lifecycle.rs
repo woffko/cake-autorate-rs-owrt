@@ -6,6 +6,7 @@
 //! instances are startable is made here from one typed configuration snapshot.
 
 use super::committed_uci::{CommittedSnapshot, PreparedConfig};
+use crate::sys;
 
 #[cfg(feature = "calibration")]
 use super::coordinator::native_apply_recovery_markers_present;
@@ -1020,9 +1021,7 @@ pub(crate) fn with_test_global_lease<T>(
 impl Drop for ServiceGlobalLock {
     fn drop(&mut self) {
         if let Self::Owned(file) = self {
-            unsafe {
-                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-            }
+            let _ = sys::flock(&*file, libc::LOCK_UN);
         }
     }
 }
@@ -1616,7 +1615,7 @@ fn observe_controller_start(
                 "controller status is missing for {instance}"
             )));
         };
-        if status.uid != unsafe { libc::geteuid() } || status.mode & 0o022 != 0 {
+        if status.uid != sys::effective_uid() || status.mode & 0o022 != 0 {
             return Err(format!(
                 "controller status ownership is unsafe for {instance}"
             ));
@@ -1758,7 +1757,7 @@ fn epoch_seconds() -> f64 {
 }
 
 fn execute_stop_openwrt() -> Result<String, String> {
-    if unsafe { libc::geteuid() } != 0 {
+    if sys::effective_uid() != 0 {
         return Err("service lifecycle requires root".to_string());
     }
     let paths = ServicePaths::production();
@@ -2535,7 +2534,7 @@ fn execute_reload_in(context: &LifecycleContext) -> Result<String, String> {
 }
 
 fn require_service_root() -> Result<(), String> {
-    if unsafe { libc::geteuid() } != 0 {
+    if sys::effective_uid() != 0 {
         return Err("service lifecycle requires root".to_string());
     }
     Ok(())
@@ -2643,7 +2642,7 @@ fn check_source_handoff(
 }
 
 fn prepare_start() -> Result<String, String> {
-    if unsafe { libc::geteuid() } != 0 {
+    if sys::effective_uid() != 0 {
         return Err("service lifecycle requires root".to_string());
     }
     // OpenWrt's default_postinst invokes service start before the package's
@@ -3235,8 +3234,8 @@ fn sync_bridger_blacklist(
         &workspace.package_path(),
         &original.bytes,
         0o600,
-        unsafe { libc::geteuid() },
-        unsafe { libc::getegid() },
+        sys::effective_uid(),
+        sys::effective_gid(),
     )?;
     let defaults_target = format!("{}.@defaults[0]", workspace.alias);
     let defaults = command_owned(
@@ -3818,8 +3817,7 @@ fn acquire_service_global_lock(paths: &ServicePaths) -> Result<ServiceGlobalLock
         .open(&guard_path)
         .map_err(|error| format!("unable to open service lifecycle lock: {error}"))?;
     attest_guard_identity(&guard_path, &guard)?;
-    if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = io::Error::last_os_error();
+    if let Err(error) = sys::flock(&guard, libc::LOCK_EX | libc::LOCK_NB) {
         return Err(if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
             "service lifecycle is busy with another runtime mutation".to_string()
         } else {
@@ -3843,13 +3841,13 @@ fn attest_borrowed_exclusive_lock(path: &Path, borrowed: &File) -> Result<(), St
         .open(path)
         .map_err(|error| format!("unable to open service lifecycle lock probe: {error}"))?;
     attest_guard_identity(path, &probe)?;
-    if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
-        unsafe {
-            libc::flock(probe.as_raw_fd(), libc::LOCK_UN);
+    let error = match sys::flock(&probe, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(()) => {
+            let _ = sys::flock(&probe, libc::LOCK_UN);
+            return Err("borrowed service lifecycle descriptor has no exclusive lock".to_string());
         }
-        return Err("borrowed service lifecycle descriptor has no exclusive lock".to_string());
-    }
-    let error = io::Error::last_os_error();
+        Err(error) => error,
+    };
     if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
         return Err(format!(
             "unable to attest borrowed service lifecycle lock: {error}"
@@ -3868,7 +3866,7 @@ fn attest_guard_identity(path: &Path, opened: &File) -> Result<(), String> {
         || !current.file_type().is_file()
         || current.dev() != metadata.dev()
         || current.ino() != metadata.ino()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.nlink() != 1
         || metadata.mode() & 0o777 != 0o600
     {
@@ -4185,9 +4183,8 @@ fn read_process_generation(
         .metadata()
         .map_err(|_| "controller-generation-environment-unavailable")?;
     if !metadata.is_file()
-        // SAFETY: geteuid has no pointer arguments and cannot fail; it supplies
-        // the OS credential used to reject another user's proc environment.
-        || metadata.uid() != unsafe { libc::geteuid() }
+        // Another user's proc environment is rejected.
+        || metadata.uid() != sys::effective_uid()
         || metadata.mode() & 0o022 != 0
     {
         return Err("controller-generation-environment-invalid".into());
@@ -4316,7 +4313,7 @@ fn cleanup_runtime_files(paths: &ServicePaths) -> Result<(), String> {
             };
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != sys::effective_uid()
                 || metadata.nlink() != 1
             {
                 return Err(format!("runtime file {} is unsafe", path.display()));
@@ -4390,7 +4387,7 @@ fn ensure_owner_directory(path: &Path) -> Result<(), String> {
 fn owner_directory_is_exact(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| {
         metadata.file_type().is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.uid() == sys::effective_uid()
             && metadata.mode() & 0o7777 == 0o700
     })
 }
@@ -7369,10 +7366,7 @@ fi
             .unwrap_err()
             .contains("has no exclusive lock"));
 
-        assert_eq!(
-            unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
-            0
-        );
+        sys::flock(&owner, libc::LOCK_SH | libc::LOCK_NB).unwrap();
         assert!(attest_borrowed_exclusive_lock(&path, &owner)
             .unwrap_err()
             .contains("has no exclusive lock"));
@@ -7381,34 +7375,25 @@ fi
             .write(true)
             .open(&path)
             .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(shared_probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB,) },
-            0,
+        assert!(
+            sys::flock(&shared_probe, libc::LOCK_SH | libc::LOCK_NB).is_ok(),
             "borrow attestation silently upgraded the shared lock"
         );
-        unsafe {
-            libc::flock(shared_probe.as_raw_fd(), libc::LOCK_UN);
-            libc::flock(owner.as_raw_fd(), libc::LOCK_UN);
-        }
+        sys::flock(&shared_probe, libc::LOCK_UN).unwrap();
+        sys::flock(&owner, libc::LOCK_UN).unwrap();
 
-        assert_eq!(
-            unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        sys::flock(&owner, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         attest_borrowed_exclusive_lock(&path, &owner).unwrap();
         let exclusive_probe = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
-        assert_ne!(
-            unsafe { libc::flock(exclusive_probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB,) },
-            0,
+        assert!(
+            sys::flock(&exclusive_probe, libc::LOCK_SH | libc::LOCK_NB).is_err(),
             "borrow attestation released the parent's exclusive lock"
         );
-        unsafe {
-            libc::flock(owner.as_raw_fd(), libc::LOCK_UN);
-        }
+        sys::flock(&owner, libc::LOCK_UN).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

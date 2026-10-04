@@ -4,11 +4,11 @@
 //! an immutable UCI snapshot, sqm-scripts state identity, bounded start/stop,
 //! and exact CAKE topology postconditions.
 
+use crate::sys;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -318,10 +318,8 @@ impl Drop for RuntimeLockClaim {
         if fs::read(&self.record_path).ok().as_deref() == Some(self.record_body.as_slice()) {
             let _ = fs::remove_file(&self.record_path);
         }
-        unsafe {
-            libc::flock(self.interface_guard.as_raw_fd(), libc::LOCK_UN);
-            libc::flock(self.global_guard.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = sys::flock(&self.interface_guard, libc::LOCK_UN);
+        let _ = sys::flock(&self.global_guard, libc::LOCK_UN);
     }
 }
 
@@ -1379,7 +1377,7 @@ fn acquire_runtime_locks(
     ensure_private_directory(&paths.lock_root)?;
     let global_path = paths.lock_root.join("runtime.guard");
     let global_guard = open_guard(&global_path)?;
-    flock(&global_guard, libc::LOCK_SH | libc::LOCK_NB).map_err(|error| {
+    sys::flock(&global_guard, libc::LOCK_SH | libc::LOCK_NB).map_err(|error| {
         if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
             NativeSqmAttestationError::Busy(
                 "managed SQM attestation deferred while another runtime operation owns the global lock"
@@ -1395,7 +1393,7 @@ fn acquire_runtime_locks(
     let record_path = paths.lock_root.join(format!("interface-{stem}.lock"));
     let interface_guard =
         open_guard(&paths.lock_root.join(format!("interface-{stem}.lock.guard")))?;
-    flock(&interface_guard, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| {
+    sys::flock(&interface_guard, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| {
         if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
             NativeSqmAttestationError::Busy(format!(
                 "managed SQM attestation deferred while another operation owns {target}"
@@ -2618,7 +2616,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), NativeSqmAttestationError
     })?;
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
     {
         return Err(NativeSqmAttestationError::failed(
             "runtime lock root is not a private owned directory",
@@ -2643,7 +2641,7 @@ fn open_guard(path: &Path) -> Result<File, NativeSqmAttestationError> {
     let metadata = file.metadata().map_err(|error| {
         NativeSqmAttestationError::failed(format!("unable to inspect {}: {error}", path.display()))
     })?;
-    if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+    if !metadata.file_type().is_file() || metadata.uid() != sys::effective_uid() {
         return Err(NativeSqmAttestationError::failed(
             "runtime guard is not an owned regular file",
         ));
@@ -2653,15 +2651,6 @@ fn open_guard(path: &Path) -> Result<File, NativeSqmAttestationError> {
             NativeSqmAttestationError::failed(format!("unable to protect runtime guard: {error}"))
         })?;
     Ok(file)
-}
-
-fn flock(file: &File, operation: i32) -> std::io::Result<()> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 fn atomic_replace_private(path: &Path, bytes: &[u8]) -> Result<(), NativeSqmAttestationError> {
@@ -2766,7 +2755,7 @@ fn open_optional_bounded_owned_regular(
         ))
     })?;
     if !metadata.file_type().is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.nlink() != 1
         || metadata.mode() & 0o077 != 0
         || metadata.len() > limit as u64
@@ -2797,7 +2786,7 @@ fn open_optional_bounded_external_regular(
     })?;
     if parent_metadata.file_type().is_symlink()
         || !parent_metadata.file_type().is_dir()
-        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.uid() != sys::effective_uid()
         || parent_metadata.mode() & 0o022 != 0
     {
         return Err(NativeSqmAttestationError::failed(format!(
@@ -2827,7 +2816,7 @@ fn open_optional_bounded_external_regular(
         ))
     })?;
     if !metadata.file_type().is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.nlink() != 1
         || metadata.mode() & 0o022 != 0
         || metadata.len() > limit as u64
@@ -3972,7 +3961,7 @@ mod tests {
         );
         // Parent/native Apply exclusion is retained by the new frozen lane.
         let global = open_guard(&lock_root.join("runtime.guard")).unwrap();
-        flock(&global, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        sys::flock(&global, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         assert!(matches!(
             attest_managed_sqm_from_input_with_paths(&spec, &frozen, &frozen_paths),
             Err(NativeSqmAttestationError::Busy(_))

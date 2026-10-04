@@ -3,11 +3,11 @@
 
 use super::process::{run_bounded_command_output_with_input, BoundedCommandOutput, SpawnSpec};
 use super::service_config::PrivateUciSavedir;
+use crate::sys;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -56,7 +56,7 @@ struct ExclusiveGuard(File);
 
 impl Drop for ExclusiveGuard {
     fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        let _ = sys::flock(&self.0, libc::LOCK_UN);
     }
 }
 
@@ -87,13 +87,12 @@ fn acquire_guard(path: &Path) -> Result<ExclusiveGuard, String> {
     let metadata = file
         .metadata()
         .map_err(|error| format!("unable to inspect Status-column guard: {error}"))?;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+    if !metadata.is_file() || metadata.uid() != sys::effective_uid() {
         return Err("Status-column guard is not an owned regular file".to_string());
     }
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("unable to protect Status-column guard: {error}"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
+    if let Err(error) = sys::flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
         return if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
             Err("another Status-column update is running".to_string())
         } else {
@@ -288,13 +287,11 @@ where
     let metadata = original_file
         .metadata()
         .map_err(|error| error.to_string())?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
+    if !metadata.is_file() || metadata.uid() != sys::effective_uid() || metadata.mode() & 0o022 != 0
     {
         return Err("UI config must be an owner-controlled regular file".to_string());
     }
-    if unsafe { libc::flock(original_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if sys::flock(&original_file, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return Err("UI config is busy with another writer".to_string());
     }
     let original = read_ui_config(&mut original_file)?;
@@ -456,10 +453,7 @@ mod tests {
             .mode(0o600)
             .open(&fixture.environment.guard)
             .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        sys::flock(&owner, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         assert!(status_columns(
             ["set".to_string(), "route".to_string()].into_iter(),
             &fixture.environment,

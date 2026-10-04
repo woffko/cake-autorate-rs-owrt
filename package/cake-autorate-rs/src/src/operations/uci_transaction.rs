@@ -9,6 +9,7 @@ use super::committed_uci::{
     file_identity, read_file, Directory, Identity, PreparedConfig, MAX_CONFIG, PACKAGES,
 };
 use crate::config_candidate::digest;
+use crate::sys;
 use serde_json::{json, Value};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -165,7 +166,7 @@ impl Version {
             ctime_ns: s("ctime_ns")?,
         };
         if identity.len > MAX_CONFIG
-            || identity.uid != unsafe { libc::geteuid() }
+            || identity.uid != sys::effective_uid()
             || identity.mode & libc::S_IFMT != libc::S_IFREG
             || identity.mode & 0o022 != 0
             || !(0..1_000_000_000).contains(&identity.mtime_ns)
@@ -232,7 +233,7 @@ impl Root {
         if file_identity(&root.path.join("lock"), &lock, true)?.len != 0 {
             return Err("uci-transaction-lock-invalid".into());
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
             return Err("uci-transaction-busy".into());
         }
         let result = Self { config, root, lock };
@@ -453,7 +454,7 @@ impl Journal {
         let mut files = Vec::new();
         for name in PACKAGES {
             let (_, file, _) = regular(&self.root.config.path.join(name), MAX_CONFIG, false)?;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            if sys::flock(&file, libc::LOCK_EX | libc::LOCK_NB).is_err() {
                 return Err("uci-transaction-source-busy".into());
             }
             files.push(file);

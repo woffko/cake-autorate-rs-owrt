@@ -5,11 +5,11 @@ use super::committed_uci::{read_file, Directory, Identity, PreparedConfig};
 use super::runtime_health::{safe_name, UciPackage};
 use super::uci_transaction::{PublishedConfig, SourceReceipt};
 use crate::config_candidate::digest;
+use crate::sys;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -100,7 +100,7 @@ fn inventory(directory: &Directory) -> Result<(usize, u64)> {
         }
         let meta = io(fs::symlink_metadata(entry.path()))?;
         if !meta.is_file()
-            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.uid() != sys::effective_uid()
             || meta.mode() & 0o077 != 0
             || meta.nlink() != 1
             || meta.len() > MAX_RECORD
@@ -129,7 +129,7 @@ fn lock_store(root: &Path) -> Result<(Directory, File)> {
     if super::committed_uci::file_identity(&root.join("lock"), &lock, true)?.len != 0 {
         return Err("controller-input-lock-invalid".into());
     }
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return Err("controller-input-store-busy".into());
     }
     inventory(&directory)?;

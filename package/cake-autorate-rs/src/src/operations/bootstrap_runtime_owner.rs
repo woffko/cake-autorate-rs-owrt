@@ -33,6 +33,7 @@ use super::identity::{
 use super::protocol::{
     OperationRequest, OperationTargetState, SpeedtestDirection, MAX_OPERATION_RECORD_BYTES,
 };
+use crate::sys;
 use ring::digest::{digest, SHA256};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -4500,17 +4501,16 @@ impl BootstrapRuntimeOwnerLock {
             .metadata()
             .map_err(|error| format!("unable to inspect bootstrap runtime owner lock: {error}"))?;
         if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != sys::effective_uid()
             || metadata.permissions().mode() & 0o777 != 0o600
             || metadata.nlink() != 1
         {
             return Err("bootstrap runtime owner lock is unsafe".to_string());
         }
         loop {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            let Err(error) = sys::flock(&file, libc::LOCK_EX) else {
                 return Ok(Self { _file: file });
-            }
-            let error = std::io::Error::last_os_error();
+            };
             if error.kind() == std::io::ErrorKind::Interrupted {
                 if terminate.load(Ordering::SeqCst) {
                     return Err("bootstrap runtime owner lock wait was cancelled".to_string());
@@ -5197,7 +5197,7 @@ fn ensure_runtime_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("unable to inspect bootstrap runtime directory: {error}"))?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.permissions().mode() & 0o777 != 0o700
     {
         return Err(

@@ -11,6 +11,7 @@ use super::autotune_apply::{
 };
 use super::protocol::{OperationRequest, OperationTargetState};
 use super::sqm_identity;
+use crate::sys;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -94,8 +95,7 @@ fn lock_config_file(path: &Path, label: &str) -> Result<File, String> {
             "{label} config identity changed while acquiring rollback lock"
         ));
     }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
-        let error = std::io::Error::last_os_error();
+    if let Err(error) = sys::flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
         return if error
             .raw_os_error()
             .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK)
@@ -127,24 +127,21 @@ impl NativeApplyGlobalLock {
         let lock =
             Self::open_lock_file(path).map_err(NativeApplyGlobalLockAcquireError::into_string)?;
         loop {
-            let result = unsafe { libc::flock(lock.file.as_raw_fd(), libc::LOCK_EX) };
-            if result == 0 {
-                return Ok(lock);
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(format!(
-                    "unable to acquire native Apply recovery runtime lock: {error}"
-                ));
+            match sys::flock(&lock.file, libc::LOCK_EX) {
+                Ok(()) => return Ok(lock),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(format!(
+                        "unable to acquire native Apply recovery runtime lock: {error}"
+                    ));
+                }
             }
         }
     }
 
     fn try_acquire(path: &Path) -> Result<Self, NativeApplyGlobalLockAcquireError> {
         let lock = Self::open_lock_file(path)?;
-        let result = unsafe { libc::flock(lock.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            let error = std::io::Error::last_os_error();
+        if let Err(error) = sys::flock(&lock.file, libc::LOCK_EX | libc::LOCK_NB) {
             return if error.kind() == std::io::ErrorKind::WouldBlock {
                 Err(NativeApplyGlobalLockAcquireError::Busy)
             } else {
@@ -2864,7 +2861,7 @@ fn strict_regular_metadata(path: &Path, label: &str) -> Result<fs::Metadata, Str
 }
 
 fn effective_uid() -> u32 {
-    unsafe { libc::geteuid() }
+    sys::effective_uid()
 }
 
 pub(super) fn reject_unknown_entries(path: &Path) -> Result<(), String> {

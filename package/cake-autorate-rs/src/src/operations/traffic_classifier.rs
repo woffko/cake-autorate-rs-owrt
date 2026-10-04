@@ -4,12 +4,12 @@
 //! attested apply/status lifecycle. It never creates or changes a qdisc: the
 //! selected upload CAKE queue remains the sole consumer of the DSCP marks.
 
+use crate::sys;
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -462,14 +462,11 @@ impl RuntimeGuard {
         let metadata = file
             .metadata()
             .map_err(|error| format!("unable to inspect traffic-classifier guard: {error}"))?;
-        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        if !metadata.is_file() || metadata.uid() != sys::effective_uid() {
             return Err("traffic-classifier guard ownership is unsafe".to_string());
         }
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(format!(
-                "unable to lock traffic-classifier state: {}",
-                io::Error::last_os_error()
-            ));
+        if let Err(error) = sys::flock(&file, libc::LOCK_EX) {
+            return Err(format!("unable to lock traffic-classifier state: {error}"));
         }
         Ok(Self(file))
     }
@@ -496,14 +493,11 @@ impl RuntimeGuard {
         let metadata = file
             .metadata()
             .map_err(|error| format!("unable to inspect traffic-classifier guard: {error}"))?;
-        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        if !metadata.is_file() || metadata.uid() != sys::effective_uid() {
             return Err("traffic-classifier guard ownership is unsafe".to_string());
         }
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
-            return Err(format!(
-                "unable to lock traffic-classifier state: {}",
-                io::Error::last_os_error()
-            ));
+        if let Err(error) = sys::flock(&file, libc::LOCK_SH) {
+            return Err(format!("unable to lock traffic-classifier state: {error}"));
         }
         Ok(Some(Self(file)))
     }
@@ -511,7 +505,7 @@ impl RuntimeGuard {
 
 impl Drop for RuntimeGuard {
     fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        let _ = sys::flock(&self.0, libc::LOCK_UN);
     }
 }
 
@@ -1277,7 +1271,7 @@ fn prepare_runtime_dir(path: &Path) -> Result<(), String> {
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
             || metadata.permissions().mode() & 0o022 != 0
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != sys::effective_uid()
         {
             return Err("traffic-classifier runtime directory is unsafe".to_string());
         }
@@ -1301,7 +1295,7 @@ fn write_manifest(path: &Path, manifest: &StateManifest) -> Result<(), String> {
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
         || metadata.permissions().mode() & 0o022 != 0
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
     {
         return Err("traffic-classifier runtime directory is unsafe".to_string());
     }
@@ -1346,7 +1340,7 @@ fn read_manifest(path: &Path) -> Result<StateManifest, String> {
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() > MAX_MANIFEST_BYTES as u64
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.permissions().mode() & 0o077 != 0
     {
         return Err("traffic-classifier state is unsafe".to_string());

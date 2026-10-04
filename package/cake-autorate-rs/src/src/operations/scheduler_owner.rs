@@ -1,9 +1,9 @@
 //! Process-wide and cross-process ownership for the native calibration scheduler.
 
+use crate::sys;
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -37,12 +37,8 @@ impl SchedulerOwnerLock {
         if locks.contains(&key) {
             return Err("scheduler ownership is already held in this process".to_string());
         }
-        let status = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if status != 0 {
-            return Err(format!(
-                "unable to lock scheduler ownership: {}",
-                io::Error::last_os_error()
-            ));
+        if let Err(error) = sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+            return Err(format!("unable to lock scheduler ownership: {error}"));
         }
         locks.insert(key);
         drop(locks);
@@ -56,7 +52,7 @@ impl SchedulerOwnerLock {
 impl Drop for SchedulerOwnerLock {
     fn drop(&mut self) {
         if let Some(lock) = self.lock.take() {
-            let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+            let _ = sys::flock(&lock, libc::LOCK_UN);
             drop(lock);
         }
         if let Ok(mut locks) = local_locks().lock() {
@@ -76,12 +72,13 @@ pub(crate) fn attest_scheduler_owner_lock_held(path: &Path) -> Result<(), String
         .metadata()
         .map_err(|error| format!("unable to inspect scheduler owner lock: {error}"))?;
     validate_owner_lock(path, &metadata)?;
-    let status = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if status == 0 {
-        let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
-        return Err("native scheduler ownership lock is not held".to_string());
-    }
-    let error = io::Error::last_os_error();
+    let error = match sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(()) => {
+            let _ = sys::flock(&lock, libc::LOCK_UN);
+            return Err("native scheduler ownership lock is not held".to_string());
+        }
+        Err(error) => error,
+    };
     if error.kind() != io::ErrorKind::WouldBlock {
         return Err(format!("unable to attest scheduler owner lock: {error}"));
     }
@@ -91,7 +88,7 @@ pub(crate) fn attest_scheduler_owner_lock_held(path: &Path) -> Result<(), String
 fn validate_owner_lock(path: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != sys::effective_uid()
         || metadata.mode() & 0o777 != 0o600
         || metadata.nlink() != 1
         || metadata.len() != 0

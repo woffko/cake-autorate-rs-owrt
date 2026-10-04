@@ -1,12 +1,12 @@
 //! Explicit, bounded MQ capability check. No traffic or existing queue changes.
 //! The probe owns one down IFB identified by a durable random alias receipt.
 use crate::operations::process::{run_bounded_command_output, SpawnSpec};
+use crate::sys;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,7 +36,7 @@ fn attest_file(path: &Path, file: &File, private: bool) -> Result<fs::Metadata> 
     let opened = io(file.metadata())?;
     for metadata in [&named, &opened] {
         if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != sys::effective_uid()
             || metadata.mode() & if private { 0o077 } else { 0o022 } != 0
             || (private && metadata.nlink() != 1)
         {
@@ -91,7 +91,7 @@ impl Files {
         }
         let parent = io(fs::canonicalize(parent))?;
         let metadata = io(fs::metadata(&parent))?;
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        if metadata.uid() != sys::effective_uid() || metadata.mode() & 0o022 != 0 {
             return Err("qdisc-capability-parent-unsafe".into());
         }
         let root = parent.join(path.file_name().ok_or("qdisc-capability-path-invalid")?);
@@ -104,7 +104,7 @@ impl Files {
         }
         let metadata = io(fs::symlink_metadata(&root))?;
         if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != sys::effective_uid()
             || metadata.mode() & 0o077 != 0
         {
             return Err("qdisc-capability-directory-unsafe".into());
@@ -124,13 +124,13 @@ impl Files {
         let metadata = attest_file(&root.join(".lock"), &guard, true)?;
         if !metadata.is_file()
             || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != sys::effective_uid()
             || metadata.len() != 0
             || metadata.mode() & 0o077 != 0
         {
             return Err("qdisc-capability-lock-unsafe".into());
         }
-        if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if sys::flock(&guard, libc::LOCK_EX | libc::LOCK_NB).is_err() {
             return Err("qdisc-capability-busy".into());
         }
         let files = Self {
@@ -145,7 +145,7 @@ impl Files {
         let named = io(fs::symlink_metadata(&self.root))?;
         let opened = io(self.directory.metadata())?;
         if !named.is_dir()
-            || named.uid() != unsafe { libc::geteuid() }
+            || named.uid() != sys::effective_uid()
             || named.mode() & 0o077 != 0
             || named.dev() != opened.dev()
             || named.ino() != opened.ino()

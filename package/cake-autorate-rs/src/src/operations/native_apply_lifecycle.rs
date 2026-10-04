@@ -18,6 +18,7 @@ use super::sqm_projection::{
     plan_projection, prepare_mq_capabilities, ProjectionScope, SqmProjectionPlan,
 };
 use super::sqm_recovery_openwrt::{error_message as sqm_error_message, ManagedSqmAttestationSpec};
+use crate::sys;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -230,7 +231,7 @@ pub(crate) fn run_selected_instance_lifecycle(
     expected_target: &str,
     lock: &NativeApplyGlobalLock,
 ) -> Result<(), String> {
-    if unsafe { libc::geteuid() } != 0 {
+    if sys::effective_uid() != 0 {
         return Err("native Apply selected lifecycle requires root".to_string());
     }
     validate_request_binding(request, expected_target)?;
@@ -258,7 +259,7 @@ pub(crate) fn run_selected_instance_containment(
     sqm: &UciPackage,
     sqm_bytes: &[u8],
 ) -> Result<(), String> {
-    if unsafe { libc::geteuid() } != 0 {
+    if sys::effective_uid() != 0 {
         return Err("native Apply selected containment requires root".to_string());
     }
     validate_request_binding(request, expected_target)?;

@@ -1,11 +1,11 @@
 //! Private, bounded candidate transfer for rpcd's small executable-plugin stdin.
 //! The RPC caller supplies opaque identities/offsets, never a filesystem path.
 use crate::config_candidate;
+use crate::sys;
 use serde_json::{json, Value};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,7 +37,7 @@ fn digest_identity(value: &str) -> bool {
 fn owned(metadata: &fs::Metadata) -> bool {
     metadata.is_file()
         && metadata.nlink() == 1
-        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.uid() == sys::effective_uid()
         && metadata.mode() & 0o077 == 0
 }
 fn attest(path: &Path, file: &File) -> Result<fs::Metadata> {
@@ -131,7 +131,7 @@ impl Store {
         io(fs::create_dir_all(parent))?;
         let parent = io(fs::canonicalize(parent))?;
         let metadata = io(fs::metadata(&parent))?;
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        if metadata.uid() != sys::effective_uid() || metadata.mode() & 0o022 != 0 {
             return Err("candidate-storage-parent-unsafe");
         }
         let root = parent.join(root.file_name().ok_or("candidate-storage-path-invalid")?);
@@ -148,7 +148,7 @@ impl Store {
         }
         let metadata = io(fs::symlink_metadata(&root))?;
         if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != sys::effective_uid()
             || metadata.mode() & 0o077 != 0
         {
             return Err("candidate-storage-directory-unsafe");
@@ -161,7 +161,7 @@ impl Store {
         if io(lock.metadata())?.len() != 0 {
             return Err("candidate-storage-lock-unsafe");
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
             return Err("candidate-storage-busy");
         }
         attest(&lock_path, &lock)?;
