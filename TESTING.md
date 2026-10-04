@@ -429,3 +429,121 @@ and the publisher keeps retrying.
   transaction, and only a reboot clears it. That was already so and is not
   changed here.
 - Lite has no MQTT. The physical routers were not run for these changes.
+
+## Changes after RC27 r320/r128: unsafe code (unreleased)
+
+These results cover the commits that put the daemon's direct libc calls behind
+safe wrappers (`src/sys.rs`), write a SAFETY comment for every `unsafe` block
+that remains, and make the source gate check both. The behaviour of the daemon
+is meant to be unchanged; the VM runs below compare the build before and the
+build after. They were made on top of the commits in the previous sections.
+
+### Source gate and packages
+
+- Source gate, 57 commands: Full (1,827) and Lite (407) Rust tests, formatting,
+  `cargo clippy --all-targets` with `clippy::undocumented_unsafe_blocks` denied
+  for the Full and the Lite build (daemon and tests), a check that no local
+  `extern "C"` block is left, LuCI JavaScript tests, TypeScript checks, real-UCI
+  tests and a hash of 235 sources before and after the run, which did not
+  change. The clippy command was tried on a block without a comment: it exits
+  with an error ("unsafe block missing a safety comment"); so was the extern
+  check on a local declaration.
+- All twelve matrix architectures were built from that exact source in the
+  OpenWrt 25.12 SDK and verified for payload, metadata, dependencies and ELF
+  interpreter/ABI. The SDK build log of every architecture shows
+  `-C overflow-checks=on` on both daemon compilations.
+- Size, compared with the build before this work: the Full binary file grows by
+  0 to 4 KiB (0.06% at most, one 4 KiB page step on x86_64 and ARM, none on
+  aarch64 and MIPS), the Full package by 1.4 to 6.2 KB (0.04% to 0.18%), the
+  Lite binary by 0 to 4 KiB.
+
+### What changed
+
+- `clippy::undocumented_unsafe_blocks` reports 0 blocks in the daemon and in its
+  tests, in both builds. It reported 211 (Full) and 102 (Lite) in the daemon and
+  56 more in the tests. About 60 `unsafe` blocks remain, half of them in
+  `src/sys.rs`; each has its own comment saying why it is sound.
+- The calls with a plain signature are safe functions in `src/sys.rs`: user,
+  group and process ids, `flock`, `pidfd_open`, `poll`, `eventfd`, `timerfd`,
+  `inotify`, `read` and `write` of counters and buffers, `kill` and `kill` of a
+  process group, `setsid` before exec, `sysconf`, `renameat2`, `socket`,
+  descriptor duplication, `set_nonblocking`, signal sets, `signalfd` and zeroed C
+  structures. The wrappers retry nothing and keep errors as the callers saw
+  them; `kill` refuses a pid of zero or below and a process group of 1 or
+  below. 16 unit tests cover them (a busy lock is `WouldBlock`, a pidfd turns
+  readable on exit, counters and timers, inotify, hung-up pipes, descriptors are
+  close-on-exec, a blocked signal arrives through its descriptor, `renameat2`
+  exchanges and refuses to replace, a `pre_exec` error reaches the parent as the
+  same error number), and one more tests the error of the speed-test backend.
+- The eight local `extern "C"` blocks are gone: what they declared comes from
+  the libc crate. Two things differ from before on purpose. The coordinator's
+  peer-credential check used `SOL_SOCKET = 1` and `SO_PEERCRED = 17`, which are
+  right on x86, ARM and AArch64 but not on MIPS (`0xffff` and 18), where
+  `getsockopt` would have failed; it uses the libc constants and `libc::ucred`
+  now. The `pre_exec` closure of the speed-test backend built an error message
+  after fork, which allocates; it returns an OS error and the parent says "the
+  speedtest worker disappeared before the backend started".
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+"Before" is the build of the previous goal (daemon `0e3efcca…`), "after" the
+build of this one (`99062905…`), both from the SDK matrix. The host was quiet
+unless the text says otherwise.
+
+- Service lifecycle (33 checks): stop, start, restart and a reload with an
+  unchanged configuration; SIGTERM and SIGINT to the controller (it exits and
+  procd starts a new one); restart and SIGTERM of the calibration daemon;
+  `--cpu-profile 5` and `--mqtt-status`; no panic, overflow or fatal signal in
+  the system log or `dmesg`. The PASS lines of the two builds are identical.
+- Speed Test (capped, current topology): completed in 24.9 s (25 s before).
+- Full Raw Auto-Tune (explicit Unlimited policy): reached Review in 660 s (9 to
+  13 minutes before), with the topology restored.
+- MQTT publisher and TLS against a real Mosquitto (the acceptance of the TLS
+  goal: upgrade, the TLS cases, reload, broker loss and return, a long outage,
+  the last will, clean stop, keepalive; the clock block was left out, it does
+  not touch this code): 193 checks pass for the build before, and for the build
+  after on a quiet host and with the host loaded by 96 busy loops. A first full
+  run of the build after (207 checks) had three failures while the host was
+  busy with two SDK builds and other jobs: two reloads and one restart ended
+  with `native reload failed` or `native service stop transaction failed`. See
+  the next section; the same scenarios passed on every rerun.
+
+### A reload or restart can fail while the host is busy (not new)
+
+The failures above have a cause that is older than this work. The controller
+starts short-lived helper processes (`ip`, `tc`, `uci`), and between `fork` and
+`exec` such a child has the command line of the controller. The service
+lifecycle looks for "exactly one controller per instance" in `/proc` and
+refuses to continue when it sees two: `multiple exact controller processes are
+running for primary`. On an idle router that window is microseconds wide; when
+the CPU is contended it stretches, and a reload or restart that scans at that
+instant fails and has to be repeated (the next attempt succeeded every time;
+the retained recovery state of the failed attempt is the one described in the
+section on MQTT over TLS). A sampler on the VM (about 170 samples a second over
+`/proc/*/cmdline`) recorded a child of the controller with the controller's
+command line, or already `ip -4 rule show` / `tc qdisc show` / a zombie, with
+the same parent, for both builds. Sixty reloads in a row with the MQTT publisher
+enabled, the MQTT host not listening:
+
+| host | before | after |
+|---|---:|---:|
+| quiet, publisher off, 30 reloads | 0 failed | 0 failed |
+| 96 busy loops on 64 CPUs, publisher on, 60 reloads | 4 failed | 2 and 4 failed (two runs) |
+
+In steady state, four alternating five-minute samples under the same load saw a
+second process with the controller's command line 9 times for the build before
+(8 and 1) and 8 times for the build after (3 and 5).
+
+The failures were `multiple exact controller processes are running` in all but
+one case (`controller-batch-readiness-changed`, the readiness check flipping
+between two looks). The lifecycle is not changed here; a scan that ignores a
+process whose parent is the controller would remove the first cause.
+
+### Known limits
+
+- A reload or restart on a router whose CPU is saturated can fail as described
+  above; repeating it works.
+- Nothing was run on MIPS hardware; the MIPS builds compile the corrected
+  constants.
+- Lite and the physical routers were not run for these changes beyond the source
+  gate and the package checks.
