@@ -132,6 +132,40 @@ encodings: a plain plan keeps the bytes of the release before TLS, checked
 against a golden plan produced by that release, while a TLS plan uses the
 version-2 encoding.
 
+## Unsafe code
+
+The daemon calls libc directly in a few places, under three rules:
+
+- **Plain calls live in `src/sys.rs`.** A call with a simple signature (user,
+  group and process ids, `flock`, `pidfd_open`, `poll`, `eventfd`, `timerfd`,
+  `inotify`, `read` and `write` of counters and buffers, `kill`, `renameat2`,
+  signal descriptors and a few more) is a safe function there, with one
+  `unsafe` block and its own `// SAFETY:` comment. The wrappers keep the
+  semantics of the call: they never retry (`EINTR` and `EAGAIN` reach the
+  caller as `Interrupted` and `WouldBlock`), the OS error is read right after
+  the call, and a new descriptor comes back as an `OwnedFd`. `kill` refuses a
+  pid of zero or below and `kill_process_group` a group of 1 or below, since
+  those would signal the caller's own group, init's group or every process.
+  Each wrapper has a unit test.
+- **Anything else keeps its `unsafe` block next to the code that owns the
+  structure**, with a comment of its own: the netlink sockets,
+  `getsockopt(SO_PEERCRED)`, `waitid`, `localtime_r` and `mktime`, the fcntl
+  record lock, `read_unaligned` of inotify events, the two signal handlers and
+  the `pre_exec` closures. A `pre_exec` closure runs between `fork` and `exec`
+  in a process that may have been forked from a multi-threaded one, so it makes
+  only async-signal-safe calls and returns errors without allocating (an OS
+  error number, never `io::Error::new` with a message); its comment lists the
+  calls. A signal handler does nothing but atomics and a `write(2)` on an
+  eventfd.
+- **Constants and types come from the `libc` crate**, not from local
+  `extern "C"` declarations: several differ between targets (on MIPS
+  `SOL_SOCKET` is `0xffff` and `SO_PEERCRED` is 18).
+
+The source gate enforces this with `cargo clippy --all-targets -- -D
+clippy::undocumented_unsafe_blocks` for the Full and the Lite build (the lint is
+also `warn` in `Cargo.toml`, so an editor shows it), and with a check that no
+local `extern "C"` block exists.
+
 ## Tests against a real nftables
 
 Two ignored unit tests apply the traffic-classifier rules to a real nftables in

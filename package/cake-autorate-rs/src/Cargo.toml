@@ -32,6 +32,11 @@ rcgen = "0.13"
 name = "cake-autorated"
 path = "src/main.rs"
 
+[lints.clippy]
+# Every unsafe block says why it is sound. The source gate turns this into an
+# error for the daemon and its tests, in both the Full and the Lite build.
+undocumented_unsafe_blocks = "warn"
+
 [profile.release]
 opt-level = "z"
 lto = true
