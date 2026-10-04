@@ -423,6 +423,8 @@ impl Drop for CalibrationEventLoop {
     }
 }
 
+/// Wake the running event loop from a signal handler. Async-signal-safe: one
+/// atomic load and one `write(2)` on an eventfd, no allocation and no lock.
 pub fn wake_from_signal() {
     let descriptor = ACTIVE_WAKE_FD.load(Ordering::Relaxed);
     if descriptor == NO_WAKE_FD {
@@ -440,6 +442,8 @@ pub fn wake_from_signal() {
     let _ = sys::write_u64(wake, 1);
 }
 
+/// SIGCHLD handler. Its body is empty on purpose (see below), which also makes
+/// it async-signal-safe. Anything added here must be async-signal-safe too.
 extern "C" fn handle_child_signal(_: libc::c_int) {
     // Synchronous helpers such as `uci` are spawned and reaped inside one
     // state-machine pass.  Feeding their SIGCHLD into the reactor would make

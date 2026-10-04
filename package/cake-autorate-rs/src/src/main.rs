@@ -107,6 +107,9 @@ const SQM_RUNTIME_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "calibration")]
 const SQM_RUNTIME_STOP_OUTPUT_LIMIT: usize = 8 * 1024;
 
+/// Handler of SIGINT and SIGTERM. It runs in signal context, so it may do
+/// nothing but atomic operations and `write(2)` on an eventfd: an atomic store
+/// and `wake_from_signal`, which is exactly that. Keep it that way.
 extern "C" fn handle_signal(_: i32) {
     TERMINATE.store(true, Ordering::SeqCst);
     operations::event_loop::wake_from_signal();
