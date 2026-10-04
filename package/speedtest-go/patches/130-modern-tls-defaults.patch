@@ -1,0 +1,200 @@
+diff -ruN a/cake_godebug.go b/cake_godebug.go
+--- a/cake_godebug.go	1970-01-01 03:00:00.000000000 +0300
++++ b/cake_godebug.go	2026-10-04 17:48:50.420381707 +0300
+@@ -0,0 +1,27 @@
++// The module declares "go 1.19", so the Go toolchain gives the program the
++// GODEBUG defaults of that old release. Among them is weak TLS behaviour that
++// current Go no longer has by default:
++//
++//	tls3des             3DES cipher suites
++//	tlsrsakex           RSA key exchange, which has no forward secrecy
++//	tlssha1             SHA-1 signatures in TLS 1.2 handshakes
++//	tlsunsafeekm        exported keying material without extended master secret
++//	rsa1024min          RSA keys shorter than 1024 bits
++//	x509negativeserial  certificates with a negative serial number
++//	tls10server         TLS 1.0 as a server (the backend runs none; it is set so
++//	                    that no legacy TLS default is left in the build info)
++//
++// The backend only needs what current Go does by default, so each setting is put
++// back to its modern value. The go command checks these directives when the
++// program is built: a setting that a later toolchain no longer knows breaks the
++// build instead of being ignored. The tests in cake_godebug_test.go fail if a
++// weak default comes back.
++
++//go:debug tls3des=0
++//go:debug tlsrsakex=0
++//go:debug tlssha1=0
++//go:debug tlsunsafeekm=0
++//go:debug rsa1024min=1
++//go:debug x509negativeserial=0
++//go:debug tls10server=0
++package main
+diff -ruN a/cake_godebug_test.go b/cake_godebug_test.go
+--- a/cake_godebug_test.go	1970-01-01 03:00:00.000000000 +0300
++++ b/cake_godebug_test.go	2026-10-04 17:48:50.422043871 +0300
+@@ -0,0 +1,165 @@
++package main
++
++import (
++	"bytes"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"math/big"
++	"net"
++	"sync"
++	"testing"
++	"time"
++)
++
++// These tests run the program with the GODEBUG defaults that cake_godebug.go
++// sets. Each one fails if the old, weak default comes back.
++
++var (
++	testCertificateOnce sync.Once
++	testCertificate     tls.Certificate
++	testRoots           *x509.CertPool
++)
++
++func loadTestCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
++	t.Helper()
++	testCertificateOnce.Do(func() {
++		key, err := rsa.GenerateKey(rand.Reader, 2048)
++		if err != nil {
++			t.Fatal(err)
++		}
++		template := &x509.Certificate{
++			SerialNumber:          big.NewInt(1),
++			Subject:               pkix.Name{CommonName: "speedtest.test"},
++			DNSNames:              []string{"speedtest.test"},
++			NotBefore:             time.Now().Add(-time.Hour),
++			NotAfter:              time.Now().Add(time.Hour),
++			KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
++			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++			BasicConstraintsValid: true,
++			IsCA:                  true,
++		}
++		der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
++		if err != nil {
++			t.Fatal(err)
++		}
++		parsed, err := x509.ParseCertificate(der)
++		if err != nil {
++			t.Fatal(err)
++		}
++		testCertificate = tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: parsed}
++		testRoots = x509.NewCertPool()
++		testRoots.AddCert(parsed)
++	})
++	return testCertificate, testRoots
++}
++
++// handshake runs a TLS handshake over an in-memory pipe, so no network is used.
++func handshake(t *testing.T, server, client *tls.Config) (serverErr, clientErr error) {
++	t.Helper()
++	clientConn, serverConn := net.Pipe()
++	deadline := time.Now().Add(10 * time.Second)
++	_ = clientConn.SetDeadline(deadline)
++	_ = serverConn.SetDeadline(deadline)
++	done := make(chan error, 1)
++	go func() {
++		err := tls.Server(serverConn, server).Handshake()
++		if err != nil {
++			_ = serverConn.Close()
++		}
++		done <- err
++	}()
++	clientErr = tls.Client(clientConn, client).Handshake()
++	if clientErr != nil {
++		_ = clientConn.Close()
++	}
++	serverErr = <-done
++	_ = clientConn.Close()
++	_ = serverConn.Close()
++	return serverErr, clientErr
++}
++
++func TestCakeDefaultsRefuseRSAKeyExchange(t *testing.T) {
++	certificate, roots := loadTestCertificate(t)
++	server := &tls.Config{Certificates: []tls.Certificate{certificate}, MaxVersion: tls.VersionTLS12,
++		CipherSuites: []uint16{tls.TLS_RSA_WITH_AES_128_GCM_SHA256}}
++	client := &tls.Config{RootCAs: roots, ServerName: "speedtest.test", MaxVersion: tls.VersionTLS12}
++	serverErr, clientErr := handshake(t, server, client)
++	if serverErr == nil && clientErr == nil {
++		t.Fatal("a server that only offers RSA key exchange must not be accepted by default")
++	}
++}
++
++func TestCakeDefaultsRefuseTripleDES(t *testing.T) {
++	certificate, roots := loadTestCertificate(t)
++	server := &tls.Config{Certificates: []tls.Certificate{certificate}, MaxVersion: tls.VersionTLS12,
++		CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA}}
++	client := &tls.Config{RootCAs: roots, ServerName: "speedtest.test", MaxVersion: tls.VersionTLS12}
++	serverErr, clientErr := handshake(t, server, client)
++	if serverErr == nil && clientErr == nil {
++		t.Fatal("a server that only offers 3DES must not be accepted by default")
++	}
++}
++
++func TestCakeDefaultsKeepModernHandshake(t *testing.T) {
++	certificate, roots := loadTestCertificate(t)
++	for _, version := range []uint16{tls.VersionTLS12, tls.VersionTLS13} {
++		server := &tls.Config{Certificates: []tls.Certificate{certificate}, MaxVersion: version, MinVersion: version}
++		client := &tls.Config{RootCAs: roots, ServerName: "speedtest.test", MaxVersion: version, MinVersion: version}
++		if serverErr, clientErr := handshake(t, server, client); serverErr != nil || clientErr != nil {
++			t.Fatalf("TLS %x handshake with defaults failed: server %v, client %v", version, serverErr, clientErr)
++		}
++	}
++}
++
++func TestCakeDefaultsRefuseTLS10Server(t *testing.T) {
++	certificate, roots := loadTestCertificate(t)
++	server := &tls.Config{Certificates: []tls.Certificate{certificate}}
++	client := &tls.Config{RootCAs: roots, ServerName: "speedtest.test", MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS10}
++	serverErr, clientErr := handshake(t, server, client)
++	if serverErr == nil && clientErr == nil {
++		t.Fatal("a default server must not accept TLS 1.0")
++	}
++}
++
++func TestCakeDefaultsRefuseSmallRSAKeys(t *testing.T) {
++	if key, err := rsa.GenerateKey(rand.Reader, 512); err == nil {
++		t.Fatalf("a %d-bit RSA key must be refused by default", key.N.BitLen())
++	}
++}
++
++func TestCakeDefaultsRefuseNegativeSerialNumbers(t *testing.T) {
++	// x509.CreateCertificate never writes a negative serial number, so the
++	// certificate is built with the serial 127 (one byte, 0x7f) and that byte is
++	// flipped to 0xff (-1). The signature is then wrong, which parsing does not
++	// check; only the serial number is under test.
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatal(err)
++	}
++	template := &x509.Certificate{
++		SerialNumber: big.NewInt(0x7f),
++		Subject:      pkix.Name{CommonName: "negative.test"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++	}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// The serial number follows the version field: a0 03 02 01 02, 02 01 7f.
++	marker := []byte{0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x01, 0x7f}
++	at := bytes.Index(der, marker)
++	if at < 0 {
++		t.Fatal("serial number not found in the test certificate")
++	}
++	if _, err := x509.ParseCertificate(der); err != nil {
++		t.Fatalf("the unmodified certificate must parse: %v", err)
++	}
++	der[at+len(marker)-1] = 0xff
++	if _, err := x509.ParseCertificate(der); err == nil {
++		t.Fatal("a negative serial number must be refused by default")
++	}
++}

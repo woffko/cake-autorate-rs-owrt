@@ -43,8 +43,9 @@ $(call Package/cake-autorate-rs/Default)
   CONFLICTS:=cake-autorate-rs-lite
   DEFAULT_VARIANT:=1
   DEPENDS+=+nftables-json +speedtest-go
-  # Reject the stock r1 backend whose failed requests can retry without bound.
-  EXTRA_DEPENDS:=speedtest-go (>=1.7.10-r2)
+  # Reject the stock r1 backend whose failed requests can retry without bound,
+  # and every backend before r6, which runs with the TLS defaults of Go 1.19.
+  EXTRA_DEPENDS:=speedtest-go (>=1.7.10-r6)
 endef
 
 define Package/cake-autorate-rs-lite

@@ -96,18 +96,21 @@ Each release provides the daemon for these 12 OpenWrt 25.12 package ABIs. Run
 |---|---|---|
 | Daemon | `cake-autorate-rs` (per ABI) | `cake-autorate-rs-lite` (per ABI) |
 | LuCI | `luci-app-cake-autorate-rs` (noarch) | `luci-app-cake-autorate-rs-lite` (noarch) |
-| Speed test backend | `speedtest-go` 1.7.10-r2 or newer (per ABI, from this project) | not used |
+| Speed test backend | `speedtest-go` 1.7.10-r6 or newer (per ABI, from this project) | not used |
 
 Full and Lite conflict; install one complete pair and never mix a Full daemon
 with Lite LuCI. Other runtime dependencies (`sqm-scripts`, `fping`,
 `nftables-json`, `uclient-fetch`, CAKE/IFB kernel modules, `tc`) come from the
 router's OpenWrt package feeds, so the feeds must work.
 
-The Full daemon requires this project's `speedtest-go` build (1.7.10-r2 or
+The Full daemon requires this project's `speedtest-go` build (1.7.10-r6 or
 newer). The OpenWrt feed only has 1.7.10-r1, which lacks the bounded-failure,
-route-bound DNS and redirect fixes, so install the `speedtest-go` APK from the
-same release together with the Full pair. Our build ships only the
-`speedtest-go` CLI (about 8 MB installed).
+route-bound DNS and redirect fixes, and builds before r6 run with the TLS
+defaults of Go 1.19 (3DES, RSA key exchange, SHA-1 signatures). Install the
+`speedtest-go` APK from the same release together with the Full pair. Our build
+ships only the `speedtest-go` CLI (about 8 to 10 MB installed). It is a
+position-independent executable on every ABI except `mips_24kc` and
+`mipsel_24kc`, where Go cannot build one.
 
 ## Install
 

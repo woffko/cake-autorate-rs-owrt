@@ -42,15 +42,41 @@ CAKE Auto-Tune and took about 17 MiB of flash. apk extracts a whole package
 before replacing files, so on a small root filesystem the old 25 MiB package
 could not be upgraded at all.
 
+Revision 6 gives the backend the TLS defaults of current Go and builds it as a
+position-independent executable. The upstream module declares `go 1.19`, and the
+Go toolchain then runs the program with the GODEBUG defaults of that release,
+which is visible as `DefaultGODEBUG` in `go version -m /usr/bin/speedtest-go`.
+Among them were 3DES cipher suites (`tls3des=1`), RSA key exchange without
+forward secrecy (`tlsrsakex=1`), SHA-1 signatures in TLS 1.2 handshakes
+(`tlssha1=1`), exported keying material without the extended master secret
+(`tlsunsafeekm=1`), RSA keys below 1024 bits (`rsa1024min=0`) and certificates
+with a negative serial number (`x509negativeserial=1`). Patch 130 adds
+`cake_godebug.go` to the main package with a `//go:debug` line for each of them
+that sets the modern value, and for `tls10server=0`, which only concerns TLS
+servers (the backend runs none; it is set so that no legacy TLS default stays in
+the build info). Certificate verification, TLS 1.2 as the lowest version and the
+other defaults of `go 1.19` are unchanged. The patch includes offline tests
+(handshakes over an in-memory pipe) that fail when a weak default comes back,
+and the go command checks the directives at build time, so a later toolchain
+that no longer knows one of these settings stops the build instead of ignoring
+the line.
+
+The recipe sets `PKG_ASLR_PIE_REGULAR:=1`, which makes `golang-package.mk` build
+with `-buildmode pie` wherever Go supports it: every ABI except `mips_24kc` and
+`mipsel_24kc`, where the build warns that PIE is not supported and the binary
+stays an ordinary executable. `go version -m` shows `-buildmode=pie`, and the
+ELF header says `DYN` instead of `EXEC` on the ABIs that got it.
+
 SDK integration must select this package instead of the stock feed package,
 inside a disposable SDK only. Preserve the package name and executable path.
 Verify the resulting speedtest-go APK version, binary hash and Full daemon
 dependency separately. Passing these offline tests does not establish physical
 throughput, server qualification or traffic-budget acceptance.
 
-The Full daemon package requires `speedtest-go >= 1.7.10-r2`; Lite does not
+The Full daemon package requires `speedtest-go >= 1.7.10-r6`; Lite does not
 depend on the calibration backend. An installed r1 must not satisfy a new Full
-installation. Supply the verified patched APK together with the Full package
+installation, and neither may an r2 to r5 build, which has the legacy TLS
+defaults and is not a PIE. Supply the verified patched APK together with the Full package
 and test the package-manager transaction before installation. The version floor
 prevents the known r1 dependency from being silently reused; it is not a proof
 that an arbitrary third-party package carrying a newer version has this patch.
