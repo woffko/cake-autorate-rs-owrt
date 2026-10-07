@@ -449,8 +449,8 @@ plain MQTT broker.
 **MQTT TLS** encrypts the connection to the broker (MQTT over TLS) and checks
 the broker's certificate. It is on by default when you set up a publisher, and
 the port then defaults to 8883. A publisher that was saved before this option
-existed keeps speaking plain MQTT on port 1883 after an upgrade, and the option
-shows as off; turn it on when the broker is ready for TLS. Without TLS the user
+existed, enabled or not, keeps speaking plain MQTT on port 1883 after an upgrade,
+and the option shows as off; turn it on when the broker is ready for TLS. Without TLS the user
 name, the password and the metrics are sent unencrypted, so use plain MQTT only
 with a broker on a trusted local network.
 
