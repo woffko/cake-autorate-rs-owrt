@@ -11777,6 +11777,26 @@ fn replay_remaining_traffic_budget(
 /// rate, so the raw and shaped samples of a direction differ only in that
 /// direction's topology. Replay checks the repeat against the measured pair
 /// rates; this check binds it to the exact pair Review is built on.
+/// A raw-topology repeat keeps the other direction at the rate the confirmed
+/// pair selected. The replay refuses any other repeat, but only after its
+/// traffic is spent, so the runner checks the control with this rule first.
+fn topology_repeat_follows_pair(
+    pair: &NativePairConfirmationResult,
+    topology: MeasurementTopology,
+    candidate_dl_kbps: Option<u64>,
+    candidate_ul_kbps: Option<u64>,
+) -> bool {
+    match topology {
+        MeasurementTopology::RawDownload => {
+            candidate_dl_kbps.is_none() && candidate_ul_kbps == Some(pair.selected_ul_kbps)
+        }
+        MeasurementTopology::RawUpload => {
+            candidate_ul_kbps.is_none() && candidate_dl_kbps == Some(pair.selected_dl_kbps)
+        }
+        _ => false,
+    }
+}
+
 fn verify_topology_repeats_follow_pair(
     pair: &NativePairConfirmationResult,
     records: &[AutotuneEvidenceRecord],
@@ -11788,16 +11808,12 @@ fn verify_topology_repeats_follow_pair(
         if record.phase != AutotunePhase::TopologyComparison {
             continue;
         }
-        let follows_pair = match value.topology {
-            MeasurementTopology::RawDownload => {
-                value.candidate_ul_kbps == Some(pair.selected_ul_kbps)
-            }
-            MeasurementTopology::RawUpload => {
-                value.candidate_dl_kbps == Some(pair.selected_dl_kbps)
-            }
-            _ => false,
-        };
-        if !follows_pair {
+        if !topology_repeat_follows_pair(
+            pair,
+            value.topology,
+            value.candidate_dl_kbps,
+            value.candidate_ul_kbps,
+        ) {
             return Err(
                 "native Auto-Tune topology repeat contradicts the confirmed pair".to_string(),
             );
@@ -17708,6 +17724,19 @@ fn run_native_topology_comparison(
                 download_kbps,
                 upload_kbps,
             };
+            // Before any traffic: a repeat at another rate would only be
+            // refused by the replay after it had been measured.
+            if !topology_repeat_follows_pair(
+                &pair,
+                control.topology,
+                control.download_kbps,
+                control.upload_kbps,
+            ) {
+                return Err(
+                    "native Auto-Tune topology repeat control contradicts the confirmed pair"
+                        .to_string(),
+                );
+            }
             permit.authorizes(&request.identity.instance, &control, monotonic_boot_ms()?)?;
             transition_runtime_after_capture_cleanup(capture, || store.publish_control(&control))?;
             wait_for_runtime_applied(Some(session), store, permit, &control, terminate)?;
@@ -20993,6 +21022,64 @@ mod tests {
                 value
             }
         }
+    }
+
+    #[test]
+    fn a_topology_repeat_control_at_another_rate_is_refused_before_any_traffic() {
+        let (operation, proposal, records, confirmed, recommended) =
+            topology_ready_records_with_a_later_primary_pair();
+        let (dl, ul) = (confirmed.selected_dl_kbps, confirmed.selected_ul_kbps);
+        let follows = |topology, download, upload| {
+            topology_repeat_follows_pair(&confirmed, topology, download, upload)
+        };
+        // The controls the runner builds.
+        assert!(follows(MeasurementTopology::RawDownload, None, Some(ul)));
+        assert!(follows(MeasurementTopology::RawUpload, Some(dl), None));
+        // The recommended pair is a measured option, so the replay would accept
+        // a repeat at its rate; only the confirmed pair binds the repeat.
+        assert!(!follows(
+            MeasurementTopology::RawDownload,
+            None,
+            Some(recommended.upload_kbps)
+        ));
+        assert!(!follows(
+            MeasurementTopology::RawUpload,
+            Some(recommended.download_kbps),
+            None
+        ));
+        // The measured direction must be left unshaped, and no other topology
+        // is a repeat.
+        assert!(!follows(
+            MeasurementTopology::RawDownload,
+            Some(dl),
+            Some(ul)
+        ));
+        assert!(!follows(MeasurementTopology::RawUpload, Some(dl), Some(ul)));
+        assert!(!follows(
+            MeasurementTopology::ShapedBoth,
+            Some(dl),
+            Some(ul)
+        ));
+        // The replay's own verdict agrees on the shape the runner builds.
+        let mut with_repeat = records.clone();
+        push_measurement_record(
+            &mut with_repeat,
+            AutotunePhase::TopologyComparison,
+            topology_repeat(&proposal, EvidenceDirection::Download, ul),
+        );
+        verify_topology_repeats_follow_pair(&confirmed, &with_repeat).unwrap();
+        let mut wrong = records;
+        push_measurement_record(
+            &mut wrong,
+            AutotunePhase::TopologyComparison,
+            topology_repeat(
+                &proposal,
+                EvidenceDirection::Download,
+                recommended.upload_kbps,
+            ),
+        );
+        assert!(verify_topology_repeats_follow_pair(&confirmed, &wrong).is_err());
+        let _ = operation;
     }
 
     #[test]
