@@ -1476,9 +1476,7 @@ impl NftRoutePin {
         if matches!(socket_owner, NftSocketOwner::ProbeRootGid(0 | u32::MAX)) {
             return Err("speedtest-probe-group-invalid".into());
         }
-        if matches!(socket_owner, NftSocketOwner::ProbeRootGid(_))
-            && super::autotune_runtime_store::effective_uid() != 0
-        {
+        if matches!(socket_owner, NftSocketOwner::ProbeRootGid(_)) && sys::effective_uid() != 0 {
             return Err("probe accounting requires a root worker".into());
         }
         validate_utility_binary(Path::new(NFT), "nft")?;

@@ -2887,7 +2887,7 @@ where
         }
     };
     if !metadata.file_type().is_file()
-        || metadata.uid() != effective_uid()
+        || metadata.uid() != sys::effective_uid()
         || metadata.nlink() != 1
         || metadata.permissions().mode() & 0o777 != 0o600
     {
@@ -4731,7 +4731,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("unable to inspect native Auto-Tune directory: {error}"))?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != effective_uid()
+        || metadata.uid() != sys::effective_uid()
         || metadata.mode() & 0o077 != 0
     {
         return Err("native Auto-Tune directory is unsafe or foreign-owned".to_string());
@@ -4744,17 +4744,13 @@ fn ensure_private_regular(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("unable to inspect native Auto-Tune evidence file: {error}"))?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != effective_uid()
+        || metadata.uid() != sys::effective_uid()
         || metadata.mode() & 0o077 != 0
         || metadata.len() > MAX_AUTOTUNE_EVIDENCE_BYTES as u64
     {
         return Err("native Auto-Tune evidence file is unsafe or foreign-owned".to_string());
     }
     Ok(())
-}
-
-fn effective_uid() -> u32 {
-    sys::effective_uid()
 }
 
 fn evidence_name(sequence: u32) -> Result<String, String> {

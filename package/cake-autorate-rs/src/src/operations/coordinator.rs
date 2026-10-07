@@ -1037,7 +1037,7 @@ pub fn run_native_apply_worker<I>(mut args: I) -> Result<(), String>
 where
     I: Iterator<Item = String>,
 {
-    if euid() != 0 {
+    if sys::effective_uid() != 0 {
         return Err("native Apply worker requires root".to_string());
     }
     if args.next().as_deref() != Some("--state-dir") {
@@ -1154,7 +1154,7 @@ fn read_private_job_operation(state_dir: &Path, job_id: &str) -> Result<Operatio
             .map_err(|error| format!("unable to inspect calibration {label} directory: {error}"))?;
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
-            || metadata.uid() != euid()
+            || metadata.uid() != sys::effective_uid()
             || metadata.mode() & 0o077 != 0
         {
             return Err(format!(
@@ -2167,7 +2167,7 @@ fn execute_native_scheduled_auto_apply(
     if !context.plan.unattended_scheduler_eligible() {
         return Ok(NativeScheduledAutoApplyOutcome::ReviewRequired);
     }
-    if euid() != 0 {
+    if sys::effective_uid() != 0 {
         return Err("scheduled native Auto-Apply requires root".to_string());
     }
     let mut backend = OpenWrtNativeApplyBackend::new();
@@ -2480,7 +2480,7 @@ fn execute_native_apply_dispatch(
     state_dir: &Path,
     dispatch: &NativeApplyDispatchRecord,
 ) -> Result<(NativeApplyTerminalOutcome, bool), String> {
-    if euid() != 0 {
+    if sys::effective_uid() != 0 {
         return Err("native Apply requires root".to_string());
     }
     dispatch.validate()?;
@@ -2988,7 +2988,7 @@ where
 }
 
 pub(crate) fn native_autotune_apply_recovery() -> Result<String, String> {
-    if euid() != 0 {
+    if sys::effective_uid() != 0 {
         return Err("native Apply recovery requires root".to_string());
     }
     let outcome = recover_native_apply_outcome()?;
@@ -3127,7 +3127,7 @@ fn read_operation_request(path: &Path) -> Result<OperationRequest, String> {
         .map_err(|error| format!("unable to inspect operation request file: {error}"))?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != euid()
+        || metadata.uid() != sys::effective_uid()
         || metadata.mode() & 0o077 != 0
     {
         return Err("operation request file must be a private root-owned regular file".to_string());
@@ -3708,18 +3708,20 @@ impl CalibrationDaemon {
             .set_write_timeout(Some(IO_TIMEOUT))
             .map_err(|error| format!("unable to set control write timeout: {error}"))?;
         let (response, effect) = match peer_credentials(&stream) {
-            Ok(credentials) if credentials.uid == euid() => match read_request(&mut stream) {
-                Ok(CoordinatorControlRequest::NativeApply(request))
-                    if request.command == NativeApplyControlCommand::Watch =>
-                {
-                    return self.serve_native_apply_watch(stream, request).map(Some);
+            Ok(credentials) if credentials.uid == sys::effective_uid() => {
+                match read_request(&mut stream) {
+                    Ok(CoordinatorControlRequest::NativeApply(request))
+                        if request.command == NativeApplyControlCommand::Watch =>
+                    {
+                        return self.serve_native_apply_watch(stream, request).map(Some);
+                    }
+                    Ok(request) => self.dispatch_control_request(request),
+                    Err(error) => (
+                        error_response("invalid-request", &error),
+                        ControlEffect::ReadOnly,
+                    ),
                 }
-                Ok(request) => self.dispatch_control_request(request),
-                Err(error) => (
-                    error_response("invalid-request", &error),
-                    ControlEffect::ReadOnly,
-                ),
-            },
+            }
             Ok(_) => (
                 error_response(
                     "access-denied",
@@ -8884,7 +8886,7 @@ impl Drop for CalibrationDaemon {
             return;
         };
         if metadata.file_type().is_socket()
-            && metadata.uid() == euid()
+            && metadata.uid() == sys::effective_uid()
             && metadata.ino() == self.socket_inode
         {
             let _ = fs::remove_file(&self.socket_path);
@@ -8926,7 +8928,7 @@ fn private_append_log_file(path: &Path, label: &str) -> Result<fs::File, String>
         .metadata()
         .map_err(|error| format!("unable to inspect {label}: {error}"))?;
     if !metadata.is_file()
-        || metadata.uid() != euid()
+        || metadata.uid() != sys::effective_uid()
         || metadata.permissions().mode() & 0o777 != 0o600
         || metadata.nlink() != 1
     {
@@ -8948,7 +8950,7 @@ fn private_runtime_owner_log_file(path: &Path) -> Result<fs::File, String> {
         .metadata()
         .map_err(|error| format!("unable to inspect bootstrap runtime owner log: {error}"))?;
     if !metadata.is_file()
-        || metadata.uid() != euid()
+        || metadata.uid() != sys::effective_uid()
         || metadata.permissions().mode() & 0o777 != 0o600
         || metadata.nlink() != 1
     {
@@ -9260,7 +9262,10 @@ fn secure_state_dir(path: &Path) -> Result<(), String> {
     validate_state_path(path)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != euid() {
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != sys::effective_uid()
+            {
                 return Err("calibration state directory is unsafe or foreign-owned".to_string());
             }
         }
@@ -9312,14 +9317,10 @@ fn remove_stale_socket(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("unable to inspect stale control socket: {error}")),
     };
-    if !metadata.file_type().is_socket() || metadata.uid() != euid() {
+    if !metadata.file_type().is_socket() || metadata.uid() != sys::effective_uid() {
         return Err("refusing to replace unsafe calibration control path".to_string());
     }
     fs::remove_file(path).map_err(|error| format!("unable to remove stale control socket: {error}"))
-}
-
-fn euid() -> u32 {
-    sys::effective_uid()
 }
 
 fn reduce_timeout(current: &mut Option<Duration>, candidate: Duration) {
@@ -17944,7 +17945,7 @@ mod tests {
     fn unix_peer_credentials_are_exact_and_local() {
         let (left, _right) = UnixStream::pair().unwrap();
         let credentials = peer_credentials(&left).unwrap();
-        assert_eq!(credentials.uid, euid());
+        assert_eq!(credentials.uid, sys::effective_uid());
         assert!(credentials.pid > 0);
     }
 

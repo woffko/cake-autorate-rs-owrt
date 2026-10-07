@@ -22,8 +22,8 @@ const MAX_TOTAL_ENVIRONMENT_BYTES: usize = 8 * 1024;
 const MAX_STDIN_BYTES: usize = 256 * 1024;
 const WAIT_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(feature = "calibration")]
-const SIGTERM: i32 = 15;
-const SIGKILL: i32 = 9;
+const SIGTERM: i32 = libc::SIGTERM;
+const SIGKILL: i32 = libc::SIGKILL;
 
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {

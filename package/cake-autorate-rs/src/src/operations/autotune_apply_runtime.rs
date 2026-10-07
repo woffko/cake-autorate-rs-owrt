@@ -183,7 +183,7 @@ impl NativeApplyGlobalLock {
         })?;
         if !metadata.is_file()
             || metadata.nlink() != 1
-            || metadata.uid() != effective_uid()
+            || metadata.uid() != sys::effective_uid()
             || metadata.permissions().mode() & 0o777 != 0o600
         {
             return Err(NativeApplyGlobalLockAcquireError::Fatal(
@@ -2734,7 +2734,7 @@ pub(super) fn ensure_private_directory(path: &Path) -> Result<(), String> {
     } else {
         let metadata = fs::symlink_metadata(path)
             .map_err(|error| format!("unable to inspect native Apply directory: {error}"))?;
-        if !metadata.file_type().is_dir() || metadata.uid() != effective_uid() {
+        if !metadata.file_type().is_dir() || metadata.uid() != sys::effective_uid() {
             return Err("native Apply directory is not safely owned".to_string());
         }
         if metadata.permissions().mode() & 0o777 != 0o700 {
@@ -2757,7 +2757,7 @@ pub(super) fn require_private_directory(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("unable to inspect recovery directory: {error}"))?;
     if !metadata.file_type().is_dir()
-        || metadata.uid() != effective_uid()
+        || metadata.uid() != sys::effective_uid()
         || metadata.permissions().mode() & 0o777 != 0o700
     {
         return Err("native Apply recovery path is not a private directory".to_string());
@@ -2868,15 +2868,13 @@ pub(super) fn read_private_recovery_bounded(
 fn strict_regular_metadata(path: &Path, label: &str) -> Result<fs::Metadata, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("unable to inspect native Apply {label}: {error}"))?;
-    if !metadata.file_type().is_file() || metadata.uid() != effective_uid() || metadata.nlink() != 1
+    if !metadata.file_type().is_file()
+        || metadata.uid() != sys::effective_uid()
+        || metadata.nlink() != 1
     {
         return Err(format!("native Apply {label} is not a regular file"));
     }
     Ok(metadata)
-}
-
-fn effective_uid() -> u32 {
-    sys::effective_uid()
 }
 
 pub(super) fn reject_unknown_entries(path: &Path) -> Result<(), String> {

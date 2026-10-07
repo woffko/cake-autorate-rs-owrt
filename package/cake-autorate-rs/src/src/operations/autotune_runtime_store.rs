@@ -1546,7 +1546,7 @@ fn ensure_existing_directory(path: &Path, private: bool) -> Result<(), String> {
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(format!("{} is not a safe directory", path.display()));
     }
-    if metadata.uid() != effective_uid() {
+    if metadata.uid() != sys::effective_uid() {
         return Err(format!("{} has a foreign owner", path.display()));
     }
     if private && metadata.permissions().mode() & 0o777 != 0o700 {
@@ -1606,7 +1606,7 @@ fn clean_and_validate_entries(root: &Path) -> Result<(), String> {
 fn validate_private_file(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != effective_uid()
+        || metadata.uid() != sys::effective_uid()
         || metadata.permissions().mode() & 0o777 != 0o600
     {
         return Err(format!("{} is not a private regular file", path.display()));
@@ -1618,10 +1618,6 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("unable to sync {}: {error}", path.display()))
-}
-
-pub(crate) fn effective_uid() -> u32 {
-    sys::effective_uid()
 }
 
 fn parse_u64(name: &str, value: &str) -> Result<u64, String> {

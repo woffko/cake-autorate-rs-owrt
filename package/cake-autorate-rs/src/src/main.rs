@@ -4536,7 +4536,7 @@ impl TransportProbeRuntime {
                                     #[cfg(not(feature = "calibration"))]
                                     let traffic_gid = permanent_gid;
                                     #[cfg(feature = "calibration")]
-                                    if traffic_gid.is_some() && operations::autotune_runtime_store::effective_uid() != 0 {
+                                    if traffic_gid.is_some() && sys::effective_uid() != 0 {
                                         return Err(transport_probe::TransportProbeFailure::other("probe accounting requires a root controller".into()));
                                     }
                                     let binding = RouteBinding {
@@ -12087,7 +12087,7 @@ impl PingerRuntime {
             if matches!(gid, 0 | u32::MAX) {
                 return Err("bootstrap probe group is invalid".into());
             }
-            if operations::autotune_runtime_store::effective_uid() != 0 {
+            if sys::effective_uid() != 0 {
                 return Err("probe accounting requires a root pinger owner".into());
             }
             command.gid(gid);
