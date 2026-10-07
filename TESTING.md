@@ -797,3 +797,62 @@ previous one, backend `speedtest-go` r6:
 - The open question on the wait before admission (item 6 of the review: should it
   be bounded?) is unchanged: the duration is counted from admission by design.
 - Only x86_64 was run; the AArch64 packages were built and verified.
+
+## Changes after RC27 r320/r128: clean-up of duplicated code (unreleased)
+
+These results cover a clean-up that is meant to change no behaviour: the boot clock
+is read with one system call, the three eventfd drain loops and the two pidfd wait
+loops are shared, four wrappers around `sys::effective_uid` and two hand-copied
+signal numbers are gone, and a topology repeat is checked against the confirmed
+pair before its traffic starts.
+
+### Source gate and packages
+
+- Source gate 188, 57 commands: Full (1,837) and Lite (409) Rust tests, formatting,
+  clippy with undocumented unsafe blocks denied, LuCI JavaScript and TypeScript
+  checks, real-UCI tests; the hash of the sources before and after the run did not
+  change.
+- Daemon and LuCI packages for x86_64 and aarch64_cortex-a76 built from the same
+  gate and verified (payload, metadata, ELF, overflow checks on).
+
+### What changed
+
+- `sys::boottime_ms` reads `CLOCK_BOOTTIME`, the clock behind `/proc/uptime`, with
+  one `clock_gettime` call; `identity::monotonic_boot_ms` no longer opens and parses
+  a file on every event-loop and wait pass. A test compares it with `/proc/uptime`
+  (within its 10 ms resolution) and checks that it never goes back. The parser and
+  its tests are removed with the code they covered.
+- `sys::drain_u64` replaces the same loop in `event_loop.rs`, `main.rs` and
+  `bootstrap_runtime_owner.rs`; each caller keeps its own error messages.
+- `process::wait_pidfd` replaces the loops in `calibration_service.rs` and
+  `native_apply_lifecycle.rs`; the callers pass the names their messages used, so
+  every message is the same. `open_stable_pidfd` stays in two places on purpose: a
+  process that vanished is `None` in one and an error in the other.
+- `sys::effective_uid` is called directly; `process.rs` uses `libc::SIGTERM` and
+  `libc::SIGKILL`.
+- A raw-topology repeat must keep the other direction at the rate of the confirmed
+  pair. The replay refused anything else, but only after the repeat had been
+  measured. The runner now checks the control with the same rule
+  (`topology_repeat_follows_pair`) before it publishes it. The controls it builds
+  always passed that rule, so a run behaves as before; the check turns a wrong
+  control into an immediate error. No record or journal format changed.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+Candidate daemon `ffaf0b76` (Full and LuCI APK of gate 188), backend `speedtest-go`
+r6, installed over the previous build:
+
+- Service lifecycle (`goal-e-vm-service.py`, 33 checks: stop, start, restart,
+  reload, SIGTERM and SIGINT to the controller and the calibration daemon,
+  `--cpu-profile`, `--mqtt-status`, clean log and dmesg): all pass.
+- Speed Test (capped, current topology): completed in 24.5 s, 9,719 / 19,747 kbit/s.
+- Full Raw Auto-Tune: reached Review in 618 s with the options `throughput_first` and
+  `bypass_download` (so the topology comparison ran), topology and fixed state
+  restored, no pending UCI changes, service running, no panic or error in the log.
+
+### Known limits
+
+- The MQTT harness and the clock-step runs were not repeated: the clean-up does not
+  touch that code beyond the shared clock read, which the Speed Test and Auto-Tune
+  runs exercise.
+- Only x86_64 was run; the AArch64 packages were built and verified.
