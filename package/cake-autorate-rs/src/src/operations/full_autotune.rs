@@ -16371,6 +16371,42 @@ fn count_basis_restart(restarts: &mut u32) -> Result<(), CaptureWaitError> {
     Ok(())
 }
 
+/// Restarts while the capture has not started (the request is published and
+/// waiting to be admitted). They spend no traffic, so the tolerance for the
+/// traffic-spending kind above does not apply; a route that flaps for a while
+/// before the load is allowed to settle is waited out, bounded here and by the
+/// operation deadline. The count starts again whenever a capture is admitted.
+const MAX_ADMISSION_RESTARTS: u32 = 64;
+
+/// The two restart counts of one directional measurement.
+#[derive(Default)]
+struct MeasurementRestarts {
+    /// Losses after the load began: traffic is already spent, never reset.
+    after_load: u32,
+    /// Losses while waiting for the capture to start: no traffic spent.
+    before_load: u32,
+}
+
+impl MeasurementRestarts {
+    fn lost_before_load(&mut self) -> Result<(), CaptureWaitError> {
+        self.before_load = self.before_load.saturating_add(1);
+        if self.before_load > MAX_ADMISSION_RESTARTS {
+            return Err(CaptureWaitError::Failure(
+                MEASUREMENT_BASIS_UNSTABLE.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn lost_after_load(&mut self) -> Result<(), CaptureWaitError> {
+        count_basis_restart(&mut self.after_load)
+    }
+
+    fn admitted(&mut self) {
+        self.before_load = 0;
+    }
+}
+
 fn run_idle_baseline_with_recovery(
     session: &EmbeddedSpeedtestSession,
     operation: &OperationRequest,
@@ -16451,7 +16487,7 @@ fn run_directional_measurement_with_recovery(
         );
     }
     let runtime_snapshot_path = capture.request_path.with_file_name("rating-runtime");
-    let mut basis_restarts = 0u32;
+    let mut restarts = MeasurementRestarts::default();
     loop {
         capture.cleanup();
         wait_for_measurement_basis(
@@ -16497,9 +16533,9 @@ fn run_directional_measurement_with_recovery(
             CaptureWaitTarget::Admitted,
             terminate,
         ) {
-            Ok(_) => {}
+            Ok(_) => restarts.admitted(),
             Err(error) if error.is_restartable_measurement_basis_loss() => {
-                count_basis_restart(&mut basis_restarts)?;
+                restarts.lost_before_load()?;
                 continue;
             }
             Err(error) if error.requires_route_rearm() => {
@@ -16548,7 +16584,7 @@ fn run_directional_measurement_with_recovery(
         let (snapshot, load) = match load_result {
             Ok(value) => value,
             Err(error) if error.is_restartable_measurement_basis_loss() => {
-                count_basis_restart(&mut basis_restarts)?;
+                restarts.lost_after_load()?;
                 continue;
             }
             Err(error) if error.requires_route_rearm() => {
@@ -25833,6 +25869,53 @@ mod tests {
         let mut saturated = u32::MAX;
         assert!(count_basis_restart(&mut saturated).is_err());
         assert_eq!(saturated, u32::MAX);
+    }
+
+    #[test]
+    fn restarts_before_the_load_starts_do_not_use_up_the_traffic_tolerance() {
+        let mut restarts = MeasurementRestarts::default();
+        // A route that flaps while the capture waits to start: far more than
+        // the tolerance for restarts that cost traffic, and no error.
+        for _ in 0..MAX_MEASUREMENT_BASIS_RESTARTS * 3 {
+            restarts.lost_before_load().unwrap();
+        }
+        // The load then runs and loses its basis: the full tolerance is left.
+        restarts.admitted();
+        for _ in 0..MAX_MEASUREMENT_BASIS_RESTARTS {
+            restarts.lost_after_load().unwrap();
+        }
+        assert!(matches!(
+            restarts.lost_after_load().unwrap_err(),
+            CaptureWaitError::Failure(code) if code == MEASUREMENT_BASIS_UNSTABLE
+        ));
+    }
+
+    #[test]
+    fn restarts_before_the_load_are_bounded_and_start_again_when_a_capture_is_admitted() {
+        let mut restarts = MeasurementRestarts::default();
+        for _ in 0..MAX_ADMISSION_RESTARTS {
+            restarts.lost_before_load().unwrap();
+        }
+        assert!(matches!(
+            restarts.lost_before_load().unwrap_err(),
+            CaptureWaitError::Failure(code) if code == MEASUREMENT_BASIS_UNSTABLE
+        ));
+        let mut restarts = MeasurementRestarts::default();
+        for _ in 0..MAX_ADMISSION_RESTARTS {
+            restarts.lost_before_load().unwrap();
+        }
+        restarts.admitted();
+        restarts.lost_before_load().unwrap();
+        // Restarts after the load are never reset by an admission.
+        for _ in 0..MAX_MEASUREMENT_BASIS_RESTARTS {
+            restarts.lost_after_load().unwrap();
+        }
+        restarts.admitted();
+        assert!(restarts.lost_after_load().is_err());
+        // Counting never wraps.
+        restarts.before_load = u32::MAX;
+        assert!(restarts.lost_before_load().is_err());
+        assert_eq!(restarts.before_load, u32::MAX);
     }
 
     #[test]
