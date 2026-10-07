@@ -204,8 +204,12 @@ Speed Test, Rating or Auto-Tune early nor extend it.
   compare it with `monotonic_boot_ms()`. The anchor belongs to one boot: another
   boot ID is refused. The journal scan already classifies such a job as
   `StaleBoot` and never resumes it (the journal lives under `/var/run`, which a
-  reboot clears). A job that predates the anchor gets one from its remaining
-  wall-clock time at the first lookup.
+  reboot clears). A job of this boot that predates the anchor gets one from its
+  remaining wall-clock time when the store opens (`anchor_jobs_without_deadline`);
+  the lookup itself only reads, caches lasting failures and never writes. A job
+  of another boot without an anchor is refused and gets none. The duration is
+  counted from admission, so a wait before admission (for the coordinator
+  socket, say) is not part of the deadline.
 - A format that carries a wall-clock deadline and cannot change, the rating
   capture request `job|mode|deadline_s|phase|...`, is written from the remaining
   boot time at every publication. The controller reads the value when the
