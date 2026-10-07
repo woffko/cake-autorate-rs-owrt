@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_PROC_ROOT: &str = "/proc";
 pub const DEFAULT_BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 pub const DEFAULT_RANDOM_UUID_PATH: &str = "/proc/sys/kernel/random/uuid";
-pub const DEFAULT_UPTIME_PATH: &str = "/proc/uptime";
 
 /// Discovery is not ownership: a task can exit after its procfs file is opened.
 /// Only kernel absence is ignorable; permission and other I/O failures remain fatal.
@@ -258,7 +257,7 @@ pub fn monotonic_boot_ms() -> Result<u64, String> {
     if let Some(value) = test_clock::boot_ms() {
         return Ok(value);
     }
-    monotonic_boot_ms_from(Path::new(DEFAULT_UPTIME_PATH))
+    sys::boottime_ms().map_err(|error| format!("unable to read the boot clock: {error}"))
 }
 
 /// Scripted clocks for tests. The overrides are per thread, so tests that do
@@ -318,48 +317,6 @@ pub(crate) mod test_clock {
             WALL_MS.with(|value| value.set(None));
         }
     }
-}
-
-pub fn monotonic_boot_ms_from(path: &Path) -> Result<u64, String> {
-    let input = fs::read_to_string(path)
-        .map_err(|error| format!("unable to read {}: {error}", path.display()))?;
-    parse_uptime_ms(&input)
-}
-
-fn parse_uptime_ms(input: &str) -> Result<u64, String> {
-    if input.len() > 256 {
-        return Err("kernel uptime record is malformed".to_string());
-    }
-    let input = input.strip_suffix('\n').unwrap_or(input);
-    if input.contains(['\n', '\r', '\0']) {
-        return Err("kernel uptime record is malformed".to_string());
-    }
-    let value = input
-        .split_ascii_whitespace()
-        .next()
-        .ok_or_else(|| "kernel uptime is missing".to_string())?;
-    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
-    if seconds.is_empty()
-        || seconds.bytes().any(|byte| !byte.is_ascii_digit())
-        || fraction.bytes().any(|byte| !byte.is_ascii_digit())
-    {
-        return Err("kernel uptime is not numeric".to_string());
-    }
-    let seconds = seconds
-        .parse::<u64>()
-        .map_err(|_| "kernel uptime seconds overflow".to_string())?;
-    let mut milliseconds = 0u64;
-    let mut scale = 100u64;
-    for digit in fraction.bytes().take(3) {
-        milliseconds = milliseconds
-            .checked_add(u64::from(digit - b'0') * scale)
-            .ok_or_else(|| "kernel uptime milliseconds overflow".to_string())?;
-        scale /= 10;
-    }
-    seconds
-        .checked_mul(1_000)
-        .and_then(|value| value.checked_add(milliseconds))
-        .ok_or_else(|| "kernel uptime milliseconds overflow".to_string())
 }
 
 #[cfg(test)]
@@ -500,15 +457,5 @@ mod tests {
         fs::remove_file(proc_dir.join("stat")).unwrap();
         fs::remove_dir(proc_dir).unwrap();
         fs::remove_dir(root).unwrap();
-    }
-
-    #[test]
-    fn kernel_uptime_is_parsed_without_floating_point_or_wall_clock() {
-        assert_eq!(parse_uptime_ms("123.45 99.00").unwrap(), 123_450);
-        assert_eq!(parse_uptime_ms("7.001 1.0").unwrap(), 7_001);
-        assert_eq!(parse_uptime_ms("9 1").unwrap(), 9_000);
-        assert_eq!(parse_uptime_ms("10.25 4.0\n").unwrap(), 10_250);
-        assert!(parse_uptime_ms("1e3 1").is_err());
-        assert!(parse_uptime_ms("\n").is_err());
     }
 }

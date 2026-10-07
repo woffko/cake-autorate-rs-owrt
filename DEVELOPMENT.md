@@ -195,7 +195,7 @@ Speed Test, Rating or Auto-Tune early nor extend it.
 - A request keeps `created_unix_ms` and `deadline_unix_ms`; the record format
   is unchanged. When the coordinator admits a job, `JournalStore::create`
   anchors the duration `deadline_unix_ms - created_unix_ms` on the kernel boot
-  clock (`/proc/uptime` through `identity::monotonic_boot_ms`) and writes it as
+  clock (`CLOCK_BOOTTIME` through `identity::monotonic_boot_ms`) and writes it as
   the file `deadline` beside the request. The file is private and written
   atomically: a header, the `boot_id` and `deadline_boot_ms`
   (`operations/deadline.rs`).

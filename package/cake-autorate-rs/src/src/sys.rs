@@ -94,6 +94,26 @@ pub(crate) fn flock(file: impl AsFd, operation: libc::c_int) -> io::Result<()> {
     check(unsafe { libc::flock(file.as_fd().as_raw_fd(), operation) })
 }
 
+/// Milliseconds on the kernel boot clock (`CLOCK_BOOTTIME`): the clock behind
+/// `/proc/uptime`, which keeps counting through a suspend and which a step of
+/// the wall clock never moves. One system call, no file to open or parse.
+pub(crate) fn boottime_ms() -> io::Result<u64> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime(2) writes one timespec through the pointer, which
+    // is a valid, exclusive reference to a local value for the whole call.
+    check(unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) })?;
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "the boot clock is out of range");
+    let seconds = u64::try_from(now.tv_sec).map_err(|_| invalid())?;
+    let nanoseconds = u64::try_from(now.tv_nsec).map_err(|_| invalid())?;
+    seconds
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(nanoseconds / 1_000_000))
+        .ok_or_else(invalid)
+}
+
 /// A pidfd for process `pid`: readable once the process has exited. A number
 /// that is not a process id at all is `EINVAL`, as the kernel answers it.
 pub(crate) fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
@@ -535,6 +555,26 @@ mod tests {
         // A descriptor that cannot be read is an error, not an empty counter.
         let directory = File::open("/").unwrap();
         assert!(drain_u64(&directory).is_err());
+    }
+
+    #[test]
+    fn the_boot_clock_agrees_with_proc_uptime_and_never_goes_back() {
+        let first = boottime_ms().unwrap();
+        let uptime = fs::read_to_string("/proc/uptime").unwrap();
+        let from_proc = (uptime
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap()
+            * 1000.0) as u64;
+        let second = boottime_ms().unwrap();
+        assert!(first > 0 && second >= first);
+        // /proc/uptime is read between the two calls and has 10 ms resolution.
+        assert!(
+            from_proc + 20 >= first && from_proc <= second + 20,
+            "{first} {from_proc} {second}"
+        );
     }
 
     #[test]
