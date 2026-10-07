@@ -675,3 +675,71 @@ the same before and after.
   3DES or SHA-1 signatures would now fail where r5 succeeded. None of the 20
   servers of the list the VM sees do; other locations and later lists were not
   checked.
+
+## Changes after RC27 r320/r128: MQTT TLS review fixes (unreleased)
+
+These results cover three fixes found in a review of the MQTT over TLS work: a
+slow broker could stretch the TLS handshake past its limit, a TLS record without
+MQTT data could stop the publisher, and the settings page could turn a disabled
+old publisher to TLS. Nothing else changed.
+
+### Source gate and packages
+
+- Source gate 186, 57 commands: Full (1,830, three more than before) and Lite
+  (407) Rust tests, formatting, clippy, LuCI JavaScript and TypeScript checks,
+  real-UCI tests, and a hash of the sources before and after the run, which did
+  not change.
+- Daemon and LuCI packages for x86_64 and aarch64_cortex-a76 were built from the
+  same gate and verified (payload, metadata, ELF, overflow checks on).
+
+### What changed, and the test that fails without it
+
+- The handshake runs one write or read step at a time, each bounded by what is
+  left of the 10 s limit, instead of `complete_io`, which keeps reading while the
+  handshake needs more. `a_broker_that_dribbles_bytes_cannot_hold_the_tls_handshake_open`
+  sends a record header and then a byte every 200 ms; with the old code it never
+  returned, now it fails with "timed out" after the limit (1 s in the test).
+- A readable socket is read without blocking before the MQTT read; a record
+  without application data sends the publisher back to `poll`. A closed
+  connection is still an error.
+  `a_tls_record_without_mqtt_data_does_not_stop_the_publisher` has the broker
+  send a TLS 1.3 KeyUpdate 1.2 s before the next packet: the old code waited
+  1.19 s inside the read, the new code returns at once, still reads the
+  PINGRESP behind it and still reports a DISCONNECT. A second test checks that a
+  broker that just closes the socket ends the wakeup with an error.
+- LuCI: the form shows plain MQTT for a section that holds any MQTT setting but
+  no `mqtt_tls`, enabled or not. `tests/mqtt-tls.test.js` has the cases (a
+  disabled publisher with or without a host, a host without the flag, empty
+  values, a disabled publisher that chose TLS); the first fails without the fix.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+The MQTT harness (`goal-c-vm-mqtt.py`, a real Mosquitto on the Linux test VM,
+clock block left out) ran on the candidate: 194 checks passed and two failed,
+neither a defect of the product:
+
+- `old status has no TLS fields` assumes the installed "old" daemon predates TLS;
+  the VM already ran the previous goal's daemon, which reports them.
+- `LuCI (disabled)` is the new scenario; the first version of its browser script
+  clicked the Check MQTT button, which a disabled publisher does not show. The
+  script was corrected and the scenario run again on its own: the page serves the
+  `settings.js` of the source tree, the saved `mqtt_enabled=0` with a host and no
+  `mqtt_tls` shows TLS off with the plain notice and no TLS fields after the
+  publisher is ticked on, and nothing is saved.
+
+New scenario in the harness: a listener on the broker host sends a TLS record
+header and then a byte a second for three minutes; `--mqtt-status` on the router
+with TLS on returned after 9.3 s with `tls_handshake: failed` and "MQTT TLS
+handshake timed out". The upgrade, TLS cases, reload, broker loss, last will,
+clean stop and 100 s keepalive scenarios passed as before. The VM was left on
+the candidate daemon (`e2e4f407`), with its MQTT options removed and the
+configuration equal to the original.
+
+### Known limits
+
+- The dribble scenario was not run against the old daemon on the VM; the unit
+  test that hangs with the old code is the evidence for that.
+- A section that LuCI saved with the publisher off after this release has no
+  `mqtt_tls` either, so ticking it on later shows TLS off and the user turns it
+  on; the daemon would run plain MQTT for it too.
+- Only x86_64 was run; the AArch64 packages were built and verified.
