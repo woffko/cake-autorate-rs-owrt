@@ -973,7 +973,9 @@ pub struct JournalScan {
 pub struct JournalStore {
     jobs_dir: PathBuf,
     coordinator: CoordinatorIdentity,
-    deadlines: Mutex<BTreeMap<String, OperationDeadline>>,
+    /// Deadlines by job. A lookup that failed for a lasting reason (no such
+    /// job, no anchor, another boot) is kept too, so the disk is read once.
+    deadlines: Mutex<BTreeMap<String, Result<OperationDeadline, String>>>,
 }
 
 impl JournalStore {
@@ -986,7 +988,65 @@ impl JournalStore {
             deadlines: Mutex::new(BTreeMap::new()),
         };
         store.finish_interrupted_retirements()?;
+        store.anchor_jobs_without_deadline()?;
         Ok(store)
+    }
+
+    fn deadline_cache(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<String, Result<OperationDeadline, String>>> {
+        // A poisoned lock only means another thread panicked while holding it;
+        // the map itself is always consistent.
+        self.deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A job admitted by a release that did not anchor deadlines has no anchor
+    /// file. When the coordinator opens its store, every such job of this boot
+    /// gets one from its remaining wall-clock time, once, here, so that the
+    /// deadline lookup in the event loop never writes. A job of another boot
+    /// is left without: its time on the old boot clock is unknown and the
+    /// scan treats it as interrupted.
+    fn anchor_jobs_without_deadline(&self) -> Result<(), String> {
+        let entries = fs::read_dir(&self.jobs_dir)
+            .map_err(|error| format!("unable to inspect journals for deadlines: {error}"))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("unable to inspect a journal entry: {error}"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if require_lower_hex("job directory", &name, 32).is_err() {
+                continue;
+            }
+            let job_dir = entry.path();
+            if secure_existing_job_dir(&job_dir).is_err()
+                || job_dir
+                    .join(deadline::DEADLINE_FILE)
+                    .symlink_metadata()
+                    .is_ok()
+            {
+                continue;
+            }
+            let (Ok(state), Ok(request)) = (
+                read_bounded(&job_dir.join(STATE_FILE)),
+                read_bounded(&job_dir.join(REQUEST_FILE)),
+            ) else {
+                continue;
+            };
+            let (Ok(journal), Ok(request)) = (
+                JobJournal::decode(&state),
+                OperationRequest::decode(&request),
+            ) else {
+                continue;
+            };
+            if journal.boot_id != self.coordinator.boot_id {
+                continue;
+            }
+            let deadline =
+                deadline::load_on_boot(&job_dir, &request, &self.coordinator.boot_id, true)?;
+            self.deadline_cache().insert(name, Ok(deadline));
+        }
+        Ok(())
     }
 
     pub fn create(&self, request: &OperationRequest, journal: &JobJournal) -> Result<(), String> {
@@ -1036,35 +1096,80 @@ impl JournalStore {
         }) {
             return Err(format!("unable to initialize job journal: {error}"));
         }
-        if let Ok(mut cache) = self.deadlines.lock() {
-            cache.insert(
-                journal.job_id.clone(),
-                OperationDeadline::at_boot_ms(anchor.deadline_boot_ms),
-            );
-        }
+        self.deadline_cache().insert(
+            journal.job_id.clone(),
+            Ok(OperationDeadline::at_boot_ms(anchor.deadline_boot_ms)),
+        );
         Ok(())
     }
 
-    /// The monotonic deadline of an admitted job. It is read from the job
-    /// directory once; a job that predates anchors gets one from its remaining
-    /// wall-clock time, stored so that every process agrees on it.
+    /// The monotonic deadline of an admitted job. It never writes: the anchor
+    /// was stored at admission (or, for a job of an older release, when the
+    /// store was opened) and is read from the job directory once.
     pub fn deadline(&self, request: &OperationRequest) -> Result<OperationDeadline, String> {
         let job_id = &request.identity.job_id;
-        if let Some(value) = self
-            .deadlines
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(job_id).copied())
-        {
-            return Ok(value);
+        if let Some(known) = self.deadline_cache().get(job_id) {
+            return known.clone();
         }
+        let (result, lasting) = self.read_deadline(job_id);
+        if lasting {
+            self.deadline_cache().insert(job_id.clone(), result.clone());
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn deadline_without_cache_for_test(
+        &self,
+        request: &OperationRequest,
+    ) -> Result<OperationDeadline, String> {
+        self.read_deadline(&request.identity.job_id).0
+    }
+
+    /// The anchor of a job from disk, and whether a failure is lasting (worth
+    /// remembering) rather than a passing I/O error.
+    fn read_deadline(&self, job_id: &str) -> (Result<OperationDeadline, String>, bool) {
         let job_dir = self.jobs_dir.join(job_id);
-        secure_existing_job_dir(&job_dir)?;
-        let value = deadline::load_on_boot(&job_dir, request, &self.coordinator.boot_id, true)?;
-        if let Ok(mut cache) = self.deadlines.lock() {
-            cache.insert(job_id.clone(), value);
+        match fs::symlink_metadata(&job_dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return (
+                    Err(format!("operation {job_id} has no job directory")),
+                    true,
+                );
+            }
+            Err(error) => {
+                return (
+                    Err(format!("unable to inspect the job directory: {error}")),
+                    false,
+                )
+            }
         }
-        Ok(value)
+        if let Err(error) = secure_existing_job_dir(&job_dir) {
+            return (Err(error), false);
+        }
+        match deadline::load_existing(&job_dir, &self.coordinator.boot_id) {
+            Ok(Some(value)) => (Ok(value), true),
+            Err(error) => {
+                let lasting = error == "operation-deadline-from-another-boot";
+                (Err(error), lasting)
+            }
+            Ok(None) => {
+                // No anchor, and none was made when the store opened: the job
+                // belongs to another boot (or its anchor could not be written).
+                let other_boot = read_bounded(&job_dir.join(STATE_FILE))
+                    .and_then(|text| JobJournal::decode(&text))
+                    .map(|journal| journal.boot_id != self.coordinator.boot_id);
+                match other_boot {
+                    Ok(true) => (
+                        Err("operation-deadline-from-another-boot".to_string()),
+                        true,
+                    ),
+                    Ok(false) => (Err("operation-deadline-missing".to_string()), false),
+                    Err(error) => (Err(error), false),
+                }
+            }
+        }
     }
 
     pub fn update(&self, journal: &JobJournal) -> Result<(), String> {
@@ -1250,9 +1355,7 @@ impl JournalStore {
         sync_directory(&self.jobs_dir)?;
         fs::remove_dir_all(&retired)
             .map_err(|error| format!("unable to remove retired settled journal: {error}"))?;
-        if let Ok(mut cache) = self.deadlines.lock() {
-            cache.remove(&expected.journal.job_id);
-        }
+        self.deadline_cache().remove(&expected.journal.job_id);
         sync_directory(&self.jobs_dir)
     }
 
@@ -1872,6 +1975,80 @@ mod tests {
         reopened.retire_settled_job(&scanned, &proc_root).unwrap();
         assert!(!job_dir.exists());
         assert!(reopened.deadline(&request).is_err());
+        cleanup(&root);
+    }
+
+    fn legacy_job(root: &Path, coordinator: &CoordinatorIdentity) -> (OperationRequest, PathBuf) {
+        // A job as an older release left it: request and state, no anchor.
+        let store = JournalStore::open(root, coordinator.clone()).unwrap();
+        let mut request = request();
+        request.created_unix_ms = 1_790_000_000_000;
+        request.deadline_unix_ms = request.created_unix_ms + 45 * 60_000;
+        let journal = JobJournal::queued(&request, coordinator, true).unwrap();
+        store.create(&request, &journal).unwrap();
+        let job_dir = root.join(JOBS_DIR).join(&journal.job_id);
+        fs::remove_file(job_dir.join(deadline::DEADLINE_FILE)).unwrap();
+        (request, job_dir)
+    }
+
+    #[test]
+    fn a_job_without_an_anchor_gets_one_when_the_store_opens_and_the_lookup_never_writes() {
+        use crate::operations::identity::test_clock::ScriptedClocks;
+        let clocks = ScriptedClocks::install(2_000_000, 1_790_000_000_000);
+        let root = temp_root("deadline-legacy-open");
+        cleanup(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let coordinator = coordinator();
+        let (request, job_dir) = legacy_job(&root, &coordinator);
+        let anchor_path = job_dir.join(deadline::DEADLINE_FILE);
+        assert!(!anchor_path.exists());
+        // Ten minutes pass, then the coordinator starts again in the same boot.
+        clocks.advance(10 * 60_000);
+        let store = JournalStore::open(&root, coordinator.clone()).unwrap();
+        assert!(
+            anchor_path.exists(),
+            "the anchor is made when the store opens"
+        );
+        // 35 of the 45 minutes are left, counted from the boot clock now.
+        let expected = OperationDeadline::at_boot_ms(2_000_000 + 10 * 60_000 + 35 * 60_000);
+        assert_eq!(store.deadline(&request).unwrap(), expected);
+        // The lookup is a read: with the file gone it reports and writes nothing.
+        fs::remove_file(&anchor_path).unwrap();
+        assert_eq!(
+            store.deadline_without_cache_for_test(&request).unwrap_err(),
+            "operation-deadline-missing"
+        );
+        assert!(!anchor_path.exists(), "a deadline lookup must not write");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn a_job_of_another_boot_without_an_anchor_is_refused_not_given_this_boots() {
+        use crate::operations::identity::test_clock::ScriptedClocks;
+        let _clocks = ScriptedClocks::install(2_000_000, 1_790_000_000_000);
+        let root = temp_root("deadline-legacy-boot");
+        cleanup(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut old_boot = coordinator();
+        old_boot.boot_id = "88888888888888888888888888888888".to_string();
+        let (request, job_dir) = legacy_job(&root, &old_boot);
+        let store = JournalStore::open(&root, coordinator()).unwrap();
+        assert_eq!(
+            store.deadline(&request).unwrap_err(),
+            "operation-deadline-from-another-boot"
+        );
+        assert!(
+            !job_dir.join(deadline::DEADLINE_FILE).exists(),
+            "no anchor may be made for a job of another boot"
+        );
+        // The refusal is remembered: the answer does not depend on the disk again.
+        fs::remove_dir_all(&job_dir).unwrap();
+        assert_eq!(
+            store.deadline(&request).unwrap_err(),
+            "operation-deadline-from-another-boot"
+        );
         cleanup(&root);
     }
 

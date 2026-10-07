@@ -218,6 +218,22 @@ pub fn load_on_boot(
     }
 }
 
+/// The deadline stored in `job_directory` for the boot `boot_id`, or `None`
+/// when the job has no anchor file. Reads only; never creates the anchor.
+pub fn load_existing(
+    job_directory: &Path,
+    boot_id: &str,
+) -> Result<Option<OperationDeadline>, String> {
+    let path = job_directory.join(DEADLINE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => DeadlineAnchor::decode(&read_private_bounded(&path, MAX_DEADLINE_BYTES)?)?
+            .on_boot(boot_id)
+            .map(Some),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("unable to inspect the operation deadline: {error}")),
+    }
+}
+
 /// The deadline for a worker process that was started with `--request`.
 pub fn load_for_worker(
     request_path: &Path,
