@@ -21,14 +21,13 @@ use super::sqm_recovery_openwrt::{error_message as sqm_error_message, ManagedSqm
 use crate::sys;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const CAKE_PACKAGE: &str = "cake-autorate";
 const SQM_PACKAGE: &str = "sqm";
@@ -457,7 +456,12 @@ impl SelectedLifecycleBackend for OpenWrtSelectedLifecycle<'_> {
             "delete the selected procd controller",
         )?;
         if let Some(pidfd) = pidfd.as_ref() {
-            wait_pidfd(pidfd, CONTROLLER_STOP_TIMEOUT)?;
+            super::process::wait_pidfd(
+                pidfd,
+                CONTROLLER_STOP_TIMEOUT,
+                "selected controller",
+                "selected controller",
+            )?;
         }
         if find_controller(&self.paths.proc_root, instance)?.is_some() {
             return Err(format!(
@@ -867,45 +871,6 @@ fn open_stable_pidfd(proc_root: &Path, identity: &ProcessIdentity) -> Result<Own
         return Err("selected controller identity changed while opening pidfd".to_string());
     }
     Ok(fd)
-}
-
-fn wait_pidfd(pidfd: &OwnedFd, timeout: Duration) -> Result<(), String> {
-    let started = Instant::now();
-    loop {
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(
-                "selected controller did not stop before its watchdog deadline".to_string(),
-            );
-        }
-        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = match sys::poll(std::slice::from_mut(&mut descriptor), timeout_ms) {
-            Ok(ready) => ready,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                return Err(format!(
-                    "unable to wait for selected controller exit: {error}"
-                ));
-            }
-        };
-        if ready == 0 {
-            return Err(
-                "selected controller did not stop before its watchdog deadline".to_string(),
-            );
-        }
-        if descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            return Ok(());
-        }
-        return Err(format!(
-            "unable to wait for selected controller exit: unexpected poll events {:#x}",
-            descriptor.revents
-        ));
-    }
 }
 
 fn attest_selected_sqm_absent(

@@ -13,7 +13,7 @@ use super::{
 use crate::sys;
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -330,7 +330,12 @@ fn confirm_calibration_service_stopped(
     }
     let started = Instant::now();
     for (identity, pidfd) in pidfds {
-        wait_pidfd(&pidfd, timeout.saturating_sub(started.elapsed()))?;
+        super::process::wait_pidfd(
+            &pidfd,
+            timeout.saturating_sub(started.elapsed()),
+            "calibration service",
+            "calibration service process",
+        )?;
         if identity.still_matches(proc_root)? {
             return Err(format!(
                 "calibration service process {} remained live after its pidfd signalled",
@@ -504,48 +509,6 @@ fn open_stable_pidfd(
         return Ok(None);
     }
     Ok(Some(pidfd))
-}
-
-fn wait_pidfd(pidfd: &OwnedFd, timeout: Duration) -> Result<(), String> {
-    if timeout.is_zero() {
-        return Err("calibration service did not stop before its watchdog deadline".to_string());
-    }
-    let started = Instant::now();
-    loop {
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(
-                "calibration service did not stop before its watchdog deadline".to_string(),
-            );
-        }
-        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = match sys::poll(std::slice::from_mut(&mut descriptor), timeout_ms) {
-            Ok(ready) => ready,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                return Err(format!(
-                    "unable to wait for calibration service process exit: {error}"
-                ));
-            }
-        };
-        if ready == 0 {
-            return Err(
-                "calibration service did not stop before its watchdog deadline".to_string(),
-            );
-        }
-        if descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            return Ok(());
-        }
-        return Err(format!(
-            "unable to wait for calibration service process exit: unexpected poll events {:#x}",
-            descriptor.revents
-        ));
-    }
 }
 
 fn prepare_calibration_service(backend: &mut impl CalibrationServiceBackend) -> Result<(), String> {

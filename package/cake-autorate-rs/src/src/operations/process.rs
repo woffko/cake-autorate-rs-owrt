@@ -546,6 +546,51 @@ fn drain_bounded<R: Read>(mut reader: R, output_limit: usize) -> io::Result<Boun
     }
 }
 
+/// Wait until the process behind `pidfd` has exited, for at most `timeout`.
+/// `subject` names the process in "did not stop" errors and `exit_subject` in
+/// errors about the wait itself (the callers' established wording).
+pub(super) fn wait_pidfd(
+    pidfd: &std::os::fd::OwnedFd,
+    timeout: Duration,
+    subject: &str,
+    exit_subject: &str,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(format!(
+                "{subject} did not stop before its watchdog deadline"
+            ));
+        }
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = match sys::poll(std::slice::from_mut(&mut descriptor), timeout_ms) {
+            Ok(ready) => ready,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(format!("unable to wait for {exit_subject} exit: {error}"));
+            }
+        };
+        if ready == 0 {
+            return Err(format!(
+                "{subject} did not stop before its watchdog deadline"
+            ));
+        }
+        if descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            return Ok(());
+        }
+        return Err(format!(
+            "unable to wait for {exit_subject} exit: unexpected poll events {:#x}",
+            descriptor.revents
+        ));
+    }
+}
+
 #[cfg(feature = "calibration")]
 pub fn signal_adopted_group(
     identity: &ProcessIdentity,
@@ -629,6 +674,36 @@ fn validate_program(program: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_on_a_pidfd_ends_with_the_process_or_with_the_named_deadline_error() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pidfd = sys::pidfd_open(child.id()).unwrap();
+        let error = wait_pidfd(
+            &pidfd,
+            Duration::from_millis(50),
+            "the sleeper",
+            "the sleeper process",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "the sleeper did not stop before its watchdog deadline"
+        );
+        assert_eq!(
+            wait_pidfd(&pidfd, Duration::ZERO, "the sleeper", "x").unwrap_err(),
+            "the sleeper did not stop before its watchdog deadline"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        wait_pidfd(
+            &pidfd,
+            Duration::from_secs(5),
+            "the sleeper",
+            "the sleeper process",
+        )
+        .unwrap();
+    }
     #[cfg(feature = "calibration")]
     use std::fs::OpenOptions;
     use std::io::Cursor;
