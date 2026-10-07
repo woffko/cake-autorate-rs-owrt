@@ -743,3 +743,57 @@ configuration equal to the original.
   `mqtt_tls` either, so ticking it on later shows TLS off and the user turns it
   on; the daemon would run plain MQTT for it too.
 - Only x86_64 was run; the AArch64 packages were built and verified.
+
+## Changes after RC27 r320/r128: restart limits and deadline anchors (unreleased)
+
+These results cover two fixes found in a review: the restart limit of an Auto-Tune
+measurement counted restarts that had used no traffic, and a deadline lookup could
+write a file and give a job of an earlier boot an anchor of this boot. Nothing else
+changed; the deadline of a job is still counted from its admission.
+
+### Source gate and packages
+
+- Source gate 187, 57 commands: Full (1,834) and Lite (407) Rust tests, formatting,
+  clippy, LuCI JavaScript and TypeScript checks, real-UCI tests; the hash of the
+  sources before and after the run did not change.
+- Daemon and LuCI packages for x86_64 and aarch64_cortex-a76 built from the same
+  gate and verified (payload, metadata, ELF, overflow checks on).
+
+### What changed, and the test that fails without it
+
+- A measurement loses its basis when a route or runtime resets. Before the load
+  starts that costs no traffic, but it was counted with the losses after the load
+  began against one limit of 8, never reset, so a flapping route could end a run
+  before any load. `MeasurementRestarts` keeps two counts: after the load (limit
+  8, never reset) and before it (limit 64, reset when a capture is admitted). The
+  two tests were run against a build where the early losses used the old counter:
+  both fail.
+- `JournalStore::deadline` is called on every event-loop pass. For a job without
+  an anchor file (admitted by a release before anchors) it wrote the anchor from
+  the remaining wall-clock time and stamped it with the current boot ID, so a job
+  of an earlier boot was taken for one of this boot. Such jobs of this boot are now
+  anchored once when the store opens (`anchor_jobs_without_deadline`), the lookup
+  only reads, a job of another boot without an anchor is refused with
+  `operation-deadline-from-another-boot` and gets none, and a lasting failure is
+  remembered instead of re-reading the disk every time. A poisoned cache lock is
+  recovered instead of skipped. Two journal tests cover the open-time anchor, the
+  read-only lookup and the other-boot refusal.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+Candidate daemon `ad32c7c5` (Full and LuCI APK of gate 187) installed over the
+previous one, backend `speedtest-go` r6:
+
+- Speed Test (capped, current topology): completed in 24.6 s, 10,380 / 19,436
+  kbit/s.
+- Full Raw Auto-Tune: reached Review in 893 s, topology and fixed state restored,
+  no pending UCI changes, service running, no panic or deadline error in the log.
+
+### Known limits
+
+- The two fixes concern paths that a healthy run does not enter (a flapping route
+  before the load, a job left by an older release): the VM runs show that the
+  normal paths still work, the unit tests show the fixed behaviour.
+- The open question on the wait before admission (item 6 of the review: should it
+  be bounded?) is unchanged: the duration is counted from admission by design.
+- Only x86_64 was run; the AArch64 packages were built and verified.
