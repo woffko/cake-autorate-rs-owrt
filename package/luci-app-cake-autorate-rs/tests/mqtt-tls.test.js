@@ -33,7 +33,8 @@ function buildForm(saved) {
     };
     const section = { taboption(_tab, type, key, title) { return record(key, type, title); } };
     const form = { DummyValue: 'DummyValue', Button: 'Button' };
-    const uci = { get: (_config, id, key) => (saved[id] || {})[key] };
+    // Like LuCI: without an option name the whole section comes back.
+    const uci = { get: (_config, id, key) => key === undefined ? saved[id] : (saved[id] || {})[key] };
     const flag = (_s, _tab, key, title, initial) => Object.assign(record(key, 'Flag', title), { default: initial });
     const optionalValue = (_s, _tab, key, title, datatype, placeholder) =>
         Object.assign(record(key, 'Value', title), { datatype, placeholder });
@@ -63,7 +64,12 @@ assert.match(options.mqtt_port.placeholder, /8883.*1883/);
 for (const [label, saved, expected] of [
     ['legacy publisher without mqtt_tls', { wan: { mqtt_enabled: '1', mqtt_host: 'broker' } }, '0'],
     ['new section', { wan: {} }, undefined],
-    ['publisher that was never enabled', { wan: { mqtt_enabled: '0' } }, undefined],
+    ['section with no MQTT setting', { wan: { ping_interval: '1' } }, undefined],
+    ['disabled publisher saved before the option existed', { wan: { mqtt_enabled: '0' } }, '0'],
+    ['disabled publisher with a host', { wan: { mqtt_enabled: '0', mqtt_host: 'broker' } }, '0'],
+    ['host set, enabled flag missing', { wan: { mqtt_host: 'broker' } }, '0'],
+    ['empty MQTT settings only', { wan: { mqtt_host: '' } }, undefined],
+    ['disabled publisher that chose TLS', { wan: { mqtt_enabled: '0', mqtt_tls: '1' } }, '1'],
     ['explicit TLS', { wan: { mqtt_enabled: '1', mqtt_tls: '1' } }, '1'],
     ['explicit plain', { wan: { mqtt_enabled: '1', mqtt_tls: '0' } }, '0'],
 ]) {

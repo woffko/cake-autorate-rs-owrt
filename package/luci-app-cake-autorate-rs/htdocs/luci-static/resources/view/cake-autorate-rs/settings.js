@@ -8497,11 +8497,20 @@ function addLoggingOptions(section) {
 	o.cfgvalue = function(section_id) {
 		var saved = uci.get('cake-autorate', section_id, 'mqtt_tls');
 
-		/* A publisher saved before this option existed speaks plain MQTT.
-		 * Show that, not the default for new settings, so the form never
-		 * disagrees with what the daemon does. */
-		if (saved == null && uci.get('cake-autorate', section_id, 'mqtt_enabled') === '1')
-			return '0';
+		/* The daemon reads a missing mqtt_tls as plain MQTT, enabled or not.
+		 * A section that already holds any other MQTT setting was saved
+		 * before this option existed (a disabled publisher too: its
+		 * mqtt_enabled='0' is stored), so show plain, not the default for
+		 * new settings. Otherwise ticking the publisher on and saving would
+		 * switch it to TLS, and to port 8883, without the user choosing it.
+		 * A section with no MQTT setting at all is new and gets the default. */
+		if (saved == null) {
+			var existing = uci.get('cake-autorate', section_id) || {};
+
+			for (var name in existing)
+				if (name.indexOf('mqtt_') === 0 && existing[name] != null && existing[name] !== '')
+					return '0';
+		}
 
 		return saved;
 	};
