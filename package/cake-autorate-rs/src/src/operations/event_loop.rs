@@ -483,17 +483,12 @@ fn poll_timeout_ms(timeout: Option<Duration>) -> libc::c_int {
 }
 
 fn drain_eventfd(descriptor: &OwnedFd) -> Result<(), String> {
-    loop {
-        match sys::read_u64(descriptor) {
-            Ok(Some(_)) => continue,
-            Ok(None) => {
-                return Err("calibration wake descriptor returned an invalid record".to_string())
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(format!("unable to drain calibration wake events: {error}")),
+    sys::drain_u64(descriptor).map_err(|error| match error.kind() {
+        io::ErrorKind::InvalidData => {
+            "calibration wake descriptor returned an invalid record".to_string()
         }
-    }
+        _ => format!("unable to drain calibration wake events: {error}"),
+    })
 }
 
 #[cfg(test)]

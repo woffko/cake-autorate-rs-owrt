@@ -1579,21 +1579,12 @@ impl BootstrapTransportRuntime {
     }
 
     fn drain_wake(&self) -> Result<(), String> {
-        loop {
-            match sys::read_u64(&self._wake) {
-                Ok(Some(_)) => continue,
-                Ok(None) => {
-                    return Err(
-                        "bootstrap transport wake descriptor returned a short read".to_string()
-                    )
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    return Err(format!("failed to drain bootstrap transport wake: {error}"))
-                }
+        sys::drain_u64(&self._wake).map_err(|error| match error.kind() {
+            std::io::ErrorKind::InvalidData => {
+                "bootstrap transport wake descriptor returned a short read".to_string()
             }
-        }
+            _ => format!("failed to drain bootstrap transport wake: {error}"),
+        })
     }
 
     fn dropout(policy: &super::autotune_capture_policy::AutotuneCapturePolicy) -> Duration {

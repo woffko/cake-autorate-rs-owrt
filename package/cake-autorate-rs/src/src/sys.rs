@@ -272,6 +272,26 @@ pub(crate) fn read_u64(descriptor: impl AsFd) -> io::Result<Option<u64>> {
     Ok((count == bytes.len()).then(|| u64::from_ne_bytes(bytes)))
 }
 
+/// Read every record that is waiting on a non-blocking eventfd or timerfd and
+/// throw them away; an empty descriptor is `Ok`. A short read, which these
+/// descriptors never produce, is `InvalidData`.
+pub(crate) fn drain_u64(descriptor: impl AsFd) -> io::Result<()> {
+    loop {
+        match read_u64(&descriptor) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "short read from a counter descriptor",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Add `value` to an eventfd. `Ok(false)` is a short write, which an eventfd
 /// never produces. Async-signal-safe.
 pub(crate) fn write_u64(descriptor: impl AsFd, value: u64) -> io::Result<bool> {
@@ -501,6 +521,20 @@ mod tests {
         assert_eq!(gone.raw_os_error(), Some(libc::ESRCH));
         let invalid = pidfd_open(u32::MAX).unwrap_err();
         assert_eq!(invalid.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[test]
+    fn draining_an_eventfd_takes_every_record_and_an_empty_one_is_fine() {
+        let counter = eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC).unwrap();
+        drain_u64(&counter).unwrap();
+        assert!(write_u64(&counter, 5).unwrap());
+        assert!(write_u64(&counter, 9).unwrap());
+        drain_u64(&counter).unwrap();
+        let empty = read_u64(&counter).unwrap_err();
+        assert_eq!(empty.kind(), io::ErrorKind::WouldBlock);
+        // A descriptor that cannot be read is an error, not an empty counter.
+        let directory = File::open("/").unwrap();
+        assert!(drain_u64(&directory).is_err());
     }
 
     #[test]

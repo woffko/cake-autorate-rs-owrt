@@ -12213,19 +12213,12 @@ impl PingerRuntime {
         let Some(wake) = self.wake.as_ref() else {
             return Ok(());
         };
-        loop {
-            match sys::read_u64(wake) {
-                Ok(Some(_)) => continue,
-                Ok(None) => {
-                    return Err("bootstrap pinger wake descriptor returned a short read".to_string())
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    return Err(format!("failed to drain bootstrap pinger wake: {error}"))
-                }
+        sys::drain_u64(wake).map_err(|error| match error.kind() {
+            io::ErrorKind::InvalidData => {
+                "bootstrap pinger wake descriptor returned a short read".to_string()
             }
-        }
+            _ => format!("failed to drain bootstrap pinger wake: {error}"),
+        })
     }
 
     fn stop(&mut self) {
