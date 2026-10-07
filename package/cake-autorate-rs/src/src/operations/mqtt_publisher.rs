@@ -1640,6 +1640,12 @@ impl MqttClient {
     /// Read the packet that made the socket readable and every packet that
     /// arrived behind it in the same TLS record.
     fn read_ready_packets(&mut self) -> Result<(), String> {
+        // A readable TLS socket may hold only a record without MQTT data.
+        if let Transport::Tls(stream) = &mut self.stream {
+            if !tls::pump_input(stream)? {
+                return Ok(());
+            }
+        }
         self.read_unsolicited()?;
         while self.has_buffered_input() {
             self.read_unsolicited()?;

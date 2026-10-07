@@ -765,6 +765,125 @@ fn a_silent_broker_cannot_hold_the_tls_handshake_open() {
 }
 
 #[test]
+fn a_broker_that_dribbles_bytes_cannot_hold_the_tls_handshake_open() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (done_sender, done) = std::sync::mpsc::channel::<()>();
+    let broker = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // The header of a TLS handshake record that announces 4 KiB, then one
+        // byte of it every 200 ms: every read succeeds, the handshake never ends.
+        let _ = stream.write_all(&[0x16, 0x03, 0x03, 0x10, 0x00]);
+        while done.recv_timeout(Duration::from_millis(200)).is_err() {
+            if stream.write_all(&[0x00]).is_err() {
+                break;
+            }
+        }
+    });
+    let fixture = Fixture::new("tls-dribble");
+    let config = tls::client_config(true, &fixture.ca_file).unwrap();
+    let socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let started = Instant::now();
+    let error = tls::connect_within(&config, "localhost", socket, Duration::from_secs(1))
+        .err()
+        .unwrap();
+    assert!(error.contains("timed out"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the handshake ran for {:?}",
+        started.elapsed()
+    );
+    done_sender.send(()).unwrap();
+    broker.join().unwrap();
+}
+
+#[test]
+fn a_tls_record_without_mqtt_data_does_not_stop_the_publisher() {
+    let fixture = Fixture::new("tls-keyupdate");
+    let identity = fixture.authority.server(&["localhost"], None);
+    let (port, broker) = spawn_tls_broker(identity.config(), |stream| {
+        accept_connect(stream)?;
+        // Let the client finish its connect first, or it reads the KeyUpdate there.
+        thread::sleep(Duration::from_millis(300));
+        // A TLS 1.3 KeyUpdate carries no application data; the socket becomes
+        // readable all the same.
+        stream
+            .conn
+            .refresh_traffic_keys()
+            .map_err(|error| error.to_string())?;
+        stream.flush().map_err(|error| error.to_string())?;
+        thread::sleep(Duration::from_millis(1200));
+        stream
+            .write_all(&[0xd0, 0x00])
+            .map_err(|error| error.to_string())?;
+        thread::sleep(Duration::from_millis(400));
+        stream
+            .write_all(&[0xe0, 0x00])
+            .map_err(|error| error.to_string())?;
+        let mut sink = [0u8; 16];
+        let _ = stream.read(&mut sink);
+        Ok(())
+    });
+    let config = tls_config("localhost", port, &[("mqtt_tls_ca_file", &fixture.ca_file)]);
+    let mut client = MqttClient::connect(&config).unwrap();
+    let wait_for_socket = |client: &MqttClient| {
+        let until = Instant::now() + Duration::from_secs(3);
+        while !socket_has_data(client) {
+            assert!(Instant::now() < until, "the broker sent nothing");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // The KeyUpdate: the socket is readable, the record holds no MQTT packet.
+    wait_for_socket(&client);
+    let started = Instant::now();
+    client.read_ready_packets().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "the read waited {:?} for data that was not there",
+        started.elapsed()
+    );
+    assert!(!client.has_buffered_input());
+    // The PINGRESP behind it is still read, and a real DISCONNECT still ends it.
+    wait_for_socket(&client);
+    client.read_ready_packets().unwrap();
+    wait_for_socket(&client);
+    assert_eq!(
+        client.read_ready_packets().unwrap_err(),
+        "MQTT broker disconnected"
+    );
+    drop(client);
+    broker.join().unwrap().unwrap();
+}
+
+#[test]
+fn a_tls_broker_that_closes_the_connection_ends_the_wakeup_with_an_error() {
+    let fixture = Fixture::new("tls-eof");
+    let identity = fixture.authority.server(&["localhost"], None);
+    let (port, broker) = spawn_tls_broker(identity.config(), |stream| {
+        accept_connect(stream)?;
+        // No close_notify: the socket just ends.
+        Ok(())
+    });
+    let config = tls_config("localhost", port, &[("mqtt_tls_ca_file", &fixture.ca_file)]);
+    let mut client = MqttClient::connect(&config).unwrap();
+    broker.join().unwrap().unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while !socket_has_data(&client) {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let started = Instant::now();
+    assert!(client.read_ready_packets().is_err());
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
 fn the_status_probe_completes_the_handshake_and_sends_no_mqtt_packet() {
     let fixture = Fixture::new("tls-probe");
     let identity = fixture.authority.server(&["localhost"], None);

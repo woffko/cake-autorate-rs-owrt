@@ -146,18 +146,46 @@ pub(super) fn read_ca_certificates(path: &str) -> Result<Vec<CertificateDer<'sta
 pub(super) fn connect(
     config: &Arc<ClientConfig>,
     host: &str,
+    socket: TcpStream,
+) -> Result<TlsStream, String> {
+    connect_within(config, host, socket, HANDSHAKE_TIMEOUT)
+}
+
+pub(super) fn connect_within(
+    config: &Arc<ClientConfig>,
+    host: &str,
     mut socket: TcpStream,
+    limit: Duration,
 ) -> Result<TlsStream, String> {
     let name = ServerName::try_from(host.to_string())
         .map_err(|_| "the MQTT broker address is not a valid TLS server name".to_string())?;
     let mut connection = ClientConnection::new(config.clone(), name)
         .map_err(|error| format!("unable to start the MQTT TLS client: {error}"))?;
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let deadline = Instant::now() + limit;
+    let io_timeouts = (
+        socket.read_timeout().ok().flatten(),
+        socket.write_timeout().ok().flatten(),
+    );
+    // `complete_io` keeps reading for as long as the handshake needs more, so
+    // a broker that sends a byte at a time never gives control back and the
+    // deadline would only be looked at when it is far past. One step at a
+    // time instead, each bounded by what is left of the deadline.
     while connection.is_handshaking() {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err("MQTT TLS handshake timed out".to_string());
         }
-        connection.complete_io(&mut socket).map_err(|error| {
+        let step_timeout = Some(remaining.max(Duration::from_millis(1)));
+        socket
+            .set_read_timeout(step_timeout)
+            .and_then(|()| socket.set_write_timeout(step_timeout))
+            .map_err(|error| format!("unable to bound the MQTT TLS handshake: {error}"))?;
+        let step = handshake_step(&mut connection, &mut socket);
+        if let Err(error) = step {
+            // A failed handshake leaves an alert for the broker: send it if
+            // that is possible at once.
+            let _ = socket.set_write_timeout(Some(Duration::from_millis(200)));
+            while connection.wants_write() && connection.write_tls(&mut socket).is_ok() {}
             let mut message = format!("MQTT TLS handshake failed: {}", describe(&error));
             if message.contains("CaUsedAsEndEntity") {
                 message.push_str(
@@ -166,10 +194,35 @@ pub(super) fn connect(
                      self-signed certificate with basicConstraints CA:FALSE",
                 );
             }
-            message
-        })?;
+            return Err(message);
+        }
     }
+    let _ = socket.set_read_timeout(io_timeouts.0);
+    let _ = socket.set_write_timeout(io_timeouts.1);
     Ok(StreamOwned::new(connection, socket))
+}
+
+/// Send what the handshake has queued, then read once.
+fn handshake_step(connection: &mut ClientConnection, socket: &mut TcpStream) -> io::Result<()> {
+    while connection.wants_write() {
+        match connection.write_tls(socket) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if connection.wants_read() {
+        match connection.read_tls(socket) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        connection
+            .process_new_packets()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    }
+    Ok(())
 }
 
 /// True when decrypted application data is already waiting inside rustls.
@@ -181,6 +234,69 @@ pub(super) fn has_buffered_input(stream: &mut TlsStream) -> bool {
         // A fatal alert or a protocol error: the next read reports it.
         Err(_) => true,
     }
+}
+
+/// Take what the broker has sent and report whether any of it is MQTT data.
+///
+/// A readable socket does not mean that: a TLS 1.3 KeyUpdate, a late session
+/// ticket or a HelloRequest are records without application data, and a
+/// blocking read on them would wait for the next packet until the I/O timeout
+/// and then fail. This reads without blocking, answers what rustls needs to
+/// answer, and tells the caller to go back to `poll` when there is nothing to
+/// read. A closed connection is an error.
+pub(super) fn pump_input(stream: &mut TlsStream) -> Result<bool, String> {
+    if has_buffered_input(stream) {
+        return Ok(true);
+    }
+    stream
+        .sock
+        .set_nonblocking(true)
+        .map_err(|error| format!("unable to read from the MQTT broker: {error}"))?;
+    let received = (|| loop {
+        if !stream.conn.wants_read() {
+            return Ok(());
+        }
+        match stream.conn.read_tls(&mut stream.sock) {
+            Ok(0) => return Err("MQTT broker disconnected".to_string()),
+            Ok(_) => {
+                let state = stream
+                    .conn
+                    .process_new_packets()
+                    .map_err(|error| format!("MQTT TLS error: {error}"))?;
+                if state.plaintext_bytes_to_read() > 0 {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("unable to read from the MQTT broker: {error}")),
+        }
+    })();
+    let restored = stream.sock.set_nonblocking(false);
+    // A KeyUpdate asks for an answer, and a fatal error leaves an alert.
+    let flushed = flush_writes(stream);
+    received?;
+    restored.map_err(|error| format!("unable to read from the MQTT broker: {error}"))?;
+    flushed?;
+    if has_buffered_input(stream) {
+        return Ok(true);
+    }
+    // close_notify arrived and nothing is left to read.
+    if !stream.conn.wants_read() {
+        return Err("MQTT broker disconnected".to_string());
+    }
+    Ok(false)
+}
+
+fn flush_writes(stream: &mut TlsStream) -> Result<(), String> {
+    while stream.conn.wants_write() {
+        match stream.conn.write_tls(&mut stream.sock) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("unable to write to the MQTT broker: {error}")),
+        }
+    }
+    Ok(())
 }
 
 /// Politely end the TLS session after the MQTT DISCONNECT was written.
