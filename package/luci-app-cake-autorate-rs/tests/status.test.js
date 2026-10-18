@@ -15,6 +15,12 @@ if (typeof String.prototype.format !== 'function') {
 const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resources',
 	'view', 'cake-autorate-rs', 'status.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+const uiSource = fs.readFileSync(path.join(__dirname, '..', 'htdocs', 'luci-static', 'resources',
+	'cake-autorate-rs', 'ui.js'), 'utf8');
+const accountingFaultMessage = new Function('_', uiSource.slice(
+	uiSource.indexOf('function accountingFaultMessage('),
+	uiSource.indexOf('// Longer explanations live in the user guide.')) +
+	'\nreturn accountingFaultMessage;')(value => value);
 const QUALITY_GRADE_METHOD = 'worst_of_direction_bound_icmp_and_transport_v5';
 assert.doesNotMatch(source, /transport_rtt_p90_loaded_minus_p5_idle_v4/,
 	'stale transport-only Rating metadata must not remain in the UI');
@@ -49,11 +55,23 @@ const helpers = new Function('fs', 'poll', 'uci', 'ui', 'cakeUi', 'L', 'E', '_',
 		`accessMediumLabel, capacityLearningLabel, ` +
 		`statusColumnPreferences, statusColumnSelection, selectedStatusColumns, formatShaperRate, ` +
 		`runtimeHealthWithNativeOperations, ` +
-		`nativeRatingRoute, nativeRatingStartArgs, nativeRatingProgress, nativeRatingStatusMatchesRequest, nativeRatingWorkerRunId, nativeRatingResultValidated, ` +
+		`nativeRatingRoute, nativeRatingStartArgs, nativeRatingProgress, nativeRatingStatusMatchesRequest, nativeRatingWorkerRunId, nativeRatingResultValidated, nativeRatingFailureText, ` +
 		`schedulerStatusSource, schedulerUnavailableStatus, nativeSchedulerStatusValidated, ` +
 		`nativeSchedulerBatchValidated, ` +
 		`readSchedulerStatuses, renderStatusData };`
-)({}, {}, {}, {}, { text: value => value, textElement: E }, {}, E, value => value);
+)({}, {}, {}, {}, { text: value => value, textElement: E, accountingFaultMessage }, {}, E, value => value);
+
+// A rating stopped by its traffic accounting explains the reason and keeps the code.
+assert.match(helpers.nativeRatingFailureText({ state: 'failed', diagnostic_code: 'speedtest-accounting-non-ipv4-traffic' }),
+	/^The speed test sent traffic that was not IPv4, usually IPv6\..* \(speedtest-accounting-non-ipv4-traffic\)$/);
+assert.match(helpers.nativeRatingFailureText({ state: 'failed', diagnostic_code: 'speedtest-accounting-wrong-egress' }),
+	/another interface than the tested uplink.*\(speedtest-accounting-wrong-egress\)$/);
+assert.match(helpers.nativeRatingFailureText({ state: 'failed', diagnostic: 'speedtest-accounting-flow-registration-failed' }),
+	/tracked connection.*\(speedtest-accounting-flow-registration-failed\)$/);
+assert.equal(helpers.nativeRatingFailureText({ state: 'failed', diagnostic_code: 'quiet-window-timeout' }), 'quiet-window-timeout');
+assert.equal(helpers.nativeRatingFailureText({ state: 'failed', diagnostic_code: '__proto__' }), '__proto__');
+assert.equal(helpers.nativeRatingFailureText({ state: 'failed', error: 'boom' }), 'boom');
+assert.equal(helpers.nativeRatingFailureText({ state: 'failed' }), 'Rating capture did not complete.');
 
 const oldColumns = { status_columns: ['route'] };
 assert.equal(helpers.statusColumnPreferences(oldColumns, undefined), oldColumns);

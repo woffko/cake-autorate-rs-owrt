@@ -321,6 +321,17 @@ function nativeRatingStartArgs(section, mode) {
 	return args;
 }
 
+// Why a rating stopped. Codes the user can act on get a plain explanation;
+// the code itself stays visible for a report.
+function nativeRatingFailureText(job) {
+	var code = job && (job.diagnostic_code || job.diagnostic);
+	var explanation = typeof code === 'string' ? cakeUi.accountingFaultMessage(code) : null;
+	if (explanation)
+		return _('%s (%s)').format(explanation, code);
+	return (job && (job.diagnostic || job.diagnostic_code || job.error)) ||
+		_('Rating capture did not complete.');
+}
+
 function nativeRatingProgress(status, job) {
 	status = status || {};
 	return Object.assign({}, job || {}, {
@@ -622,7 +633,7 @@ function showQualityTest(section, status, calibrationSummary) {
 				});
 			finish({
 				state: job.state,
-				error: job.diagnostic || job.error || _('Rating capture did not complete.')
+				error: nativeRatingFailureText(job)
 			});
 		}).catch(function(error) {
 			finish({ state: 'error', error: error.message || String(error) });

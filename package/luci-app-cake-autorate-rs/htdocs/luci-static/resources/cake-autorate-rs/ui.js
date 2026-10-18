@@ -122,6 +122,21 @@ function ensureAppHeader() {
 	});
 }
 
+// A speed test stops when its traffic accounting refused packets. These three
+// codes name the reason; the text says what the user can do about it.
+function accountingFaultMessage(code) {
+	switch (code) {
+	case 'speedtest-accounting-non-ipv4-traffic':
+		return _('The speed test sent traffic that was not IPv4, usually IPv6. Only the IPv4 traffic of the tested uplink can be counted, so those packets were dropped and the test stopped. Install the speedtest-go package of the same release.');
+	case 'speedtest-accounting-wrong-egress':
+		return _('Test traffic was about to leave through another interface than the tested uplink, so it was dropped and the test stopped. Check the routing of this uplink (mwan3 rules, policy routes, VPN).');
+	case 'speedtest-accounting-flow-registration-failed':
+		return _('Some IPv4 test traffic could not be counted as a tracked connection (connection tracking was disabled for it, or the limit of 4096 connections was reached), so it was dropped and the test stopped.');
+	default:
+		return null;
+	}
+}
+
 // Longer explanations live in the user guide. Only these fixed sections can be
 // linked; the page opens only when the user clicks.
 var DOCS_BASE = 'https://github.com/woffko/cake-autorate-rs-owrt/blob/main/USER_GUIDE.md#';
@@ -141,5 +156,6 @@ return L.Class.extend({
 	textElement: textElement,
 	docsLink: docsLink,
 	readNativeResult: readNativeResult,
+	accountingFaultMessage: accountingFaultMessage,
 	ensureAppHeader: ensureAppHeader
 });

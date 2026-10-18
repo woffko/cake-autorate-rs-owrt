@@ -5569,6 +5569,10 @@ function autotuneTypedTerminalDiagnostic(result) {
 	if (result && (result.terminal_state === 'cancelled' || result.state === 'cancelled'))
 		return { code: 'cancelled', message: _('Calibration was cancelled. Cancellation does not mean the traffic budget was exhausted.') };
 	if (result && [ 'inconclusive', 'failed' ].indexOf(result.terminal_state) >= 0) {
+		var accounting = typeof result.diagnostic_code === 'string' ?
+			cakeUi.accountingFaultMessage(result.diagnostic_code) : null;
+		if (accounting)
+			return { code: result.diagnostic_code, message: accounting };
 		var trafficMessages = {
 			'server-comparison-insufficient-independent-sources': _('The comparison did not confirm stable sources with different reported providers and hostnames. Several server IDs can refer to the same source; no new capacity proposal was accepted.'),
 			'speedtest-server-endpoint-changed': _('The selected server reported a different transfer endpoint after qualification. Its measurements cannot be mixed into this calibration; retry server selection.'),

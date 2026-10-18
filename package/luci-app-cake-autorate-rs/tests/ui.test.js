@@ -85,6 +85,11 @@ assert.deepEqual(header.text('<img src=x>'), { nodeType: 3, textContent: '<img s
 assert.equal(header.text(null).textContent, '');
 assert.equal(header.text(0).textContent, '0');
 assert.equal(typeof header.ensureAppHeader, 'function');
+assert.match(header.accountingFaultMessage('speedtest-accounting-non-ipv4-traffic'), /not IPv4/);
+assert.match(header.accountingFaultMessage('speedtest-accounting-wrong-egress'), /another interface/);
+assert.match(header.accountingFaultMessage('speedtest-accounting-flow-registration-failed'), /tracked connection/);
+for (const other of [ 'speedtest-accounting-timeout', '__proto__', 'toString', '', undefined ])
+	assert.equal(header.accountingFaultMessage(other), null);
 header.ensureAppHeader();
 assert.equal(inserted.reference, tabs);
 assert.equal(inserted.node.attrs.id, 'cake-autorate-app-header');

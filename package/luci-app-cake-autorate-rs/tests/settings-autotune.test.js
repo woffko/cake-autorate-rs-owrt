@@ -16,6 +16,13 @@ for (const helper of [ 'speedtestJobDelay', 'autotuneJobDelay' ]) {
 		`${helper} must remain an explicit polling/watchdog cadence helper`);
 }
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
+// The real accounting-fault texts of the shared UI module, not a stand-in.
+const uiSource = fs.readFileSync(path.join(__dirname, '..', 'htdocs', 'luci-static', 'resources',
+	'cake-autorate-rs', 'ui.js'), 'utf8');
+const accountingFaultMessage = new Function('_', uiSource.slice(
+	uiSource.indexOf('function accountingFaultMessage('),
+	uiSource.indexOf('// Longer explanations live in the user guide.')) +
+	'\nreturn accountingFaultMessage;')(value => value);
 assert.match(source, /function modal\(option\)\s*\{[\s\S]*?option\.modalonly = true;[\s\S]*?option\.retain = true;/,
 	'all modal settings must retain dependency-hidden values instead of staging unrelated deletions');
 assert.match(source,
@@ -177,6 +184,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`setMwan3Context: function(value) { mwan3Context = value; } };`
 	)(fsImpl || {}, {}, {}, uciImpl || uci, {}, {}, {
 		text: value => value,
+		accountingFaultMessage,
 		// These tests mock the parsed readout API; the separate transport suite
 		// covers CGI limits, partial JSON and the read-only command allowlist.
 		readNativeResult: args => (fsImpl || {}).exec('/usr/sbin/cake-autorated', args)
@@ -2007,6 +2015,19 @@ async function testNativeAutotuneTransport() {
 			'a path that keeps resetting the measurement basis must have a plain stop explanation');
 		assert.match(helpers.autotuneTypedTerminalDiagnostic({ state: 'cancelled' }).message, /Cancellation does not mean/);
 		assert.equal(helpers.autotuneTypedTerminalDiagnostic({ terminal_state: 'failed', diagnostic_code: '__proto__' }), null);
+		// A test stopped by its traffic accounting says why, for Speed Test and Auto-Tune alike.
+		for (const [code, expected] of [
+			[ 'speedtest-accounting-non-ipv4-traffic', /not IPv4, usually IPv6.*speedtest-go package of the same release/ ],
+			[ 'speedtest-accounting-wrong-egress', /another interface than the tested uplink.*mwan3 rules/ ],
+			[ 'speedtest-accounting-flow-registration-failed', /tracked connection.*4096 connections/ ],
+		]) {
+			for (const terminal_state of [ 'failed', 'inconclusive' ]) {
+				const diagnostic = helpers.autotuneTypedTerminalDiagnostic({ terminal_state, diagnostic_code: code });
+				assert.equal(diagnostic.code, code);
+				assert.match(diagnostic.message, expected);
+			}
+		}
+		assert.equal(helpers.autotuneTypedTerminalDiagnostic({ terminal_state: 'failed', diagnostic_code: 'speedtest-accounting-timeout' }), null);
 		assert.match(trafficText, /16\.381 GB.*32\.000 GB.*15\.619 GB/);
 		assert.match(trafficText, /including background traffic/);
 		assert.match(trafficText, /current transfer is not yet included/);

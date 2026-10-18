@@ -187,6 +187,7 @@ declare const cakeUi: {
   text(value: unknown): Text;
   textElement(tag: string, attributes?: any, children?: any): HTMLElement;
   readNativeResult(arguments_: string[]): Promise<any>;
+  accountingFaultMessage(code: string): string | null;
   ensureAppHeader(): void;
 };
 }
