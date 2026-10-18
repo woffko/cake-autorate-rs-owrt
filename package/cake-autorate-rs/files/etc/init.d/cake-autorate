@@ -555,16 +555,20 @@ boot() {
 
 	"$initscript" start "$@" && return 0
 	(
-		# Every attempt takes rc.common's procd_lock itself: do not keep it
-		# held across the pauses.
+		# Every attempt (and every other init action) takes rc.common's
+		# procd_lock itself, on descriptor 1000. Close the inherited one before
+		# the pipeline exists, so that neither this loop nor its logger keeps
+		# the lock and blocks the very start it retries.
 		[ ! -e /proc/self/fd/1000 ] || exec 1000>&-
-		while "$DAEMON" --service-lifecycle boot-retry "$attempt" >/dev/null; do
-			attempt=$((attempt + 1))
-			enabled || exit 0
-			"$initscript" start "$@" && exit 0
-		done
-		exit 1
-	) </dev/null 2>&1 | logger -t cake-autorate >/dev/null 2>&1 &
+		{
+			while "$DAEMON" --service-lifecycle boot-retry "$attempt" >/dev/null; do
+				attempt=$((attempt + 1))
+				enabled || exit 0
+				"$initscript" start "$@" && exit 0
+			done
+			exit 1
+		} </dev/null 2>&1 | logger -t cake-autorate
+	) >/dev/null 2>&1 &
 	return 1
 }
 

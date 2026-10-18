@@ -80,6 +80,54 @@ for variant in full lite; do
 	done
 done
 
+# rc.common takes procd_lock on descriptor 1000 for every init action, and the
+# children of the boot script inherit it. BusyBox ash (as on the router) can
+# hold that descriptor: the stand-in below takes the lock the way procd_lock
+# does, and a retry must not wait for a lock still held by the retry loop or
+# by its logger once the boot script itself has exited.
+if command -v busybox >/dev/null 2>&1; then
+	cat > "$work/locking-initscript" <<'EOF'
+#!/bin/sh
+exec busybox sh -c '
+	flock -n 1000 >/dev/null 2>&1 || {
+		exec 1000>"$WORK/procd.lock"
+		flock -w 5 1000 || { echo blocked >> "$WORK/blocked"; exit 1; }
+	}
+	printf "%s\n" "$0" >> "$WORK/attempts"
+	[ "$(wc -l < "$WORK/attempts")" -gt "$FAILURES" ]
+' "$1"
+EOF
+	chmod 0755 "$work/locking-initscript"
+	for variant in full lite; do
+		: > "$work/attempts"
+		: > "$work/retries"
+		: > "$work/blocked"
+		: > "$work/log"
+		FAILURES=1 busybox sh -c '
+			exec 1000>"$WORK/procd.lock"
+			flock 1000
+			. "$1"
+			initscript="$2"
+			DAEMON="$3"
+			logger() { cat >> "$WORK/log"; }
+			enabled() { return 0; }
+			boot || :
+		' sh "$work/$variant" "$work/locking-initscript" "$work/daemon"
+		i=0
+		while [ "$(wc -l < "$work/attempts")" -lt 2 ] && [ ! -s "$work/blocked" ] &&
+			[ "$i" -lt 150 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		[ ! -s "$work/blocked" ] && [ "$(wc -l < "$work/attempts")" = 2 ] || {
+			echo "$variant boot retry waited for an inherited procd_lock" >&2
+			exit 1
+		}
+	done
+else
+	echo 'busybox is not installed: the inherited procd_lock case was not run'
+fi
+
 # The pause and the bound belong to the native lifecycle, not to the shell.
 ! grep -Eq '(^|[^_])(sleep|usleep)([^_]|$)' "$base/files/etc/init.d/cake-autorate"
 grep -Fq '"$DAEMON" --service-lifecycle boot-retry "$attempt"' \
