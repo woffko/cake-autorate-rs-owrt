@@ -546,6 +546,28 @@ restart() {
 	return "$rc"
 }
 
+# rcS runs boot() only once. A start that fails at boot, for example while the
+# SQM hotplug restarts the managed queue, must not leave the service down until
+# a manual start. The native lifecycle bounds the attempts and owns the pause;
+# the retries run in the background so later boot scripts are not held up.
+boot() {
+	local attempt=1
+
+	"$initscript" start "$@" && return 0
+	(
+		# Every attempt takes rc.common's procd_lock itself: do not keep it
+		# held across the pauses.
+		[ ! -e /proc/self/fd/1000 ] || exec 1000>&-
+		while "$DAEMON" --service-lifecycle boot-retry "$attempt" >/dev/null; do
+			attempt=$((attempt + 1))
+			enabled || exit 0
+			"$initscript" start "$@" && exit 0
+		done
+		exit 1
+	) </dev/null 2>&1 | logger -t cake-autorate >/dev/null 2>&1 &
+	return 1
+}
+
 # @variant full begin
 stop_service() {
 	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD" result

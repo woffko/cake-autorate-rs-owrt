@@ -15084,7 +15084,7 @@ fn main() {
             let mut arguments = initial_args.peekable();
             if arguments
                 .peek()
-                .is_some_and(|value| value == "confirm-started")
+                .is_some_and(|value| value == "confirm-started" || value == "boot-retry")
             {
                 install_signal_handlers();
             }

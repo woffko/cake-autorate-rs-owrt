@@ -50,6 +50,8 @@ const SQM_START_ATTEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROLLER_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(90);
 const CONTROLLER_START_LOCK_RETRY: Duration = Duration::from_secs(1);
+const BOOT_START_ATTEMPTS: u32 = 3;
+const BOOT_START_RETRY_DELAY: Duration = Duration::from_secs(15);
 const CONTROLLER_STATUS_MAX_AGE: f64 = 15.0;
 const CONTROLLER_STATUS_FUTURE_SKEW: f64 = 2.0;
 const MAX_OUTPUT: usize = 64 * 1024;
@@ -1207,6 +1209,15 @@ where
     let command = arguments
         .next()
         .ok_or_else(|| "service-lifecycle requires a command".to_string())?;
+    if command == "boot-retry" {
+        let failed = arguments.next().ok_or_else(|| {
+            "service-lifecycle boot-retry requires the failed attempt".to_string()
+        })?;
+        if arguments.next().is_some() {
+            return Err("service-lifecycle received unexpected arguments".to_string());
+        }
+        return boot_retry(&failed);
+    }
     if arguments.next().is_some() {
         return Err("service-lifecycle received unexpected arguments".to_string());
     }
@@ -1219,6 +1230,47 @@ where
         "reload" => execute_reload_openwrt(),
         _ => Err("service-lifecycle command is unsupported".to_string()),
     }
+}
+
+/// rcS runs boot() only once. A start that failed at boot, for example while
+/// the SQM iface hotplug restarted the managed queue, is retried a bounded
+/// number of times: the init script only loops, this owns the policy and the
+/// pause. Each retry is an ordinary start, which first stops whatever the
+/// failed start left behind.
+fn boot_retry(failed: &str) -> Result<String, String> {
+    let next = boot_retry_attempt(failed)?;
+    eprintln!(
+        "WARNING: start failed at boot, retrying ({next}/{BOOT_START_ATTEMPTS}) in {} s",
+        BOOT_START_RETRY_DELAY.as_secs()
+    );
+    let deadline = Instant::now() + BOOT_START_RETRY_DELAY;
+    let mut events = CalibrationEventLoop::new()?;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(format!("service-boot-retry-v1 {next}\n"));
+        }
+        // Nothing is watched: only the pause or SIGTERM/SIGINT end the wait.
+        if events.wait(-1, Some(remaining))?.signal {
+            return Err("start retry at boot was interrupted".to_string());
+        }
+    }
+}
+
+fn boot_retry_attempt(failed: &str) -> Result<u32, String> {
+    let failed = failed
+        .parse::<u32>()
+        .ok()
+        .filter(|attempt| {
+            (1..=BOOT_START_ATTEMPTS).contains(attempt) && failed == attempt.to_string()
+        })
+        .ok_or_else(|| "service-lifecycle boot-retry attempt is invalid".to_string())?;
+    if failed == BOOT_START_ATTEMPTS {
+        return Err(format!(
+            "start failed at boot after {BOOT_START_ATTEMPTS} attempts; run /etc/init.d/cake-autorate start once the cause is fixed"
+        ));
+    }
+    Ok(failed + 1)
 }
 
 /// Fresh Native Apply admission only. The caller already owns the global
@@ -7581,6 +7633,30 @@ fi
         assert!(holder.is_none());
         assert!(fixture.applied());
         assert!(began.elapsed() < CONTROLLER_START_TIMEOUT);
+    }
+
+    #[test]
+    fn boot_retry_policy_is_bounded_and_rejects_noncanonical_attempts() {
+        assert_eq!(boot_retry_attempt("1"), Ok(2));
+        assert_eq!(boot_retry_attempt("2"), Ok(3));
+        assert_eq!(
+            boot_retry_attempt("3").unwrap_err(),
+            "start failed at boot after 3 attempts; run /etc/init.d/cake-autorate start once the cause is fixed"
+        );
+        for invalid in ["0", "4", "01", "+1", "-1", "", "1 ", "x"] {
+            assert_eq!(
+                boot_retry_attempt(invalid).unwrap_err(),
+                "service-lifecycle boot-retry attempt is invalid",
+                "{invalid:?}"
+            );
+        }
+        for arguments in [vec!["boot-retry"], vec!["boot-retry", "1", "2"]] {
+            assert!(run_service_lifecycle(arguments.into_iter().map(String::from)).is_err());
+        }
+        assert_eq!(
+            run_service_lifecycle(["boot-retry", "3"].into_iter().map(String::from)).unwrap_err(),
+            boot_retry_attempt("3").unwrap_err()
+        );
     }
 
     #[test]
