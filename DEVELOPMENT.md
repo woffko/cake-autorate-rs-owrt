@@ -82,6 +82,14 @@ first 12-ABI build of that revision, so the backend must be built again for all
 twelve ABIs for the release (and its build information and ELF type checked),
 not taken from an earlier build of revision 6.
 
+Release acceptance on the test VM includes a Get rating on an emulated
+dual-stack uplink: a global IPv6 address and an IPv6 default route on the WAN
+through a gateway that never answers, with IPv4 to the nearby servers without an
+AAAA record dropped, so that the backend chooses a dual-stack server itself. It
+must complete with every refusal counter at zero. The same acceptance provokes
+each refusal once (the backend before patch 140, a host route out through
+another device, a `notrack` rule for the backend's user) and expects its code.
+
 ## Overflow checks
 
 The daemon is built with integer overflow checks: an addition, subtraction or

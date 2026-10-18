@@ -927,3 +927,79 @@ afterwards and its hash checked.
   about 45 Mbit/s. The second completed in 51 s: grade A+, 36 samples per direction,
   the `flow_fault` counter of the backend table zero in all six samples taken while
   it ran, limits unchanged.
+
+## Changes after RC27 r320/r128: refusals of test traffic counted by reason (unreleased)
+
+A test's traffic is counted in temporary nftables tables, and a packet those
+rules cannot account for is dropped. Until now every such packet went into one
+counter, so three different causes ended with one code,
+`speedtest-accounting-flow-registration-failed`. The tables now count the
+reason: `fault_family` (not IPv4), `fault_unregistered` (IPv4 that is not an
+accounted flow) and `fault_egress` (leaving through another device than the
+tested uplink), with the codes `speedtest-accounting-non-ipv4-traffic`,
+`speedtest-accounting-flow-registration-failed` and
+`speedtest-accounting-wrong-egress`. LuCI explains each code in the Get rating,
+Speed Test and Auto-Tune windows.
+
+### Source gate and packages
+
+- Source gate 190, 57 commands: Full (1,838) and Lite (410) Rust tests,
+  formatting, clippy, LuCI JavaScript and TypeScript checks, real-UCI tests; the
+  hash of the sources before and after the run did not change.
+- Daemon and LuCI packages for x86_64 and aarch64_cortex-a76 built from the same
+  gate and verified (payload, metadata, ELF, overflow checks on).
+
+### Tests that fail without the change
+
+- The rule batch has five counters with the owner comment `:flow-v2`; the
+  IPv4-only refusal comes after the accounted flows and before the refusal of
+  other families; the egress guard counts only `fault_egress`.
+- The accepted-batch golden test folds the split back into the previous form
+  (one `flow_fault` counter, no IPv4-only refusal rule) and still matches the
+  accepted hashes of both route variants byte for byte: nothing else in the rules
+  changed.
+- The counter reader: each reason gives its code, several at once give the most
+  specific, every refusal counter must be present, an old `flow_fault` counter
+  is not accepted in a current table, mixed formats are rejected, and tables of
+  the previous format (`:flow-v1`) and without refusal counters are still read.
+  The permanent probes accept only the current format and have their own three
+  codes. A mutation that reports the old single code, or that counts the egress
+  guard as unregistered, fails these tests.
+
+### Real nftables
+
+The exact production batches were applied in a throw-away user and network
+namespace on the host kernel (6.18, nftables 1.0.9), with synthetic traffic
+through an isolated veth pair:
+
+- Accounted UDP, ICMP and TCP traffic of the owner: `rx` and `tx` only, all
+  three refusal counters zero.
+- A `notrack` IPv4 packet of the owner: dropped, `fault_unregistered` 60 bytes.
+- IPv6 to `::1` on another port than 53: dropped, `fault_family` 80 bytes.
+- The egress guard pinned to a device that is not used: a packet out through
+  the veth is dropped and counted in `fault_egress` (92 bytes); DNS to
+  `127.0.0.1:53` through `lo` passes; another loopback port is `fault_egress`.
+- The same for the probe tables (root with the reserved group), and nothing at
+  all for root sockets of another group.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+Candidate daemon `57e0ee71` with the fixed backend r6. Each refusal was
+provoked on purpose, and each case put the VM back:
+
+| Case | How | Result | Log line of the job |
+|---|---|---|---|
+| dual-stack Get rating | emulated IPv6 uplink, the nearby IPv4-only server dropped | complete in 53 s, no refusal | — |
+| not IPv4 | the same with the backend from before patch 140 | `speedtest-accounting-non-ipv4-traffic` after 28 s | 17,026 bytes not IPv4 |
+| wrong device | capped Speed Test, a host route sends the server out through eth2 | `speedtest-accounting-wrong-egress` | 2,160 bytes leaving through another device |
+| unregistered | capped Speed Test, `notrack` for the backend's user | `speedtest-accounting-flow-registration-failed` after 29 s | 1,920 bytes IPv4 without an accounted flow |
+
+- Speed Test (capped, current topology): completed in 25.7 s.
+- Full Raw Auto-Tune: reached Review in 875 s, topology restored, no refusal and
+  no panic in the log.
+
+### Known limits
+
+- An Auto-Tune whose traffic budget watch notices a refusal still stops with
+  `owned-traffic-accounting-failed`; the job's log line names the reason.
+- Only x86_64 was run; the AArch64 packages were built and verified.
