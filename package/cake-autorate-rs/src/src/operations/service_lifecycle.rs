@@ -49,6 +49,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const SQM_START_ATTEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROLLER_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(90);
+const CONTROLLER_START_LOCK_RETRY: Duration = Duration::from_secs(1);
 const CONTROLLER_STATUS_MAX_AGE: f64 = 15.0;
 const CONTROLLER_STATUS_FUTURE_SKEW: f64 = 2.0;
 const MAX_OUTPUT: usize = 64 * 1024;
@@ -1403,10 +1404,21 @@ fn confirm_controller_service_started_in(
         preserved(None)?;
         authority.attest(&paths)?;
         arm_controller_start_events(&mut events, &paths)?;
-        let last_waiting =
-            match observe_controller_start(&paths, &authority.instances, epoch_seconds())? {
-                ControllerStartReadiness::Ready => {
-                    let lock = acquire_service_global_lock(&paths)?;
+        let mut lock_busy = false;
+        let last_waiting = match observe_controller_start(
+            &paths,
+            &authority.instances,
+            epoch_seconds(),
+        )? {
+            ControllerStartReadiness::Ready => match try_acquire_service_global_lock(&paths)? {
+                // A controller holds the lock shared while it checks its
+                // SQM, e.g. during an SQM hotplug restart. That is
+                // progress to wait for, not a failed start.
+                None => {
+                    lock_busy = true;
+                    "the service lifecycle lock is held by another runtime check".to_string()
+                }
+                Some(lock) => {
                     let lease = lock.lease(&paths)?;
                     preserved(Some(&lease))?;
                     #[cfg(feature = "calibration")]
@@ -1421,11 +1433,13 @@ fn confirm_controller_service_started_in(
                     authority.attest(&paths)?;
                     match observe_controller_start(&paths, &authority.instances, epoch_seconds())? {
                         ControllerStartReadiness::Ready => {
-                            if let Some(batch) = super::controller_input::load_batch(
+                            let batch = super::controller_input::load_batch(
                                 &paths.runtime_root.join(".controller-input"),
                                 &paths.config_root,
-                            )? {
-                                batch.accept(|generations| {
+                            )?;
+                            let mut left_readiness = None;
+                            let accepted = match &batch {
+                                Some(batch) => batch.accept(|generations| {
                                     preserved(Some(&lease))?;
                                     authority.attest(&paths)?;
                                     let expected = generations.keys().cloned().collect::<Vec<_>>();
@@ -1435,22 +1449,40 @@ fn confirm_controller_service_started_in(
                                         epoch_seconds(),
                                     )? {
                                         ControllerStartReadiness::Ready => Ok(()),
-                                        ControllerStartReadiness::Waiting(_) => {
+                                        ControllerStartReadiness::Waiting(reason) => {
+                                            left_readiness = Some(reason);
                                             Err("controller-batch-readiness-changed".into())
                                         }
                                     }
-                                })?;
-                                preserved(Some(&lease))?;
-                                if collect_inputs {
-                                    if let Err(error) = collect_controller_inputs(&paths) {
-                                        eprintln!(
-                                            "WARNING: controller input cleanup deferred: {error}"
-                                        );
+                                }),
+                                None => Ok(()),
+                            };
+                            match (accepted, left_readiness) {
+                                (Ok(()), _) => {
+                                    if batch.is_some() {
+                                        preserved(Some(&lease))?;
+                                        if collect_inputs {
+                                            if let Err(error) = collect_controller_inputs(&paths) {
+                                                eprintln!(
+                                                    "WARNING: controller input cleanup deferred: {error}"
+                                                );
+                                            }
+                                        }
                                     }
+                                    drop(lock);
+                                    return Ok(());
                                 }
+                                // Every acceptance step rechecks the runtime
+                                // first and a later Ready resumes only what
+                                // is left, so a controller that briefly left
+                                // readiness (its SQM was restarted) is waited
+                                // for like any other startup progress.
+                                (Err(_), Some(reason)) => {
+                                    drop(lock);
+                                    reason
+                                }
+                                (Err(error), None) => return Err(error),
                             }
-                            drop(lock);
-                            return Ok(());
                         }
                         ControllerStartReadiness::Waiting(reason) => {
                             drop(lock);
@@ -1458,8 +1490,9 @@ fn confirm_controller_service_started_in(
                         }
                     }
                 }
-                ControllerStartReadiness::Waiting(reason) => reason,
-            };
+            },
+            ControllerStartReadiness::Waiting(reason) => reason,
+        };
 
         // Re-arm and re-observe before sleeping to close directory-creation
         // and atomic status-replacement races. The deadline only bounds a
@@ -1467,23 +1500,32 @@ fn confirm_controller_service_started_in(
         arm_controller_start_events(&mut events, &paths)?;
         preserved(None)?;
         authority.attest(&paths)?;
-        if matches!(
-            observe_controller_start(&paths, &authority.instances, epoch_seconds())?,
-            ControllerStartReadiness::Ready
-        ) {
-            continue;
-        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(format!(
                 "controller service did not become ready: {last_waiting}"
             ));
         }
-        let readiness = events.wait(-1, Some(remaining))?;
+        // Releasing a lock raises no event: retry a busy lock after a short
+        // bounded pause instead of re-observing Ready in a tight loop.
+        if !lock_busy
+            && matches!(
+                observe_controller_start(&paths, &authority.instances, epoch_seconds())?,
+                ControllerStartReadiness::Ready
+            )
+        {
+            continue;
+        }
+        let pause = if lock_busy {
+            remaining.min(CONTROLLER_START_LOCK_RETRY)
+        } else {
+            remaining
+        };
+        let readiness = events.wait(-1, Some(pause))?;
         if readiness.signal {
             return Err("controller service readiness was interrupted".to_string());
         }
-        if readiness.deadline {
+        if readiness.deadline && (!lock_busy || Instant::now() >= deadline) {
             return Err(format!(
                 "controller service did not become ready: {last_waiting}"
             ));
@@ -2722,7 +2764,7 @@ fn prepare_start() -> Result<String, String> {
         remove_empty_clsact(&paths, interface)?;
         start.attest(&environment)?;
     }
-    start_sqm_backend(&paths, &start, profiles, &environment)?;
+    start_sqm_backend(&paths, &start, &profiles, &environment)?;
     #[cfg(feature = "calibration")]
     let cake = start.published.config().package(CAKE_PACKAGE)?;
     #[cfg(feature = "calibration")]
@@ -2737,10 +2779,8 @@ fn prepare_start() -> Result<String, String> {
     #[cfg(not(feature = "calibration"))]
     let mqtt_instances = Vec::new();
     start.attest(&environment)?;
-    for spec in &start.plan.managed {
-        super::sqm_recovery_openwrt::attest_managed_sqm_from_published(spec, &start.published)
-            .map_err(|error| sqm_error_message(&error).to_string())?;
-    }
+    // The hotplug can restart a queue again while the sidecars are published.
+    settle_managed_sqm(&paths, &start, &profiles, &environment)?;
     start.attest(&environment)?;
     encode_generation_start_plan(start.batch.generations(), &mqtt_instances)
 }
@@ -3364,15 +3404,36 @@ fn remove_empty_clsact(paths: &ServicePaths, interface: &str) -> Result<(), Stri
 fn start_sqm_backend(
     paths: &ServicePaths,
     start: &StartPublication,
-    profiles: Vec<super::sqm_runner::Profile>,
+    profiles: &[super::sqm_runner::Profile],
     resolver: &impl InterfaceResolver,
 ) -> Result<(), String> {
-    let specs = &start.plan.managed;
-    if profiles.len() != specs.len() {
-        return Err("service-start-runner-membership-mismatch".into());
+    let offline_instances = settle_managed_sqm(paths, start, profiles, resolver)?;
+    for (spec, offline) in start.plan.managed.iter().zip(offline_instances) {
+        if offline {
+            eprintln!(
+                "WARNING: managed SQM start for {} is deferred until its target interface returns",
+                spec.instance
+            );
+        }
     }
-    if specs.is_empty() {
-        return start.attest(resolver);
+    Ok(())
+}
+
+/// Bring every managed queue to its exact start postcondition. The upstream
+/// iface hotplug restarts a queue (run.sh stop, then start) independently of
+/// our lock, so one observation can land in that gap. A failed observation
+/// therefore only waits for the next real event; the start action is
+/// idempotent (it starts an absent queue and only attests an existing one).
+fn settle_managed_sqm(
+    paths: &ServicePaths,
+    start: &StartPublication,
+    profiles: &[super::sqm_runner::Profile],
+    resolver: &impl InterfaceResolver,
+) -> Result<Vec<bool>, String> {
+    let specs = &start.plan.managed;
+    if specs.is_empty() && profiles.is_empty() {
+        start.attest(resolver)?;
+        return Ok(Vec::new());
     }
     let sqm_paths = OpenWrtPaths::from_environment();
     // Subscribe before the scoped service action sequence. Upstream iface
@@ -3399,36 +3460,48 @@ fn start_sqm_backend(
         &sqm_paths.sys_class_net,
     )?;
     start.attest(resolver)?;
-    for (spec, profile) in specs.iter().zip(profiles) {
-        start.attest(resolver)?;
-        super::sqm_recovery_openwrt::start_managed_sqm_from_published(
-            spec,
-            &start.published,
-            profile,
-            &paths.runtime_root,
-            || false,
-        )
-        .map_err(|error| sqm_error_message(&error).to_string())?;
-        start.attest(resolver)?;
-    }
-    let offline_instances = await_sqm_start(
+    settle_managed_sqm_with(
         &mut events,
         Instant::now() + SQM_START_ATTEST_TIMEOUT,
         specs,
+        profiles,
         || start.attest(resolver),
-        |spec| {
-            super::sqm_recovery_openwrt::attest_managed_sqm_from_published(spec, &start.published)
+        |spec, profile| {
+            super::sqm_recovery_openwrt::start_managed_sqm_from_published(
+                spec,
+                &start.published,
+                profile,
+                &paths.runtime_root,
+                || false,
+            )
         },
-    )?;
-    for (spec, offline) in specs.iter().zip(offline_instances) {
-        if offline {
-            eprintln!(
-                "WARNING: managed SQM start for {} is deferred until its target interface returns",
-                spec.instance
-            );
-        }
+    )
+}
+
+/// Every round runs the start action for each queue again, but only after a
+/// real event; Busy and cancellation stay terminal (see `await_sqm_start`).
+fn settle_managed_sqm_with<P: Clone>(
+    events: &mut impl StartEvents,
+    deadline: Instant,
+    specs: &[ManagedSqmAttestationSpec],
+    profiles: &[P],
+    attest_configuration: impl FnMut() -> Result<(), String>,
+    mut start_action: impl FnMut(
+        &ManagedSqmAttestationSpec,
+        P,
+    ) -> Result<bool, NativeSqmAttestationError>,
+) -> Result<Vec<bool>, String> {
+    if profiles.len() != specs.len() {
+        return Err("service-start-runner-membership-mismatch".into());
     }
-    Ok(())
+    await_sqm_start(events, deadline, specs, attest_configuration, |spec| {
+        // await_sqm_start only passes members of this same slice.
+        let index = specs
+            .iter()
+            .position(|member| std::ptr::eq(member, spec))
+            .ok_or(NativeSqmAttestationError::Terminated)?;
+        start_action(spec, profiles[index].clone())
+    })
 }
 
 pub(super) fn await_sqm_start(
@@ -3788,6 +3861,14 @@ impl ServiceStopBackend for OpenWrtServiceStop {
 }
 
 fn acquire_service_global_lock(paths: &ServicePaths) -> Result<ServiceGlobalLock, String> {
+    try_acquire_service_global_lock(paths)?
+        .ok_or_else(|| "service lifecycle is busy with another runtime mutation".to_string())
+}
+
+/// `None` only when another holder has the lock right now (EWOULDBLOCK).
+fn try_acquire_service_global_lock(
+    paths: &ServicePaths,
+) -> Result<Option<ServiceGlobalLock>, String> {
     ensure_owner_directory(&paths.runtime_lock_root)?;
     let guard_path = paths.runtime_lock_root.join("runtime.guard");
     if std::env::var_os("CAKE_AUTORATE_SERVICE_LOCK_BORROW").is_some_and(|value| value == "1") {
@@ -3800,7 +3881,7 @@ fn acquire_service_global_lock(paths: &ServicePaths) -> Result<ServiceGlobalLock
             format!("unable to duplicate borrowed service lifecycle lock: {error}")
         })?);
         attest_borrowed_exclusive_lock(&guard_path, &borrowed)?;
-        return Ok(ServiceGlobalLock::Borrowed { _guard: borrowed });
+        return Ok(Some(ServiceGlobalLock::Borrowed { _guard: borrowed }));
     }
 
     let guard = OpenOptions::new()
@@ -3813,13 +3894,12 @@ fn acquire_service_global_lock(paths: &ServicePaths) -> Result<ServiceGlobalLock
         .map_err(|error| format!("unable to open service lifecycle lock: {error}"))?;
     attest_guard_identity(&guard_path, &guard)?;
     if let Err(error) = sys::flock(&guard, libc::LOCK_EX | libc::LOCK_NB) {
-        return Err(if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            "service lifecycle is busy with another runtime mutation".to_string()
-        } else {
-            format!("unable to acquire service lifecycle lock: {error}")
-        });
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        return Err(format!("unable to acquire service lifecycle lock: {error}"));
     }
-    Ok(ServiceGlobalLock::Owned(guard))
+    Ok(Some(ServiceGlobalLock::Owned(guard)))
 }
 
 fn attest_borrowed_exclusive_lock(path: &Path, borrowed: &File) -> Result<(), String> {
@@ -7188,6 +7268,283 @@ fi
             .is_err());
             assert_eq!(calls, 1);
         }
+    }
+
+    #[test]
+    fn sqm_start_repeats_the_start_action_after_a_hotplug_gap_event() {
+        // The 2026-10-18 VM boot: S50sqm had started the queue, then the iface
+        // hotplug restarted it while this start checked the ingress redirect.
+        let mut events = ScriptedStartEvents {
+            drains: [false, false, true, false].into(),
+            waits: [true].into(),
+        };
+        let mut actions = 0;
+        let result = settle_managed_sqm_with(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            &[start_spec("wan")],
+            &["runner"],
+            || Ok(()),
+            |spec, runner| {
+                assert_eq!((spec.instance.as_str(), runner), ("wan", "runner"));
+                actions += 1;
+                if actions == 1 {
+                    Err(NativeSqmAttestationError::Failed(
+                        "managed SQM ingress redirect is not an exact single match".into(),
+                    ))
+                } else {
+                    Ok(false)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(result, [false]);
+        assert_eq!(actions, 2);
+        assert!(events.waits.is_empty());
+    }
+
+    #[test]
+    fn sqm_start_persistent_mismatch_fails_at_the_deadline_with_instance_and_reason() {
+        let mut events = ScriptedStartEvents {
+            drains: [false, false].into(),
+            waits: [false].into(),
+        };
+        let mut actions = 0;
+        let error = settle_managed_sqm_with(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            &[start_spec("wan")],
+            &[()],
+            || Ok(()),
+            |_, ()| {
+                actions += 1;
+                Err(NativeSqmAttestationError::Failed(
+                    "managed SQM counter /sys/class/net/ifb4eth0/statistics/tx_bytes is missing"
+                        .into(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "managed SQM did not reach its exact start postcondition for wan: managed SQM counter /sys/class/net/ifb4eth0/statistics/tx_bytes is missing"
+        );
+        assert_eq!(actions, 1); // one start action per real event, no timer polling
+    }
+
+    /// A fake `uci -c DIR -C .. -t .. -q -X show ALIAS` for snapshot captures.
+    fn readiness_fixture_uci(path: &Path) {
+        write_executable(
+            path,
+            "#!/bin/sh\n[ \"$9\" = show ] || exit 64\neval \"alias=\\${10}\"\ngrep -q cake_autorate \"$2/$alias\" || exit 0\ncat <<EOF\n$alias.lab=cake_autorate\n$alias.lab.enabled='0'\n$alias.lab.manage_sqm='0'\n$alias.lab.sqm_enabled='0'\n$alias.globals=globals\n$alias.globals.graph_history_ram_budget_kib='512'\nEOF\n",
+        );
+    }
+
+    struct ReadinessFixture {
+        root: PathBuf,
+        context: LifecycleContext,
+        status: PathBuf,
+    }
+    impl ReadinessFixture {
+        /// One published but unconfirmed start batch for instance `lab` and
+        /// its controller process (this test process's own PID, so the event
+        /// loop can hold a real pidfd for it).
+        fn new(label: &str) -> Self {
+            let root = test_root(label);
+            let config = root.join("config");
+            let runtime = root.join("run");
+            let proc_root = root.join("proc");
+            for path in [&config, &runtime, &proc_root] {
+                fs::create_dir(path).unwrap();
+            }
+            fs::write(config.join(CAKE_PACKAGE), "config cake_autorate 'lab'\n option enabled '0'\n option manage_sqm '0'\n option sqm_enabled '0'\nconfig globals 'globals'\n option graph_history_ram_budget_kib '512'\n").unwrap();
+            fs::write(config.join(SQM_PACKAGE), b"# no owned queue\n").unwrap();
+            let uci = root.join("uci");
+            readiness_fixture_uci(&uci);
+            let snapshot = CommittedSnapshot::capture(&config, &runtime, &uci).unwrap();
+            let published =
+                super::super::uci_transaction::publish(snapshot.prepare([&[], &[]], &uci).unwrap())
+                    .unwrap();
+            let inputs = runtime.join(".controller-input");
+            let lab =
+                super::super::controller_input::store(&published, "lab", &inputs, &config).unwrap();
+            let batch = super::super::controller_input::store_batch(
+                &published,
+                &["lab".into()],
+                &BTreeMap::from([("lab".into(), lab)]),
+                &inputs,
+                &config,
+            )
+            .unwrap();
+            drop(published);
+            assert!(batch.pending());
+            let id = batch.generations()["lab"].clone();
+            let pid = std::process::id();
+            let process = proc_root.join(pid.to_string());
+            fs::create_dir(&process).unwrap();
+            fs::write(proc_root.join("stat"), b"cpu 1 2 3 4\nbtime 100\n").unwrap();
+            fs::write(
+                process.join("cmdline"),
+                b"/usr/sbin/cake-autorated\0--instance\0lab\0",
+            )
+            .unwrap();
+            fs::write(
+                process.join("stat"),
+                format!(
+                    "{pid} (cake) S 1 {pid} {pid} 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 {}\n",
+                    sys::clock_ticks_per_second() as u64 * 10
+                ),
+            )
+            .unwrap();
+            fs::write(
+                process.join("environ"),
+                format!("{}={id}\0", super::super::controller_input::GENERATION_ENV),
+            )
+            .unwrap();
+            fs::create_dir(runtime.join("lab")).unwrap();
+            let response = serde_json::json!({"cake-autorate":{"instances":{"lab":{
+                "command":[DAEMON_PATH,"--instance","lab"],"pid":pid,"running":true,
+                "env":{super::super::controller_input::GENERATION_ENV:&id}
+            }}}});
+            write_executable(
+                &root.join("ubus"),
+                &format!("#!/bin/sh\nprintf '%s\\n' '{response}'\n"),
+            );
+            let fixture = Self {
+                context: LifecycleContext {
+                    paths: ServicePaths {
+                        config_root: config,
+                        uci: uci.clone(),
+                        tc: root.join("tc"),
+                        ubus: root.join("ubus"),
+                        proc_root,
+                        runtime_root: runtime.clone(),
+                        runtime_lock_root: root.join("locks"),
+                        bridger_init: root.join("bridger"),
+                        bridger_config: root.join("bridger-config"),
+                        uci_workspace_root: root.join("uci-work"),
+                    },
+                    environment: OpenWrtEnvironment::test_paths(
+                        uci,
+                        root.join("ubus"),
+                        root.join("sys"),
+                    ),
+                    #[cfg(feature = "calibration")]
+                    mqtt_root: root.join("mqtt"),
+                    #[cfg(feature = "calibration")]
+                    native_recovery_root: root.join("native"),
+                },
+                status: runtime.join("lab/status.json"),
+                root,
+            };
+            fixture.write_status("RUNNING");
+            fixture
+        }
+        fn write_status(&self, state: &str) {
+            fs::write(
+                &self.status,
+                format!(
+                    "{{\"instance\":\"lab\",\"state\":\"{state}\",\"started_at\":111.0,\"updated_at\":{}}}",
+                    epoch_seconds()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&self.status, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fn applied(&self) -> bool {
+            let paths = &self.context.paths;
+            super::super::controller_input::load_batch(
+                &paths.runtime_root.join(".controller-input"),
+                &paths.config_root,
+            )
+            .unwrap()
+            .is_some_and(|batch| !batch.pending())
+        }
+    }
+    impl Drop for ReadinessFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn controller_readiness_resumes_acceptance_after_a_controller_leaves_readiness() {
+        // 2026-10-18 VM: the SQM hotplug restarted the queue while readiness
+        // accepted the batch; the controller briefly reported WAITING_OPERATION
+        // and the start failed with controller-batch-readiness-changed.
+        let mut flip_at = 2; // the first runtime check inside acceptance
+        loop {
+            let fixture = ReadinessFixture::new("readiness-resume");
+            let (mut leased, mut flipped, mut restored) = (0, false, false);
+            confirm_controller_service_started_in(
+                &fixture.context,
+                |lease| {
+                    match lease {
+                        Some(_) => {
+                            leased += 1;
+                            if leased == flip_at {
+                                fixture.write_status("WAITING_OPERATION");
+                                flipped = true;
+                            }
+                        }
+                        None if flipped && !restored => {
+                            fixture.write_status("RUNNING");
+                            restored = true;
+                        }
+                        None => {}
+                    }
+                    Ok(())
+                },
+                false,
+            )
+            .unwrap_or_else(|error| panic!("flip at runtime check {flip_at}: {error}"));
+            assert!(fixture.applied(), "flip at runtime check {flip_at}");
+            if !restored {
+                break; // the flip came after the last runtime check
+            }
+            flip_at += 1;
+        }
+        // Acceptance has several runtime checks; each one was interrupted once.
+        assert!(flip_at > 5, "only {} checks were interrupted", flip_at - 2);
+    }
+
+    #[test]
+    fn controller_readiness_waits_for_a_lock_held_by_a_controller_sqm_check() {
+        let fixture = ReadinessFixture::new("readiness-lock");
+        let lock_root = &fixture.context.paths.runtime_lock_root;
+        fs::create_dir(lock_root).unwrap();
+        fs::set_permissions(lock_root, fs::Permissions::from_mode(0o700)).unwrap();
+        // A controller takes the global lock shared while it checks its SQM.
+        let shared = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(lock_root.join("runtime.guard"))
+            .unwrap();
+        sys::flock(&shared, libc::LOCK_SH | libc::LOCK_NB).unwrap();
+        let mut holder = Some(shared);
+        let mut unleased = 0;
+        let began = Instant::now();
+        confirm_controller_service_started_in(
+            &fixture.context,
+            |lease| {
+                if lease.is_none() {
+                    unleased += 1;
+                    // Calls 1 and 2 precede the first Ready observation; the
+                    // third one follows the refused lock.
+                    if unleased == 3 {
+                        holder.take(); // the controller finished its check
+                    }
+                }
+                Ok(())
+            },
+            false,
+        )
+        .unwrap();
+        assert!(holder.is_none());
+        assert!(fixture.applied());
+        assert!(began.elapsed() < CONTROLLER_START_TIMEOUT);
     }
 
     #[test]
