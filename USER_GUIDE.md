@@ -49,6 +49,21 @@ and acknowledgements. Do not start a different operation merely because a
 request timed out; inspect its authoritative state first. Lite **Reset** also
 discards this page's staged autorate/SQM changes, not just the visible form.
 
+### Start at boot
+
+At boot the SQM scripts can restart a managed queue (stop, then start again)
+while the service starts, for example when the WAN interface comes up. The start
+waits for such a restart to finish, up to 30 seconds per check, instead of
+failing on the first look, and the readiness check waits the same way when a
+controller briefly reports that its queue is being replaced. If a start still
+fails at boot, it is retried twice in the background, 15 seconds apart. The
+system log (`logread -e cake-autorate`) then shows
+`start failed at boot, retrying (2/3) in 15 s`, and after the last attempt
+`start failed at boot after 3 attempts`. A start that failed never blocks the
+next one: the next start, from the command line or from **Start** in Status,
+first stops what the failed attempt left behind and writes
+`stopping the remains of an earlier start that did not complete` to the log.
+
 ## Get rating
 
 **Get rating** offers an automatic router-side test and a guided client

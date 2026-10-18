@@ -305,6 +305,49 @@ Unit tests script both clocks with `identity::test_clock::ScriptedClocks`
 the capture request do not change under a step, and that snapshot stamps ahead
 of or behind the reader's clock are waits, not failures.
 
+## Service start and the SQM hotplug
+
+`/etc/init.d/cake-autorate start` runs `--service-lifecycle prepare-start`
+(publish the configuration and the generation batch, start or adopt each
+managed queue, classifier and MQTT plans), registers the controllers with
+procd, and then runs `--service-lifecycle confirm-started`, which accepts the
+batch once every controller is ready. The upstream iface hotplug
+(`/etc/hotplug.d/iface/11-sqm`) restarts a queue with `run.sh stop` and then
+`run.sh start`, outside our lock: during that gap the IFB device, the ingress
+redirect or the state file (written last by `start-sqm`) are missing, and at
+boot this happens when `wan` and `wan6` come up while `S97cake-autorate` runs.
+
+- Both managed-SQM checks of `prepare-start` (after the SQM start and again
+  after the sidecars) go through `settle_managed_sqm`: a failed observation
+  waits for a real event (inotify on the state files and configuration, netlink
+  on the interfaces) and then repeats the idempotent start action, which starts
+  an absent queue and only attests an existing one. Each check is bounded by
+  `SQM_START_ATTEST_TIMEOUT` (30 s); Busy and cancellation stay terminal, and
+  there is no timer polling.
+- `confirm-started` treats a controller that leaves readiness during the
+  acceptance of the batch (`controller-batch-readiness-changed`) and a global
+  lock held by a controller's own SQM check as progress to wait for, within
+  `CONTROLLER_START_TIMEOUT` (90 s). Acceptance is resumable: every step
+  rechecks the runtime first, so a later Ready repeats only what is left. A
+  busy lock is retried after one second, because releasing it raises no event.
+- A start that failed after publishing its batch, or whose controllers never
+  became ready, leaves a pending batch without a predecessor
+  (`Batch::unconfirmed_start`). The next `prepare-start` runs the ordinary Stop
+  transaction under its own lock before it publishes a new batch; before this
+  it refused with `service-start-pending-generation-recovery-required` until a
+  stop or a reboot. rc.common holds `procd_lock` (flock on
+  `/var/lock/procd_cake-autorate.lock`) for the whole run of every init action
+  of the service, so no other start can be between its preparation and its procd
+  registration at that point.
+- `boot()` runs the first start as a child of the boot script. When it fails,
+  a background loop asks `--service-lifecycle boot-retry <failed attempt>`,
+  which owns the bound (three attempts in all) and the 15 s pause and logs
+  `start failed at boot, retrying (n/3)`; each retry is an ordinary start in
+  its own process. The loop closes its copy of the procd lock so that other init
+  actions are not held during the pauses, stops when the service is disabled,
+  and logs through `logger -t cake-autorate`. The shell keeps no `sleep`
+  (`tests/shipped-shell-boundary.test.sh`).
+
 ## Notes
 
 Rust is a reasonable daemon language for this project because it provides one static-ish native binary, predictable memory safety, and better long-term maintainability than a large shell daemon. The main practical cost on OpenWrt is build complexity: the first SDK build of `rust/host` is heavy because it compiles Rust/LLVM tooling.
