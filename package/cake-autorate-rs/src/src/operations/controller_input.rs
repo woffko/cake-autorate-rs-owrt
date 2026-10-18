@@ -446,6 +446,11 @@ impl Batch {
     pub(crate) fn pending(&self) -> bool {
         self.name == BATCH_PENDING
     }
+    /// The desired set of an ordinary start that was never confirmed ready:
+    /// only a start publishes a batch without a predecessor.
+    pub(crate) fn unconfirmed_start(&self) -> bool {
+        self.pending() && self.previous.is_none()
+    }
     /// An applied record can coexist with unfinished marker-last restoration.
     /// Such a record is recovery authority, not a baseline for a fresh reload.
     pub(crate) fn attest_settled(&self) -> Result<()> {

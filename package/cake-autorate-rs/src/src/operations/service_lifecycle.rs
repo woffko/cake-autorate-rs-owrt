@@ -1814,7 +1814,15 @@ fn execute_stop_openwrt() -> Result<String, String> {
             super::mqtt_publisher::PRODUCTION_PLAN_ROOT,
         ))?;
     }
-    let requested_source = expected_source_id()?;
+    stop_under_lock(paths, expected_source_id()?)
+}
+
+/// The ordinary Stop transaction. The caller holds the global lifecycle lock
+/// and has already refused every pending Native Apply recovery.
+fn stop_under_lock(
+    paths: ServicePaths,
+    requested_source: Option<String>,
+) -> Result<String, String> {
     let initial_source = if requested_source.is_some() {
         let snapshot =
             CommittedSnapshot::capture(&paths.config_root, &paths.runtime_root, &paths.uci)?;
@@ -2683,6 +2691,33 @@ fn check_source_handoff(
     Ok(source)
 }
 
+/// A start that failed after publishing its generation batch, or whose
+/// controllers never became ready, leaves that batch pending. The next start
+/// must not refuse it until a manual stop or a reboot: it runs the ordinary
+/// Stop transaction under its own lock first. rc.common keeps procd_lock for
+/// the whole life of every init action of this service, so no other start can
+/// be between its preparation and its procd registration at this point.
+fn recover_unconfirmed_start(paths: &ServicePaths) -> Result<(), String> {
+    recover_unconfirmed_start_with(paths, || stop_under_lock(paths.clone(), None).map(|_| ()))
+}
+
+fn recover_unconfirmed_start_with(
+    paths: &ServicePaths,
+    stop: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let unconfirmed = super::controller_input::load_batch(
+        &paths.runtime_root.join(".controller-input"),
+        &paths.config_root,
+    )?
+    .is_some_and(|batch| batch.unconfirmed_start());
+    if !unconfirmed {
+        return Ok(());
+    }
+    eprintln!("WARNING: stopping the remains of an earlier start that did not complete");
+    stop()
+        .map_err(|error| format!("unable to stop an earlier start that did not complete: {error}"))
+}
+
 fn prepare_start() -> Result<String, String> {
     if sys::effective_uid() != 0 {
         return Err("service lifecycle requires root".to_string());
@@ -2712,6 +2747,7 @@ fn prepare_start() -> Result<String, String> {
     }
     let environment = OpenWrtEnvironment::production();
     super::sqm_runner::ensure_idle(&paths.runtime_root)?;
+    recover_unconfirmed_start(&paths)?;
     let expected_source = expected_source_id()?;
     let snapshot = CommittedSnapshot::capture(&paths.config_root, &paths.runtime_root, &paths.uci)?;
     check_source_handoff(&snapshot, expected_source.as_deref())?;
@@ -7377,7 +7413,7 @@ fi
             )
             .unwrap();
             drop(published);
-            assert!(batch.pending());
+            assert!(batch.unconfirmed_start());
             let id = batch.generations()["lab"].clone();
             let pid = std::process::id();
             let process = proc_root.join(pid.to_string());
@@ -7545,6 +7581,31 @@ fi
         assert!(holder.is_none());
         assert!(fixture.applied());
         assert!(began.elapsed() < CONTROLLER_START_TIMEOUT);
+    }
+
+    #[test]
+    fn start_stops_only_the_remains_of_an_unconfirmed_start() {
+        let fixture = ReadinessFixture::new("unconfirmed-start");
+        let paths = &fixture.context.paths;
+        let mut stops = 0;
+        recover_unconfirmed_start_with(paths, || {
+            stops += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stops, 1);
+        assert_eq!(
+            recover_unconfirmed_start_with(paths, || Err("SQM is restarting".into())).unwrap_err(),
+            "unable to stop an earlier start that did not complete: SQM is restarting"
+        );
+        // A confirmed (applied) batch belongs to the running service.
+        confirm_controller_service_started_in(&fixture.context, |_| Ok(()), false).unwrap();
+        assert!(fixture.applied());
+        recover_unconfirmed_start_with(paths, || panic!("a confirmed start must not be stopped"))
+            .unwrap();
+        // No batch at all: an ordinary first start.
+        fs::remove_dir_all(paths.runtime_root.join(".controller-input")).unwrap();
+        recover_unconfirmed_start_with(paths, || panic!("nothing to recover")).unwrap();
     }
 
     #[test]
