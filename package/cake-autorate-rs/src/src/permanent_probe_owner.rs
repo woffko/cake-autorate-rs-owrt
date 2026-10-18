@@ -636,11 +636,17 @@ mod tests {
             );
             let mut counter_snapshot: serde_json::Value =
                 serde_json::from_slice(&snapshot).unwrap();
-            for (name, bytes) in [("rx", 12), ("tx", 34), ("flow_fault", 0)] {
+            for (name, bytes) in [
+                ("rx", 12),
+                ("tx", 34),
+                ("fault_family", 0),
+                ("fault_unregistered", 0),
+                ("fault_egress", 0),
+            ] {
                 counter_snapshot["nftables"].as_array_mut().unwrap().push(
                     serde_json::json!({"counter":{
                         "name":name, "family":"inet", "table":owner.authority.table,
-                        "comment":format!("{}:flow-v1", owner.authority.owner), "bytes":bytes
+                        "comment":format!("{}:flow-v2", owner.authority.owner), "bytes":bytes
                     }}),
                 );
             }

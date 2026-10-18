@@ -18,10 +18,12 @@ use super::rating;
 #[cfg(test)]
 use crate::owned_route_rules::MAX_ACCOUNTING_FLOWS;
 use crate::owned_route_rules::{
-    attest_route_pin_snapshot, cleanup_named_route_pin_with, install_owned_route_pin_with,
-    nft_table_snapshot_arguments, nft_table_snapshot_proves_absence, NftSocketOwner,
-    ACCOUNTING_FAULT_COUNTER, ACCOUNTING_RX_COUNTER, ACCOUNTING_TX_COUNTER,
-    FLOW_ACCOUNTING_OWNER_SUFFIX,
+    accounting_fault, attest_route_pin_snapshot, cleanup_named_route_pin_with,
+    install_owned_route_pin_with, nft_table_snapshot_arguments, nft_table_snapshot_proves_absence,
+    AccountingFault, NftSocketOwner, ACCOUNTING_EGRESS_FAULT_COUNTER,
+    ACCOUNTING_FAMILY_FAULT_COUNTER, ACCOUNTING_RX_COUNTER, ACCOUNTING_TX_COUNTER,
+    ACCOUNTING_UNREGISTERED_FAULT_COUNTER, ACCOUNTING_V1_FAULT_COUNTER,
+    FLOW_ACCOUNTING_OWNER_SUFFIX, FLOW_V1_ACCOUNTING_OWNER_SUFFIX,
 };
 #[cfg(test)]
 use crate::owned_route_rules::{nft_egress_guard_batch, nft_owned_route_pin_batch};
@@ -4548,28 +4550,62 @@ fn parse_named_traffic_counters(
     table: &str,
     owner: &str,
 ) -> Result<SpeedtestTrafficCounters, String> {
-    let flow_owner = format!("{owner}{FLOW_ACCOUNTING_OWNER_SUFFIX}");
-    let (rx_bytes, counter_owner) =
-        match named_counter_bytes(json, table, ACCOUNTING_RX_COUNTER, &flow_owner) {
-            Ok(Some(bytes)) => (bytes, flow_owner.as_str()),
-            Err(error) if error == "speedtest-accounting-identity-mismatch" => (
-                named_counter_bytes(json, table, ACCOUNTING_RX_COUNTER, owner)?
-                    .ok_or_else(|| "speedtest-accounting-rx-missing".to_string())?,
-                owner,
-            ),
+    // The rx counter's comment tells which daemon version installed the
+    // table: the current one (a counter per refusal reason), the previous one
+    // (one counter for every refusal), or one without refusal counters. A
+    // table of an older version can still be read after an upgrade.
+    let current = format!("{owner}{FLOW_ACCOUNTING_OWNER_SUFFIX}");
+    let previous = format!("{owner}{FLOW_V1_ACCOUNTING_OWNER_SUFFIX}");
+    let mut found = None;
+    for (version, comment) in [(2, current.as_str()), (1, previous.as_str()), (0, owner)] {
+        match named_counter_bytes(json, table, ACCOUNTING_RX_COUNTER, comment) {
+            Ok(Some(bytes)) => {
+                found = Some((version, comment, bytes));
+                break;
+            }
             Ok(None) => return Err("speedtest-accounting-rx-missing".into()),
+            Err(error) if error == "speedtest-accounting-identity-mismatch" => continue,
             Err(error) => return Err(error),
-        };
-    let tx_bytes = named_counter_bytes(json, table, ACCOUNTING_TX_COUNTER, counter_owner)?
-        .ok_or_else(|| "speedtest-accounting-tx-missing".to_string())?;
-    if counter_owner == flow_owner {
-        let faults = named_counter_bytes(json, table, ACCOUNTING_FAULT_COUNTER, counter_owner)?
-            .ok_or_else(|| "speedtest-accounting-flow-fault-counter-missing".to_string())?;
-        if faults != 0 {
-            return Err("speedtest-accounting-flow-registration-failed".into());
         }
     }
+    let (version, comment, rx_bytes) =
+        found.ok_or_else(|| "speedtest-accounting-identity-mismatch".to_string())?;
+    let tx_bytes = named_counter_bytes(json, table, ACCOUNTING_TX_COUNTER, comment)?
+        .ok_or_else(|| "speedtest-accounting-tx-missing".to_string())?;
+    let fault = |name: &str| {
+        named_counter_bytes(json, table, name, comment)?
+            .ok_or_else(|| "speedtest-accounting-flow-fault-counter-missing".to_string())
+    };
+    match version {
+        2 => {
+            let family = fault(ACCOUNTING_FAMILY_FAULT_COUNTER)?;
+            let unregistered = fault(ACCOUNTING_UNREGISTERED_FAULT_COUNTER)?;
+            let egress = fault(ACCOUNTING_EGRESS_FAULT_COUNTER)?;
+            if let Some(reason) = accounting_fault(family, unregistered, egress) {
+                // The code names one reason; the job log keeps all three.
+                eprintln!(
+                    "ERROR: {table} refused packets of the speed test: {family} bytes not IPv4, \
+                     {unregistered} bytes IPv4 without an accounted flow, {egress} bytes \
+                     leaving through another device"
+                );
+                return Err(speedtest_accounting_fault_code(reason).into());
+            }
+        }
+        1 if fault(ACCOUNTING_V1_FAULT_COUNTER)? != 0 => {
+            return Err("speedtest-accounting-flow-registration-failed".into());
+        }
+        _ => {}
+    }
     Ok(SpeedtestTrafficCounters { rx_bytes, tx_bytes })
+}
+
+/// The terminal code of a speed test whose accounting table refused packets.
+pub(crate) const fn speedtest_accounting_fault_code(reason: AccountingFault) -> &'static str {
+    match reason {
+        AccountingFault::NonIpv4 => "speedtest-accounting-non-ipv4-traffic",
+        AccountingFault::WrongEgress => "speedtest-accounting-wrong-egress",
+        AccountingFault::Unregistered => "speedtest-accounting-flow-registration-failed",
+    }
 }
 
 fn accounting_time_remaining(deadline: Instant) -> Result<Duration, String> {
@@ -7293,7 +7329,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             .filter_map(|command| command.get("add")?.get("rule"))
             .filter(|rule| !rule.to_string().contains("owned_dns6"))
             .collect();
-        assert_eq!(rules.len(), 6);
+        assert_eq!(rules.len(), 7);
         let matches_credentials =
             |rule: &serde_json::Value, uid: Option<u32>, group: Option<u32>| {
                 rule["expr"].as_array().unwrap().iter().all(|expression| {
@@ -7322,6 +7358,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         ] {
             assert_eq!(matches_credentials(rules[0], Some(uid), Some(group)), owned);
             assert_eq!(matches_credentials(rules[4], Some(uid), Some(group)), owned);
+            assert_eq!(matches_credentials(rules[5], Some(uid), Some(group)), owned);
             let clears = matches_credentials(rules[1], Some(uid), Some(group))
                 || matches_credentials(rules[2], Some(uid), Some(group));
             assert_eq!(
@@ -7339,20 +7376,24 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             rules[3]["expr"].as_array().unwrap().last().unwrap(),
             &serde_json::json!({"return":null})
         );
-        assert_eq!(
-            rules[4]["expr"].as_array().unwrap().last().unwrap(),
-            &serde_json::json!({"drop":null})
-        );
+        for refusal in &rules[4..6] {
+            assert_eq!(
+                refusal["expr"].as_array().unwrap().last().unwrap(),
+                &serde_json::json!({"drop":null})
+            );
+            assert!(
+                refusal["expr"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e["match"]["left"].get("ct").is_none()),
+                "untracked/unsupported owned traffic must hit a refusal counter"
+            );
+        }
+        assert!(rules[4].to_string().contains("fault_unregistered"));
+        assert!(rules[5].to_string().contains("fault_family"));
         assert!(
-            rules[4]["expr"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|e| e["match"]["left"].get("ct").is_none()),
-            "untracked/unsupported owned traffic must hit the fault counter"
-        );
-        assert!(
-            rules[5]["expr"]
+            rules[6]["expr"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -8578,7 +8619,13 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         assert_eq!(commands[0]["create"]["table"]["comment"], owner);
         assert_eq!(commands[1]["add"]["set"]["size"], MAX_ACCOUNTING_FLOWS);
         assert!(commands[1]["add"]["set"].get("timeout").is_none());
-        for (entry, name) in commands[2..5].iter().zip(["rx", "tx", "flow_fault"]) {
+        for (entry, name) in commands[2..7].iter().zip([
+            "rx",
+            "tx",
+            "fault_family",
+            "fault_unregistered",
+            "fault_egress",
+        ]) {
             assert_eq!(entry["add"]["counter"]["name"], name);
             assert_eq!(
                 entry["add"]["counter"]["comment"],
@@ -8586,8 +8633,8 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             );
         }
         for (entry, hook, kind) in [
-            (&commands[5], "output", "route"),
-            (&commands[6], "input", "filter"),
+            (&commands[7], "output", "route"),
+            (&commands[8], "input", "filter"),
         ] {
             assert_eq!(entry["add"]["chain"]["hook"], hook);
             assert_eq!(entry["add"]["chain"]["type"], kind);
@@ -8599,7 +8646,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
                 command["add"].get("rule").is_some() && !command.to_string().contains("owned_dns6")
             })
             .collect();
-        assert_eq!(rules.len(), 5);
+        assert_eq!(rules.len(), 6);
         assert_eq!(
             rules[0]["add"]["rule"]["expr"]
                 .as_array()
@@ -8623,14 +8670,22 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             .unwrap();
         assert_eq!(mark["mangle"]["value"]["|"][0]["&"][1], !0x3f00_u32);
         assert_eq!(mark["mangle"]["value"]["|"][1], 0x200);
-        let fallback = rules[3]["add"]["rule"]["expr"].as_array().unwrap();
-        assert_eq!(fallback.len(), 3);
-        assert_eq!(fallback[0]["match"]["left"]["meta"]["key"], "skuid");
-        assert_eq!(fallback[0]["match"]["right"], 32769);
-        assert_eq!(fallback[1]["counter"], "flow_fault");
-        assert!(fallback[2].get("drop").is_some());
-        assert_eq!(rules[4]["add"]["rule"]["chain"], "input");
-        assert!(!rules[4].to_string().contains("skuid"));
+        let unregistered = rules[3]["add"]["rule"]["expr"].as_array().unwrap();
+        assert_eq!(unregistered.len(), 4);
+        assert_eq!(unregistered[0]["match"]["left"]["meta"]["key"], "nfproto");
+        assert_eq!(unregistered[0]["match"]["right"], "ipv4");
+        assert_eq!(unregistered[1]["match"]["left"]["meta"]["key"], "skuid");
+        assert_eq!(unregistered[1]["match"]["right"], 32769);
+        assert_eq!(unregistered[2]["counter"], "fault_unregistered");
+        assert!(unregistered[3].get("drop").is_some());
+        let family = rules[4]["add"]["rule"]["expr"].as_array().unwrap();
+        assert_eq!(family.len(), 3);
+        assert_eq!(family[0]["match"]["left"]["meta"]["key"], "skuid");
+        assert_eq!(family[0]["match"]["right"], 32769);
+        assert_eq!(family[1]["counter"], "fault_family");
+        assert!(family[2].get("drop").is_some());
+        assert_eq!(rules[5]["add"]["rule"]["chain"], "input");
+        assert!(!rules[5].to_string().contains("skuid"));
         let accounting_only = nft_route_pin_batch(&table, &owner, 32769, None);
         assert!(!accounting_only.contains("\"mangle\""));
         assert!(accounting_only.contains("{\"counter\":\"rx\"}"));
@@ -8733,6 +8788,26 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             )
             .unwrap();
         }
+        // The egress guard pinned to a device the kernel fixture never uses:
+        // its isolated veth is then the wrong device for every owned packet.
+        let mut egress = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("egress.json"))
+            .unwrap();
+        egress
+            .write_all(
+                nft_egress_guard_batch(
+                    &nft_route_pin_batch(&table, &owner, 0, None),
+                    &table,
+                    NftSocketOwner::BackendUid(0),
+                    "cake_wrong",
+                )
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -8740,43 +8815,102 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         use serde_json::json;
         let table = route_pin_table_name(&"a".repeat(32), &"b".repeat(32)).unwrap();
         let owner = route_pin_owner(&"a".repeat(32), &"b".repeat(32)).unwrap();
-        let counters = |counter_owner: &str| {
-            json!({"nftables":[
-                {"counter":{"family":"inet","table":table,"name":"rx","comment":counter_owner,"bytes":1200}},
-                {"counter":{"family":"inet","table":table,"name":"tx","comment":counter_owner,"bytes":300}}
-            ]})
+        let counters = |counter_owner: &str, faults: &[(&str, u64)]| {
+            let mut rows = vec![
+                json!({"counter":{"family":"inet","table":table,"name":"rx","comment":counter_owner,"bytes":1200}}),
+                json!({"counter":{"family":"inet","table":table,"name":"tx","comment":counter_owner,"bytes":300}}),
+            ];
+            for (name, bytes) in faults {
+                rows.push(json!({"counter":{
+                    "family":"inet","table":table,"name":name,"comment":counter_owner,"bytes":bytes}}));
+            }
+            json!({ "nftables": rows }).to_string()
         };
+        let read = |text: &str| parse_named_traffic_counters(text, &table, &owner);
         let expected = SpeedtestTrafficCounters {
             rx_bytes: 1200,
             tx_bytes: 300,
         };
+        // A table installed before refusal counters existed stays readable.
+        assert_eq!(read(&counters(&owner, &[])).unwrap(), expected);
+
+        // The previous version: one counter for every refused packet.
+        let previous = format!("{owner}:flow-v1");
         assert_eq!(
-            parse_named_traffic_counters(&counters(&owner).to_string(), &table, &owner).unwrap(),
-            expected
-        );
-        let flow_owner = format!("{owner}{FLOW_ACCOUNTING_OWNER_SUFFIX}");
-        let mut current = counters(&flow_owner);
-        assert_eq!(
-            parse_named_traffic_counters(&current.to_string(), &table, &owner).unwrap_err(),
+            read(&counters(&previous, &[])).unwrap_err(),
             "speedtest-accounting-flow-fault-counter-missing"
         );
-        current["nftables"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"counter":{
-            "family":"inet","table":table,"name":"flow_fault","comment":flow_owner,"bytes":0}}));
         assert_eq!(
-            parse_named_traffic_counters(&current.to_string(), &table, &owner).unwrap(),
+            read(&counters(&previous, &[("flow_fault", 0)])).unwrap(),
             expected
         );
-        current["nftables"][2]["counter"]["bytes"] = json!(1);
-        let error = parse_named_traffic_counters(&current.to_string(), &table, &owner).unwrap_err();
+        let error = read(&counters(&previous, &[("flow_fault", 1)])).unwrap_err();
         assert_eq!(error, "speedtest-accounting-flow-registration-failed");
         assert!(!server_attempt_is_retryable(&error));
         assert!(!completed_speedtest_output_is_unmeasurable(&error));
-        current["nftables"][2]["counter"]["bytes"] = json!(0);
-        current["nftables"][2]["counter"]["comment"] = json!(owner);
-        assert!(parse_named_traffic_counters(&current.to_string(), &table, &owner).is_err());
+
+        // The current version: a counter per reason, each with its own code.
+        let current = format!("{owner}{FLOW_ACCOUNTING_OWNER_SUFFIX}");
+        assert_eq!(current, format!("{owner}:flow-v2"));
+        let v2 = |family, unregistered, egress| {
+            counters(
+                &current,
+                &[
+                    ("fault_family", family),
+                    ("fault_unregistered", unregistered),
+                    ("fault_egress", egress),
+                ],
+            )
+        };
+        assert_eq!(read(&v2(0, 0, 0)).unwrap(), expected);
+        for (faults, code) in [
+            ((80, 0, 0), "speedtest-accounting-non-ipv4-traffic"),
+            ((0, 60, 0), "speedtest-accounting-flow-registration-failed"),
+            ((0, 0, 92), "speedtest-accounting-wrong-egress"),
+            ((80, 60, 92), "speedtest-accounting-non-ipv4-traffic"),
+            ((0, 60, 92), "speedtest-accounting-wrong-egress"),
+        ] {
+            let error = read(&v2(faults.0, faults.1, faults.2)).unwrap_err();
+            assert_eq!(error, code, "{faults:?}");
+            assert!(!server_attempt_is_retryable(&error));
+            assert!(!completed_speedtest_output_is_unmeasurable(&error));
+            assert!(
+                super::super::full_autotune::terminal_traffic_is_unknown(
+                    &super::super::full_autotune::AutotuneTerminal::Failed {
+                        code: error.clone()
+                    }
+                ),
+                "{error} must leave the traffic of a job unknown"
+            );
+        }
+        // Every refusal counter of the current version must be present.
+        for missing in ["fault_family", "fault_unregistered", "fault_egress"] {
+            let faults: Vec<_> = [
+                ("fault_family", 0),
+                ("fault_unregistered", 0),
+                ("fault_egress", 0),
+            ]
+            .into_iter()
+            .filter(|(name, _)| *name != missing)
+            .collect();
+            assert_eq!(
+                read(&counters(&current, &faults)).unwrap_err(),
+                "speedtest-accounting-flow-fault-counter-missing"
+            );
+        }
+        // An old single counter in a current table is not a substitute.
+        assert_eq!(
+            read(&counters(&current, &[("flow_fault", 0)])).unwrap_err(),
+            "speedtest-accounting-flow-fault-counter-missing"
+        );
+        // A refusal counter of another owner never belongs to this table.
+        let mut foreign: serde_json::Value = serde_json::from_str(&v2(0, 0, 0)).unwrap();
+        foreign["nftables"][3]["counter"]["comment"] = json!(owner);
+        assert!(read(&foreign.to_string()).is_err());
+        // Mixed versions in one table are rejected, not merged.
+        let mut mixed: serde_json::Value = serde_json::from_str(&v2(0, 0, 0)).unwrap();
+        mixed["nftables"][1]["counter"]["comment"] = json!(previous);
+        assert!(read(&mixed.to_string()).is_err());
     }
 
     #[test]

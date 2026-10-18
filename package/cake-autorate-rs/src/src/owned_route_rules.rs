@@ -4,10 +4,47 @@
 
 pub(crate) const ACCOUNTING_RX_COUNTER: &str = "rx";
 pub(crate) const ACCOUNTING_TX_COUNTER: &str = "tx";
-pub(crate) const ACCOUNTING_FAULT_COUNTER: &str = "flow_fault";
-pub(crate) const FLOW_ACCOUNTING_OWNER_SUFFIX: &str = ":flow-v1";
+/// A refused packet of the owner is counted by its reason (format `:flow-v2`):
+/// it was not IPv4, it was IPv4 but could not be recorded as an accounted flow,
+/// or it was leaving through another device than the measured uplink.
+pub(crate) const ACCOUNTING_FAMILY_FAULT_COUNTER: &str = "fault_family";
+pub(crate) const ACCOUNTING_UNREGISTERED_FAULT_COUNTER: &str = "fault_unregistered";
+pub(crate) const ACCOUNTING_EGRESS_FAULT_COUNTER: &str = "fault_egress";
+pub(crate) const FLOW_ACCOUNTING_OWNER_SUFFIX: &str = ":flow-v2";
+/// Format `:flow-v1` counted every refused packet in one counter. A table of
+/// that format can still exist after an upgrade and is read as before.
+pub(crate) const ACCOUNTING_V1_FAULT_COUNTER: &str = "flow_fault";
+pub(crate) const FLOW_V1_ACCOUNTING_OWNER_SUFFIX: &str = ":flow-v1";
 pub(crate) const MAX_ACCOUNTING_FLOWS: u32 = 4096;
 const MAX_NFT_SNAPSHOT_BYTES: usize = 256 * 1024;
+
+/// Why a `:flow-v2` table refused packets of its owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountingFault {
+    NonIpv4,
+    WrongEgress,
+    Unregistered,
+}
+
+/// The refusal to report when the fault counters of a `:flow-v2` table are
+/// not all zero. One code is reported; the order puts the most specific cause
+/// first, since an IPv6 packet or a packet on another device is also not an
+/// accounted IPv4 flow of the measured uplink.
+pub(crate) fn accounting_fault(
+    family_bytes: u64,
+    unregistered_bytes: u64,
+    egress_bytes: u64,
+) -> Option<AccountingFault> {
+    if family_bytes != 0 {
+        Some(AccountingFault::NonIpv4)
+    } else if egress_bytes != 0 {
+        Some(AccountingFault::WrongEgress)
+    } else if unregistered_bytes != 0 {
+        Some(AccountingFault::Unregistered)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum NftSocketOwner {
@@ -72,7 +109,9 @@ pub(crate) fn nft_owned_route_pin_batch(
     for name in [
         ACCOUNTING_RX_COUNTER,
         ACCOUNTING_TX_COUNTER,
-        ACCOUNTING_FAULT_COUNTER,
+        ACCOUNTING_FAMILY_FAULT_COUNTER,
+        ACCOUNTING_UNREGISTERED_FAULT_COUNTER,
+        ACCOUNTING_EGRESS_FAULT_COUNTER,
     ] {
         commands.push(json!({"add":{"counter":{"family":"inet","table":table,"name":name,"comment":counter_owner}}}));
     }
@@ -100,15 +139,21 @@ pub(crate) fn nft_owned_route_pin_batch(
         original.clone(),
         owned.clone(),
     ];
-    let mut fault = vec![owned.clone()];
+    let mut unregistered = vec![ipv4.clone(), owned.clone()];
+    let mut family = vec![owned.clone()];
     if let Some(gid) = probe_gid {
         let group = json!({"match":{"op":"==","left":{"meta":{"key":"skgid"}},"right":gid}});
         register.push(group.clone());
-        fault.push(group);
+        unregistered.push(group.clone());
+        family.push(group);
     }
     register.push(json!({"set":{"op":"update","set":"@owned_flows","elem":key}}));
-    fault.extend([
-        json!({"counter":ACCOUNTING_FAULT_COUNTER}),
+    unregistered.extend([
+        json!({"counter":ACCOUNTING_UNREGISTERED_FAULT_COUNTER}),
+        json!({"drop":null}),
+    ]);
+    family.extend([
+        json!({"counter":ACCOUNTING_FAMILY_FAULT_COUNTER}),
         json!({"drop":null}),
     ]);
     let mut rules = vec![
@@ -199,9 +244,12 @@ pub(crate) fn nft_owned_route_pin_batch(
     rules.push(("input", receive6));
     rules.extend([
         ("output", transmit),
-        // No CT-dependent condition here: NOTRACK, unsupported family/zone or
-        // full-set failure must not let this backend send unaccounted traffic.
-        ("output", fault),
+        // No CT-dependent condition in either refusal: an IPv4 packet that is
+        // NOTRACK, in another zone or did not fit the full set is refused as
+        // unregistered, and every other family as non-IPv4. Neither lets this
+        // backend send unaccounted traffic.
+        ("output", unregistered),
+        ("output", family),
         (
             "input",
             vec![
@@ -264,7 +312,7 @@ pub(crate) fn nft_egress_guard_batch(
     let wrong_device =
         json!({"match":{"op":"!=","left":{"meta":{"key":"oifname"}},"right":device}});
     let deny = [
-        json!({"counter":ACCOUNTING_FAULT_COUNTER}),
+        json!({"counter":ACCOUNTING_EGRESS_FAULT_COUNTER}),
         json!({"drop":null}),
     ];
     owned.push(wrong_device.clone());
@@ -323,7 +371,7 @@ pub(crate) fn attest_owned_probe_counters(
         .as_array()
         .ok_or_else(|| "permanent-probe-counters-invalid".to_string())?;
     let counter_owner = format!("{owner}{FLOW_ACCOUNTING_OWNER_SUFFIX}");
-    let mut counters = [None; 3];
+    let mut counters = [None; 5];
     for entry in entries {
         let Some(counter) = entry.get("counter") else {
             continue;
@@ -331,7 +379,9 @@ pub(crate) fn attest_owned_probe_counters(
         let slot = match counter.get("name").and_then(serde_json::Value::as_str) {
             Some(ACCOUNTING_RX_COUNTER) => 0,
             Some(ACCOUNTING_TX_COUNTER) => 1,
-            Some(ACCOUNTING_FAULT_COUNTER) => 2,
+            Some(ACCOUNTING_FAMILY_FAULT_COUNTER) => 2,
+            Some(ACCOUNTING_UNREGISTERED_FAULT_COUNTER) => 3,
+            Some(ACCOUNTING_EGRESS_FAULT_COUNTER) => 4,
             _ => return Err("permanent-probe-counter-name-invalid".into()),
         };
         if entry.as_object().is_none_or(|object| object.len() != 1)
@@ -348,11 +398,17 @@ pub(crate) fn attest_owned_probe_counters(
             return Err("permanent-probe-counter-duplicate".into());
         }
     }
-    let [Some(rx_bytes), Some(tx_bytes), Some(faults)] = counters else {
+    let [Some(rx_bytes), Some(tx_bytes), Some(family), Some(unregistered), Some(egress)] = counters
+    else {
         return Err("permanent-probe-counter-missing".into());
     };
-    if faults != 0 {
-        return Err("permanent-probe-flow-accounting-failed".into());
+    match accounting_fault(family, unregistered, egress) {
+        Some(AccountingFault::NonIpv4) => return Err("permanent-probe-non-ipv4-traffic".into()),
+        Some(AccountingFault::WrongEgress) => return Err("permanent-probe-wrong-egress".into()),
+        Some(AccountingFault::Unregistered) => {
+            return Err("permanent-probe-flow-accounting-failed".into())
+        }
+        None => {}
     }
     Ok(OwnedProbeCounters { rx_bytes, tx_bytes })
 }
@@ -542,10 +598,12 @@ mod tests {
         for (name, bytes) in [
             (ACCOUNTING_RX_COUNTER, 12),
             (ACCOUNTING_TX_COUNTER, 34),
-            (ACCOUNTING_FAULT_COUNTER, 0),
+            (ACCOUNTING_FAMILY_FAULT_COUNTER, 0),
+            (ACCOUNTING_UNREGISTERED_FAULT_COUNTER, 0),
+            (ACCOUNTING_EGRESS_FAULT_COUNTER, 0),
         ] {
             entries.push(json!({"counter":{
-                "family":"inet", "table":"cake_pm_42", "comment":"owner:flow-v1",
+                "family":"inet", "table":"cake_pm_42", "comment":"owner:flow-v2",
                 "name":name, "bytes":bytes, "packets":0
             }}));
         }
@@ -571,8 +629,9 @@ mod tests {
             (1, "family", json!("ip")),
             (1, "table", json!("foreign")),
             (1, "comment", json!("owner")), // No legacy fallback for permanent probes.
-            (2, "comment", json!("foreign:flow-v1")),
-            (3, "bytes", json!(1)),
+            (2, "comment", json!("foreign:flow-v2")),
+            (2, "comment", json!("owner:flow-v1")), // Only the current format.
+            (3, "name", json!("flow_fault")),
             (1, "bytes", json!(-1)),
             (1, "bytes", json!(1.5)),
             (1, "bytes", json!("12")),
@@ -582,7 +641,22 @@ mod tests {
             bad["nftables"][index][kind][field] = replacement;
             assert!(read(&bad).is_err(), "accepted invalid {index}/{field}");
         }
-        for index in 1..=3 {
+        // Each refusal has its own code; several at once report the most
+        // specific one (not IPv4, then wrong device, then unregistered).
+        for (faults, code) in [
+            ([1, 0, 0], "permanent-probe-non-ipv4-traffic"),
+            ([0, 0, 1], "permanent-probe-wrong-egress"),
+            ([0, 1, 0], "permanent-probe-flow-accounting-failed"),
+            ([1, 1, 1], "permanent-probe-non-ipv4-traffic"),
+            ([0, 1, 1], "permanent-probe-wrong-egress"),
+        ] {
+            let mut faulted = valid.clone();
+            for (offset, bytes) in faults.into_iter().enumerate() {
+                faulted["nftables"][3 + offset]["counter"]["bytes"] = json!(bytes);
+            }
+            assert_eq!(read(&faulted).unwrap_err(), code, "{faults:?}");
+        }
+        for index in 1..=5 {
             let mut missing = valid.clone();
             missing["nftables"].as_array_mut().unwrap().remove(index);
             assert!(read(&missing).is_err());
@@ -914,7 +988,9 @@ mod tests {
             for deny in &rules[2..] {
                 let text = deny.to_string();
                 assert!(text.contains("wan-test") && text.contains("!=") && text.contains("drop"));
-                assert!(text.contains(ACCOUNTING_FAULT_COUNTER));
+                assert!(text.contains(ACCOUNTING_EGRESS_FAULT_COUNTER));
+                assert!(!text.contains(ACCOUNTING_FAMILY_FAULT_COUNTER));
+                assert!(!text.contains(ACCOUNTING_UNREGISTERED_FAULT_COUNTER));
             }
             assert!(rules[3].to_string().contains("@owned_flows"));
             assert!(!rules[3].to_string().contains("skuid"));
@@ -924,6 +1000,108 @@ mod tests {
             assert!(nft_egress_guard_batch(&base, "cake_test", socket_owner, "wan;bad").is_err());
         }
     }
+    #[test]
+    fn refused_packets_are_counted_by_their_reason() {
+        for socket_owner in [
+            NftSocketOwner::BackendUid(32769),
+            NftSocketOwner::ProbeRootGid(32770),
+        ] {
+            let batch: serde_json::Value = serde_json::from_str(&nft_owned_route_pin_batch(
+                "test",
+                "owner",
+                socket_owner,
+                Some((!0x3f00, 0x200)),
+            ))
+            .unwrap();
+            let commands = batch["nftables"].as_array().unwrap();
+            let counters: Vec<_> = commands
+                .iter()
+                .filter_map(|row| row["add"].get("counter"))
+                .map(|counter| {
+                    (
+                        counter["name"].as_str().unwrap(),
+                        counter["comment"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                counters,
+                [
+                    ("rx", "owner:flow-v2"),
+                    ("tx", "owner:flow-v2"),
+                    ("fault_family", "owner:flow-v2"),
+                    ("fault_unregistered", "owner:flow-v2"),
+                    ("fault_egress", "owner:flow-v2"),
+                ]
+            );
+            let output: Vec<_> = commands
+                .iter()
+                .filter_map(|row| row["add"].get("rule"))
+                .filter(|rule| rule["chain"] == "output")
+                .map(|rule| rule["expr"].as_array().unwrap().clone())
+                .collect();
+            let refusal = |name: &str| {
+                output
+                    .iter()
+                    .position(|expr| {
+                        expr.iter()
+                            .any(|e| e.get("counter") == Some(&serde_json::json!(name)))
+                    })
+                    .unwrap()
+            };
+            let transmit = output
+                .iter()
+                .position(|expr| {
+                    expr.iter()
+                        .any(|e| e.get("counter") == Some(&serde_json::json!("tx")))
+                        && serde_json::Value::Array(expr.clone())
+                            .to_string()
+                            .contains("@owned_flows")
+                })
+                .unwrap();
+            let unregistered = refusal(ACCOUNTING_UNREGISTERED_FAULT_COUNTER);
+            let family = refusal(ACCOUNTING_FAMILY_FAULT_COUNTER);
+            // Accounted flows return first; IPv4 that is still left over is
+            // unregistered, and anything left after that is another family.
+            assert!(transmit < unregistered && unregistered < family && family == output.len() - 1);
+            let unregistered = &output[unregistered];
+            assert_eq!(unregistered[0]["match"]["left"]["meta"]["key"], "nfproto");
+            assert_eq!(unregistered[0]["match"]["right"], "ipv4");
+            assert!(!serde_json::Value::Array(unregistered.clone())
+                .to_string()
+                .contains("\"ct\""));
+            let family = &output[family];
+            assert!(!serde_json::Value::Array(family.clone())
+                .to_string()
+                .contains("nfproto"));
+            for expr in [unregistered, family] {
+                assert!(expr.last().unwrap().get("drop").is_some());
+                assert_eq!(
+                    expr.iter().any(|e| e.to_string().contains("skgid")),
+                    matches!(socket_owner, NftSocketOwner::ProbeRootGid(_))
+                );
+            }
+            assert!(!commands
+                .iter()
+                .any(|row| row.to_string().contains("flow_fault")));
+        }
+        assert_eq!(accounting_fault(0, 0, 0), None);
+        assert_eq!(accounting_fault(1, 0, 0), Some(AccountingFault::NonIpv4));
+        assert_eq!(
+            accounting_fault(0, 0, 1),
+            Some(AccountingFault::WrongEgress)
+        );
+        assert_eq!(
+            accounting_fault(0, 1, 0),
+            Some(AccountingFault::Unregistered)
+        );
+        assert_eq!(accounting_fault(1, 1, 1), Some(AccountingFault::NonIpv4));
+        assert_eq!(
+            accounting_fault(0, 1, 1),
+            Some(AccountingFault::WrongEgress)
+        );
+    }
+
     #[test]
     fn t2_dns6_is_bounded_loopback_dns_not_an_ipv6_wan_bypass() {
         for owner in [
@@ -1001,6 +1179,48 @@ mod tests {
                 "exemption precedes the device check"
             );
             late.remove(position);
+            // The refusal counter was split by reason (format v2). Fold the
+            // split back into the single v1 counter: one counter definition,
+            // the IPv4-only refusal rule dropped (the family rule catches the
+            // same packets in v1), every refusal counting `flow_fault`. All
+            // other bytes must still be those of the accepted batch.
+            let commands = value["nftables"].as_array_mut().unwrap();
+            commands.retain(|row| {
+                let counter = row["add"]["counter"]["name"].as_str();
+                let unregistered = row["add"]["rule"]["expr"].as_array().is_some_and(|expr| {
+                    expr.iter()
+                        .any(|e| e["counter"] == ACCOUNTING_UNREGISTERED_FAULT_COUNTER)
+                });
+                !matches!(
+                    counter,
+                    Some(ACCOUNTING_UNREGISTERED_FAULT_COUNTER | ACCOUNTING_EGRESS_FAULT_COUNTER)
+                ) && !unregistered
+            });
+            for row in commands.iter_mut() {
+                // pointer_mut: indexing a missing key mutably would insert null.
+                if let Some(counter) = row.pointer_mut("/add/counter") {
+                    if counter["name"] == ACCOUNTING_FAMILY_FAULT_COUNTER {
+                        counter["name"] = ACCOUNTING_V1_FAULT_COUNTER.into();
+                    }
+                    let comment = counter["comment"]
+                        .as_str()
+                        .unwrap()
+                        .replace(":flow-v2", ":flow-v1");
+                    counter["comment"] = comment.into();
+                }
+                if let Some(expr) = row
+                    .pointer_mut("/add/rule/expr")
+                    .and_then(|expr| expr.as_array_mut())
+                {
+                    for item in expr {
+                        if item["counter"] == ACCOUNTING_FAMILY_FAULT_COUNTER
+                            || item["counter"] == ACCOUNTING_EGRESS_FAULT_COUNTER
+                        {
+                            item["counter"] = ACCOUNTING_V1_FAULT_COUNTER.into();
+                        }
+                    }
+                }
+            }
             // Keep the original golden proof for every other byte/field;
             // actual exclusive creation is exercised by the kernel fixture.
             let legacy = format!("{}\n", serde_json::to_string(&value).unwrap());

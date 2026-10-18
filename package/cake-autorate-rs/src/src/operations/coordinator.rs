@@ -11947,6 +11947,8 @@ mod tests {
             "owned-traffic-accounting-failed",
             "speedtest-counter-reset",
             "speedtest-accounting-flow-registration-failed",
+            "speedtest-accounting-non-ipv4-traffic",
+            "speedtest-accounting-wrong-egress",
         ] {
             full_autotune::publish_terminal_file(
                 &paths.terminal,
