@@ -869,10 +869,11 @@ error means that the `flow_fault` counter of the job's accounting table was not
 zero: a packet of the backend's user was dropped because it was not part of an
 accounted IPv4 flow on the measured uplink.
 
-The difference between the two operations is the server choice. Auto-Tune and a
-Speed Test with a chosen server pass `--server`; the Automatic Rating lets the
-backend pick the server. Only then does speedtest-go run its packet loss
-analyzer, and that analyzer ignored `--source`: its TCP sampler was never bound,
+The difference between the two operations is the server choice. Auto-Tune
+compares servers itself and always passes `--server`, as does a Speed Test with
+a chosen server; the Automatic Rating, and a Speed Test without a chosen server,
+let the backend pick the server. Only then does speedtest-go run its packet
+loss analyzer, and that analyzer ignored `--source`: its TCP sampler was never bound,
 and its UDP sender's binding failed because the bare address was resolved as
 `host:port`. On a router with IPv6, Go prefers IPv6 (RFC 6724) for a server with
 an AAAA record, so both sockets went out over IPv6. Read-only checks on the
