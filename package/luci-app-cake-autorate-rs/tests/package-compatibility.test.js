@@ -28,6 +28,11 @@ for (const setting of ['tls3des=0', 'tlsrsakex=0', 'tlssha1=0', 'tlsunsafeekm=0'
 	'x509negativeserial=0', 'tls10server=0'])
 	assert.ok(tls.includes('\n+//go:debug ' + setting + '\n'), 'the backend must set ' + setting);
 assert.ok(fs.existsSync(path.join(packages, 'speedtest-go/patches/100-bounded-request-failures.patch')));
+const loss = fs.readFileSync(path.join(packages, 'speedtest-go/patches/140-loss-analyzer-source.patch'), 'utf8');
+assert.match(loss, /^\+\ttcpSource, udpSource := lossSourceAddrs\(options.SourceInterface\)$/m,
+	'patch 140 must derive the loss analyzer binding from --source');
+assert.match(loss, /^\+\t\t\tLocalAddr: tcpSource,$/m, 'the loss analyzer TCP sampler must be bound to --source');
+assert.match(loss, /^\+\t\t\tLocalAddr: udpSource,$/m, 'the loss analyzer UDP sender must be bound to --source');
 for (const [ui, daemon] of [
 	['luci-app-cake-autorate-rs', 'cake-autorate-rs-full'],
 	['luci-app-cake-autorate-rs-lite', 'cake-autorate-rs-lite'],

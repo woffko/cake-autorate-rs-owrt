@@ -1,0 +1,116 @@
+diff -ruN a/speedtest/cake_loss_source_test.go b/speedtest/cake_loss_source_test.go
+--- a/speedtest/cake_loss_source_test.go	1970-01-01 03:00:00.000000000 +0300
++++ b/speedtest/cake_loss_source_test.go	2026-10-18 09:41:27.213444841 +0300
+@@ -0,0 +1,60 @@
++package speedtest
++
++import (
++	"net"
++	"testing"
++)
++
++// The packet loss analyzer must use --source like the rest of the test: the
++// daemon accounts only for IPv4 flows of the backend on the measured uplink,
++// so an IPv6 or unbound socket aborts the measurement.
++func TestCakeLossAnalyzerBindsTheSourceAddress(t *testing.T) {
++	for _, source := range []string{"192.0.2.10", "tcp://192.0.2.10"} {
++		analyzer := NewPacketLossAnalyzer(&PacketLossAnalyzerOptions{SourceInterface: source})
++		tcp, ok := analyzer.options.TCPDialer.LocalAddr.(*net.TCPAddr)
++		if !ok || !tcp.IP.Equal(net.ParseIP("192.0.2.10")) || tcp.Port != 0 {
++			t.Fatalf("%s: TCP sampler is bound to %v", source, analyzer.options.TCPDialer.LocalAddr)
++		}
++		udp, ok := analyzer.options.UDPDialer.LocalAddr.(*net.UDPAddr)
++		if !ok || !udp.IP.Equal(net.ParseIP("192.0.2.10")) || udp.Port != 0 {
++			t.Fatalf("%s: UDP sender is bound to %v", source, analyzer.options.UDPDialer.LocalAddr)
++		}
++	}
++}
++
++func TestCakeLossAnalyzerWithoutAnAddressStaysUnbound(t *testing.T) {
++	for _, source := range []string{"", "not an address"} {
++		analyzer := NewPacketLossAnalyzer(&PacketLossAnalyzerOptions{SourceInterface: source})
++		if analyzer.options.TCPDialer.LocalAddr != nil || analyzer.options.UDPDialer.LocalAddr != nil {
++			t.Fatalf("%q: dialers are bound to %v and %v", source,
++				analyzer.options.TCPDialer.LocalAddr, analyzer.options.UDPDialer.LocalAddr)
++		}
++	}
++}
++
++func TestCakeLossAnalyzerDialersKeepAnIPv4SourceOffIPv6(t *testing.T) {
++	analyzer := NewPacketLossAnalyzer(&PacketLossAnalyzerOptions{SourceInterface: "127.0.0.1"})
++	v4, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer v4.Close()
++	conn, err := analyzer.options.TCPDialer.Dial("tcp", v4.Addr().String())
++	if err != nil {
++		t.Fatalf("IPv4 sampler connection: %v", err)
++	}
++	conn.Close()
++	v6, err := net.Listen("tcp6", "[::1]:0")
++	if err != nil {
++		t.Skipf("no IPv6 loopback here: %v", err)
++	}
++	defer v6.Close()
++	if conn, err := analyzer.options.TCPDialer.Dial("tcp", v6.Addr().String()); err == nil {
++		conn.Close()
++		t.Fatal("the TCP sampler connected over IPv6 despite an IPv4 source")
++	}
++	if conn, err := analyzer.options.UDPDialer.Dial("udp", v6.Addr().String()); err == nil {
++		conn.Close()
++		t.Fatal("the UDP sender opened an IPv6 socket despite an IPv4 source")
++	}
++}
+diff -ruN a/speedtest/loss.go b/speedtest/loss.go
+--- a/speedtest/loss.go	2026-10-18 09:41:09.987616139 +0300
++++ b/speedtest/loss.go	2026-10-18 09:43:15.271378604 +0300
+@@ -39,20 +39,17 @@
+ 	if options.PacketSendingTimeout == 0 {
+ 		options.PacketSendingTimeout = 5 * time.Second
+ 	}
++	tcpSource, udpSource := lossSourceAddrs(options.SourceInterface)
+ 	if options.TCPDialer == nil {
+ 		options.TCPDialer = &net.Dialer{
+-			Timeout: options.PacketSendingTimeout,
++			Timeout:   options.PacketSendingTimeout,
++			LocalAddr: tcpSource,
+ 		}
+ 	}
+ 	if options.UDPDialer == nil {
+-		var addr net.Addr
+-		if len(options.SourceInterface) > 0 {
+-			// skip error and using auto-select
+-			addr, _ = net.ResolveUDPAddr("udp", options.SourceInterface)
+-		}
+ 		options.UDPDialer = &net.Dialer{
+ 			Timeout:   options.PacketSendingTimeout,
+-			LocalAddr: addr,
++			LocalAddr: udpSource,
+ 		}
+ 	}
+ 	return &PacketLossAnalyzer{
+@@ -60,6 +57,23 @@
+ 	}
+ }
+ 
++// lossSourceAddrs binds the analyzer's TCP sampler and UDP sender to the
++// --source address, as every other socket of the test is bound. Upstream
++// resolved the bare address as a "udp" host:port, which fails without a
++// port, and never bound the TCP sampler, so on a dual-stack host both
++// connected to the server over IPv6 (preferred by RFC 6724), or left
++// through another uplink, whatever --source said. With an IPv4 source the
++// dialers only consider the server's IPv4 addresses. A source that is not an
++// IP address keeps the unbound dialers; nothing is looked up here.
++func lossSourceAddrs(source string) (net.Addr, net.Addr) {
++	_, address := parseAddr(source)
++	ip := net.ParseIP(address)
++	if ip == nil {
++		return nil, nil
++	}
++	return &net.TCPAddr{IP: ip}, &net.UDPAddr{IP: ip}
++}
++
+ // RunMulti Mix all servers to get the average packet loss.
+ func (pla *PacketLossAnalyzer) RunMulti(hosts []string) (*transport.PLoss, error) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), pla.options.SamplingDuration)

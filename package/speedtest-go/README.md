@@ -67,6 +67,18 @@ with `-buildmode pie` wherever Go supports it: every ABI except `mips_24kc` and
 stays an ordinary executable. `go version -m` shows `-buildmode=pie`, and the
 ELF header says `DYN` instead of `EXEC` on the ABIs that got it.
 
+Patch 140 (also revision 6) binds the packet loss analyzer to `--source`. When
+no `--server` is given, upstream runs that analyzer against the server it
+picked, with a TCP sampler that was never bound and a UDP sender whose binding
+failed (it resolved the bare address as `host:port`). On a router with IPv6
+both connected to the server over IPv6, which RFC 6724 prefers, or through
+another uplink. The daemon accounts only for the backend's IPv4 flows on the
+measured uplink and stops such a run with
+`speedtest-accounting-flow-registration-failed`; the Automatic Rating, which
+lets the backend choose the server, failed that way on dual-stack routers. With
+an IPv4 source both sockets now consider only the server's IPv4 addresses.
+Offline tests check the binding and that the dialers refuse an IPv6 target.
+
 SDK integration must select this package instead of the stock feed package,
 inside a disposable SDK only. Preserve the package name and executable path.
 Verify the resulting speedtest-go APK version, binary hash and Full daemon
