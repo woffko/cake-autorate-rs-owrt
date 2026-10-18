@@ -1031,7 +1031,8 @@ of the queue) after a delay.
 |---|---:|---|
 | one hotplug restart, 42 starts with delays from 0 to 3 s | 8 | 2 × counter missing, 4 × ingress redirect, 2 × readiness confirmation (`controller-batch-readiness-changed`) |
 | a second start right after each failure, no reboot | 8 of 8 | `service-start-pending-generation-recovery-required` |
-| reboot while a boot script restarts SQM back to back during `S97cake-autorate` | 5 of 5 boots | 2 × ingress redirect, 3 × counter missing; the second start failed every time |
+| plain reboot: the hotplug restarted SQM once or twice during the start in every boot | 3 of 10 boots | counter missing, `does not have exactly one root CAKE qdisc`, readiness confirmation (`download-redirect-missing`); the second start failed every time |
+| reboot while a boot script restarts SQM back to back during `S97cake-autorate` | 9 of 10 boots | ingress redirect and counter missing; the second start failed every time |
 
 The readiness failures came from a controller that briefly reported
 `WAITING_OPERATION` while its batch was accepted; the lifecycle took that for a
@@ -1088,18 +1089,24 @@ load.
 
 ### VM acceptance (x86_64, OpenWrt 25.12)
 
-Daemon `c4683636` from gate 192 with its packaged init script:
+Daemon `c4683636` from gate 192 with its packaged init script. The driver reads
+the SQM starts and stops of each boot from `logread -t` and the controller's
+start from `/proc/<pid>/stat`, both in seconds since boot.
 
 | Scenario | Before | After |
 |---|---|---|
 | one hotplug restart during the start, the 29 delays of two of the runs above | 6 failed | 0 failed; a start that met the restart waited up to 2.0 s |
 | ten back-to-back restarts during the start, 5 delays | — | 0 of 5 failed; the start waited up to 5.0 s |
 | ingress redirect removed for longer than the wait | — | the start fails after the 30 s wait with `managed SQM did not reach its exact start postcondition for primary: managed SQM ingress redirect is not an exact single match` and leaves its batch pending; with the redirect back, the next start, without a reboot, stops the remains and runs in 1.3 s |
-| reboot, SQM restarted back to back during `S97cake-autorate` | 5 of 5 down | 10 of 10 running, controller up 15 to 18 s after boot |
+| plain reboot | 3 of 10 down | 15 of 15 running; in the 10 boots with a timeline the hotplug stopped SQM at 14.3 to 16.6 s and the controller came up at 14.9 to 16.7 s, so every start met a restart |
+| reboot, SQM restarted back to back during `S97cake-autorate` | 9 of 10 down | 10 of 10 running, controller up 15 to 18 s after boot |
 | reboot, global lock held for the first 10 s of `S96` | — | 2 of 2 running after one retry, controller up 30 s after boot |
-| plain reboot | — | 5 of 5 running, controller up 14 to 15 s after boot |
 
-- Service checks: 33 of 33 before and after the reboots.
+- The before columns of the reboots come from the daemon and init script of
+  source gate 190, installed again for that series; the VM was then put back on
+  the gate 192 package.
+- Service checks: 33 of 33 before and after the reboots, and after the package
+  was put back.
 - Speed Test (capped, current topology): completed in 28.6 s.
 - After back-to-back SQM restarts the running controller stays `HEALTHY`; while
   the restarts last it reports `download-device-missing` and similar runtime
