@@ -1003,3 +1003,117 @@ provoked on purpose, and each case put the VM back:
 - An Auto-Tune whose traffic budget watch notices a refusal still stops with
   `owned-traffic-accounting-failed`; the job's log line names the reason.
 - Only x86_64 was run; the AArch64 packages were built and verified.
+
+## Changes after RC27 r320/r128: service start while SQM restarts (unreleased)
+
+### The failure
+
+The upstream iface hotplug restarts a managed queue (`run.sh stop`, then
+`run.sh start`) outside the lifecycle lock, and `start-sqm` writes the state
+file last. At boot this happens when `wan` and `wan6` come up while
+`S97cake-autorate` starts. A start that looked at the queue in that gap failed
+(`managed SQM counter /sys/class/net/ifb4eth0/statistics/tx_bytes is missing`,
+`managed SQM ingress redirect is not an exact single match`), and every later
+start refused with `service-start-pending-generation-recovery-required` until
+a stop or a reboot. rcS runs `boot()` once, so nothing retried: one of the
+owner's routers ran without its controllers for seven days after such a boot,
+and the test VM failed the same way after a reboot.
+
+### Reproduction on the test VM (before the change)
+
+Daemon `57e0ee71` (the build of source gate 190) and
+`tools/goal-k-vm-start-race.py` (git-ignored): stop the service, start the
+managed queue with the stock SQM init (as `S50sqm` does at boot), then start the
+service and run the iface hotplug (`ACTION=ifup ... 11-sqm`: a stop and a start
+of the queue) after a delay.
+
+| Scenario | Failed | Errors |
+|---|---:|---|
+| one hotplug restart, 42 starts with delays from 0 to 3 s | 8 | 2 × counter missing, 4 × ingress redirect, 2 × readiness confirmation (`controller-batch-readiness-changed`) |
+| a second start right after each failure, no reboot | 8 of 8 | `service-start-pending-generation-recovery-required` |
+| reboot while a boot script restarts SQM back to back during `S97cake-autorate` | 5 of 5 boots | 2 × ingress redirect, 3 × counter missing; the second start failed every time |
+
+The readiness failures came from a controller that briefly reported
+`WAITING_OPERATION` while its batch was accepted; the lifecycle took that for a
+failed start. The section on unsafe code above records the same code under CPU
+load.
+
+### What changed
+
+- Both managed-SQM checks of the start wait for a real event and repeat the
+  idempotent start action, at most 30 s each, instead of one look.
+- The readiness confirmation waits when a controller leaves readiness during
+  the acceptance of its batch or holds the global lock for its own SQM check;
+  acceptance resumes where it stopped.
+- A start that finds the pending batch of an earlier start that never became
+  ready runs the ordinary Stop transaction first (`stopping the remains of an
+  earlier start that did not complete`). No recovery record changes.
+- `boot()` retries a failed start in the background, three attempts in all,
+  15 s apart (`start failed at boot, retrying (2/3) in 15 s`, then
+  `start failed at boot after 3 attempts`). The pause and the bound live in
+  `--service-lifecycle boot-retry`.
+
+### Tests that fail without the change
+
+- SQM start: a start action that fails in a hotplug gap is repeated after the
+  next event and the start succeeds; a lasting mismatch fails at the deadline
+  with the instance and the reason, after one action per event (no polling).
+- Readiness, on the real loop over a fixture `/proc`, status file, batch and
+  `ubus`: the controller leaves readiness at each runtime check of the
+  acceptance in turn, and the start is accepted every time; a global lock held
+  shared by a controller is waited for. The previous code failed with
+  `controller-batch-readiness-changed` and with `service lifecycle is busy with
+  another runtime mutation`.
+- Recovery: a pending start batch is stopped before the new start, an accepted
+  one and an empty store are left alone, a failed stop is reported.
+- `boot-retry`: three attempts at most, non-canonical numbers refused.
+- `tests/init-boot-retry.test.sh` (Full and Lite): attempts and retries for 0 to
+  3 failures and for a disabled service, the log lines, no `sleep` in the
+  shell; and, under BusyBox ash with a stand-in that takes the lock like
+  `procd_lock`, that a retry never waits for the lock inherited by the loop or
+  by its `logger`.
+
+### Source gate and packages
+
+- Source gate 192, 58 commands (the new shell test is one of them): Full (1,872)
+  and Lite (444) Rust tests, six new in each, formatting, clippy, LuCI checks,
+  shell tests and real-UCI tests; the sources did not change during the run.
+- Daemon and LuCI packages for x86_64 and aarch64_cortex-a76 built from that
+  gate and verified (payload, metadata, ELF, overflow checks on).
+- Gate 191 had accepted the same Rust code with the first version of `boot()`.
+  On the VM its retry loop kept `procd_lock` through the `logger` at the end of
+  its pipeline: the retried start, and even `status`, waited for the lock until
+  a reboot. The descriptor is now closed before the pipeline exists, and the
+  BusyBox case of the shell test fails on the first version.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+Daemon `c4683636` from gate 192 with its packaged init script:
+
+| Scenario | Before | After |
+|---|---|---|
+| one hotplug restart during the start, the 29 delays of two of the runs above | 6 failed | 0 failed; a start that met the restart waited up to 2.0 s |
+| ten back-to-back restarts during the start, 5 delays | — | 0 of 5 failed; the start waited up to 5.0 s |
+| ingress redirect removed for longer than the wait | — | the start fails after the 30 s wait with `managed SQM did not reach its exact start postcondition for primary: managed SQM ingress redirect is not an exact single match` and leaves its batch pending; with the redirect back, the next start, without a reboot, stops the remains and runs in 1.3 s |
+| reboot, SQM restarted back to back during `S97cake-autorate` | 5 of 5 down | 10 of 10 running, controller up 15 to 18 s after boot |
+| reboot, global lock held for the first 10 s of `S96` | — | 2 of 2 running after one retry, controller up 30 s after boot |
+| plain reboot | — | 5 of 5 running, controller up 14 to 15 s after boot |
+
+- Service checks: 33 of 33 before and after the reboots.
+- Speed Test (capped, current topology): completed in 28.6 s.
+- After back-to-back SQM restarts the running controller stays `HEALTHY`; while
+  the restarts last it reports `download-device-missing` and similar runtime
+  errors, as before.
+- The VM configuration was the same at the end; the test fixtures were removed.
+
+### Known limits
+
+- A reload (Save & Apply) still starts a changed queue with one check; a hotplug
+  restart at that moment can fail the reload. That path is not part of this
+  change.
+- A start that fails at boot three times stays stopped until it is started by
+  hand; the log says so.
+- A busy global lock during readiness raises no event, so it is retried every
+  second, within the 90 s readiness limit.
+- Only x86_64 was run; the AArch64 packages were built and verified. The
+  owner's router still runs the release daemon.

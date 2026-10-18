@@ -343,10 +343,13 @@ boot this happens when `wan` and `wan6` come up while `S97cake-autorate` runs.
   a background loop asks `--service-lifecycle boot-retry <failed attempt>`,
   which owns the bound (three attempts in all) and the 15 s pause and logs
   `start failed at boot, retrying (n/3)`; each retry is an ordinary start in
-  its own process. The loop closes its copy of the procd lock so that other init
-  actions are not held during the pauses, stops when the service is disabled,
-  and logs through `logger -t cake-autorate`. The shell keeps no `sleep`
-  (`tests/shipped-shell-boundary.test.sh`).
+  its own process. The retry subshell closes the inherited procd lock
+  (descriptor 1000) before it creates its pipeline to `logger -t cake-autorate`:
+  a copy kept by the loop or by `logger` would block every later init action of
+  the service, the retried start and `status` included, until a reboot. The
+  loop stops when the service is disabled. The shell keeps no `sleep`
+  (`tests/shipped-shell-boundary.test.sh`); `tests/init-boot-retry.test.sh`
+  runs the inherited-lock case under BusyBox ash.
 
 ## Notes
 
