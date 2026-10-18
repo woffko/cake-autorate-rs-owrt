@@ -357,6 +357,29 @@ start and that nothing was measured and no test traffic was used. Where the
 service's reason is internal detail, a plain explanation is shown with the
 original text below it.
 
+### When test traffic could not be counted
+
+Every Speed Test, Get rating and Auto-Tune counts its own traffic with
+temporary nftables rules. A packet of the test that these rules cannot account
+for is dropped, and the test stops with one of three codes. The Get rating,
+Speed Test and Auto-Tune windows show an explanation next to the code.
+
+| Code | What happened | What to do |
+|---|---|---|
+| `speedtest-accounting-non-ipv4-traffic` | The speed-test program sent traffic that was not IPv4, usually IPv6. Only the IPv4 traffic of the tested uplink can be counted. | Install the `speedtest-go` package of the same release. Older builds sent IPv6 on routers with IPv6 when the program chose the server itself (Get rating, or a Speed Test without a chosen server). |
+| `speedtest-accounting-wrong-egress` | Test traffic was about to leave through another interface than the tested uplink. | Check the routing of this uplink: mwan3 rules and policies, policy routes, a VPN that takes the default route. |
+| `speedtest-accounting-flow-registration-failed` | Some IPv4 test traffic could not be recorded as a tracked connection: connection tracking was disabled for it (a `notrack` rule), it was in another conntrack zone, or the test opened more than 4096 connections. | Remove `notrack` or conntrack-zone rules that also match the router's own traffic. |
+
+When several of these happen in one test, the first in the table is reported.
+The line `... refused packets of the speed test: ... bytes not IPv4, ... bytes
+IPv4 without an accounted flow, ... bytes leaving through another device`
+records how many bytes were refused for each reason: in the job's log
+(`stderr-*.log` in the job's directory under
+`/tmp/run/cake-autorate-calibration/jobs/`) or, when the calibration service
+noticed it, in the system log. An Auto-Tune whose traffic budget watch notices
+the refusal stops with `owned-traffic-accounting-failed`; the same line names
+the reason.
+
 ### Retries after a server failure
 
 Public speed-test servers occasionally refuse a connection or stop mid-test.

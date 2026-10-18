@@ -67,8 +67,8 @@ overrides before starting probes or calibration. It requires the standard
 local/main/default rules; it does not attempt to guess that a custom selector
 is irrelevant. Use a supported, explicit route authority for policy routing.
 Owned calibration traffic additionally has a postrouting egress guard: packets
-resolved to a different device are dropped and make accounting fail, rather
-than measuring that device. The guard permits only local loopback DNS as an
+resolved to a different device are dropped and make accounting fail
+(`speedtest-accounting-wrong-egress`), rather than measuring that device. The guard permits only local loopback DNS as an
 exception; it does not attest the resolver daemon's upstream forwarding path.
 
 ### Explicit policy route (`route_mode=explicit`, Full only)

@@ -73,8 +73,9 @@ picked, with a TCP sampler that was never bound and a UDP sender whose binding
 failed (it resolved the bare address as `host:port`). On a router with IPv6
 both connected to the server over IPv6, which RFC 6724 prefers, or through
 another uplink. The daemon accounts only for the backend's IPv4 flows on the
-measured uplink and stops such a run with
-`speedtest-accounting-flow-registration-failed`; the Automatic Rating, which
+measured uplink and stops such a run (before the daemon split its refusal
+counters, with `speedtest-accounting-flow-registration-failed`; now with
+`speedtest-accounting-non-ipv4-traffic`); the Automatic Rating, which
 lets the backend choose the server, failed that way on dual-stack routers. With
 an IPv4 source both sockets now consider only the server's IPv4 addresses.
 Offline tests check the binding and that the dialers refuse an IPv6 target.

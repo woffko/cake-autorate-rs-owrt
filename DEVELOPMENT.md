@@ -74,6 +74,14 @@ For Lite select `CONFIG_PACKAGE_cake-autorate-rs-lite=m` and
 `CONFIG_PACKAGE_luci-app-cake-autorate-rs-lite=m` instead of the two Full
 package symbols.
 
+### Releases and the speedtest-go backend
+
+The release set ships a `speedtest-go` APK for every ABI. Its content is
+revision 6 with patches 100 to 140; patch 140 was added to revision 6 after the
+first 12-ABI build of that revision, so the backend must be built again for all
+twelve ABIs for the release (and its build information and ELF type checked),
+not taken from an earlier build of revision 6.
+
 ## Overflow checks
 
 The daemon is built with integer overflow checks: an addition, subtraction or
@@ -184,6 +192,37 @@ unshare --user --map-user=0 --map-group=0 --net env \
   package/cake-autorate-rs/src/target/debug/deps/cake_autorated-<hash> \
   --ignored operations::traffic_classifier
 ```
+
+## Traffic accounting tables
+
+Each operation counts its own traffic in temporary nftables tables:
+`cake_st_<job>_<run>` for the speed-test backend (its user), `cake_pt_<job>_<run>`
+for the probes of a job (root with a reserved group), and `cake_pm_<gid>` for
+the permanent probes of a controller (`owned_route_rules.rs`). Each table has the
+counters `rx` and `tx` and one counter per reason a packet of the owner is
+refused (dropped):
+
+| Counter | Chain | Refused packet | Code |
+|---|---|---|---|
+| `fault_family` | output | not IPv4 (except DNS to `::1` through `lo`) | `speedtest-accounting-non-ipv4-traffic` |
+| `fault_egress` | egress (postrouting) | leaving through another device than the pinned one (except DNS to `127.0.0.1`/`::1`) | `speedtest-accounting-wrong-egress` |
+| `fault_unregistered` | output | IPv4 that is not an accounted flow: `notrack`, conntrack zone other than 0, flow set full | `speedtest-accounting-flow-registration-failed` |
+
+Permanent probes use `permanent-probe-non-ipv4-traffic`,
+`permanent-probe-wrong-egress` and `permanent-probe-flow-accounting-failed`. The
+counters carry the comment `<owner>:flow-v2`. Readers of the job tables also
+accept the format before it (`<owner>:flow-v1`, a single `flow_fault` counter,
+reported as `speedtest-accounting-flow-registration-failed`) and tables without
+refusal counters, because a table of an older daemon can still exist after an
+upgrade. A permanent owner reads only the table it installed itself, so it
+accepts only the current format.
+
+The unit test `t2_flow_accounting_export_exact_production_rules_for_kernel_fixture`
+writes the exact batches (`main`, `mwan3`, both probe variants, the cutoff, and
+an egress guard pinned to an unused device) into the directory named by
+`CAKE_T2_NFT_BATCH_DIR`, so that they can be applied to a real nftables in a
+throw-away user and network namespace, as described in the previous section,
+and each refusal checked against its counter.
 
 ## Clocks and deadlines
 
