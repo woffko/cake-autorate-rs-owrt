@@ -856,3 +856,66 @@ r6, installed over the previous build:
   touch that code beyond the shared clock read, which the Speed Test and Auto-Tune
   runs exercise.
 - Only x86_64 was run; the AArch64 packages were built and verified.
+
+## Changes after RC27 r320/r128: Automatic Rating on dual-stack routers (unreleased)
+
+### The failure
+
+On the owner's multi-WAN router (OpenWrt 25.12, IPv6 on both uplinks, daemon r320
+with backend `speedtest-go` r5) every **Get rating** in automatic mode ended within
+seconds with `speedtest-accounting-flow-registration-failed`, while two Full Raw
+Auto-Tune runs on the same instance and route the same morning reached Review. The
+error means that the `flow_fault` counter of the job's accounting table was not
+zero: a packet of the backend's user was dropped because it was not part of an
+accounted IPv4 flow on the measured uplink.
+
+The difference between the two operations is the server choice. Auto-Tune and a
+Speed Test with a chosen server pass `--server`; the Automatic Rating lets the
+backend pick the server. Only then does speedtest-go run its packet loss
+analyzer, and that analyzer ignored `--source`: its TCP sampler was never bound,
+and its UDP sender's binding failed because the bare address was resolved as
+`host:port`. On a router with IPv6, Go prefers IPv6 (RFC 6724) for a server with
+an AAAA record, so both sockets went out over IPv6. Read-only checks on the
+router showed that most of the nearby servers have AAAA records (one of them, the
+one Auto-Tune preferred, does not).
+
+### Reproduction on the test VM
+
+The VM has no IPv6 uplink, so one was emulated: a global IPv6 address and an IPv6
+default route on the WAN through a gateway that never answers, and IPv4 to the
+one nearby server without an AAAA record dropped so that the backend's own choice
+fell on a dual-stack server.
+
+- The backend run by hand (`--source <IPv4> --dns-bind-source`, no `--server`)
+  sent 1 IPv6 SYN and 146 IPv6 UDP packets to the server it picked. With
+  `--server` the analyzer does not start (the server record has no host) and no
+  IPv6 packet left.
+- Automatic Rating with the packaged r6 backend: failed after 29 s with
+  `speedtest-accounting-flow-registration-failed`; the `flow_fault` counter of
+  the backend table grew from 4 to 163 packets while it ran.
+- The same rating with the patched backend: completed in 55 s (grade A+, 36
+  samples per direction), `flow_fault` stayed 0.
+- A capped Speed Test without the emulation, with the patched backend: completed
+  in 24 s as before.
+
+The patched backend for these runs was a static x86_64 build of the patched
+source (the SDK build is pending, see below); the packaged backend was put back
+afterwards and its hash checked.
+
+### What changed
+
+- Patch 140 of `speedtest-go` binds the analyzer's TCP sampler and UDP sender to
+  the `--source` IP (a literal only; nothing is looked up). With an IPv4 source
+  both consider only the server's IPv4 addresses. Three offline tests check the
+  binding, that a source that is not an address keeps the upstream behaviour, and
+  that the dialers refuse an IPv6 target; all three fail on the unpatched code.
+  The patch belongs to the unreleased revision 6, so the daemon's backend floor
+  (`>= 1.7.10-r6`) also requires it.
+
+### Known limits
+
+- The accounting rules are unchanged: a backend packet outside the accounted IPv4
+  flows still stops the measurement. Nothing in the daemon can tell from the
+  counter which packet it was; the router checks above and the VM reproduction
+  are the evidence.
+- The fix has not been run on the owner's router yet.
