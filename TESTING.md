@@ -919,4 +919,11 @@ afterwards and its hash checked.
   flows still stops the measurement. Nothing in the daemon can tell from the
   counter which packet it was; the router checks above and the VM reproduction
   are the evidence.
-- The fix has not been run on the owner's router yet.
+- On the owner's router the fixed r6 backend (x86_64 APK, binary `ab007e6a…`) replaced
+  r5 in one package transaction; the daemon (r320), the configuration, the boot and
+  the running controller and calibration processes were unchanged. The first Get
+  rating stopped after 30 s with `quiet-window-timeout`, before any measurement:
+  LAN clients were uploading in bursts of up to 57 Mbit/s against a quiet limit of
+  about 45 Mbit/s. The second completed in 51 s: grade A+, 36 samples per direction,
+  the `flow_fault` counter of the backend table zero in all six samples taken while
+  it ran, limits unchanged.
