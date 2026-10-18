@@ -779,6 +779,34 @@ impl ReloadPublication {
             .zip(profiles)
             .map(|(spec, profile)| (spec.target_interface.clone(), profile))
             .collect();
+        fn desired_ready_in(
+            reload: &ReloadPublication,
+            live: &BTreeSet<String>,
+            spec: &ManagedSqmAttestationSpec,
+        ) -> Result<bool, String> {
+            let mut observed = spec.clone();
+            if live.contains(&spec.instance) {
+                let cake = reload.start.published.config().package(CAKE_PACKAGE)?;
+                let section = cake
+                    .sections
+                    .get(&spec.instance)
+                    .ok_or("reload-controller-config-missing")?;
+                let policy = managed_sqm_rate_policy_from_options(&section.options)
+                    .map_err(|e| sqm_error_message(&e).to_string())?;
+                observed.minimum_download_kbps = policy.minimum_download_kbps;
+                observed.maximum_download_kbps = policy.maximum_download_kbps;
+                observed.minimum_upload_kbps = policy.minimum_upload_kbps;
+                observed.maximum_upload_kbps = policy.maximum_upload_kbps;
+            }
+            match super::sqm_recovery_openwrt::attest_managed_sqm_from_published(
+                &observed,
+                &reload.start.published,
+            ) {
+                Ok(_) => Ok(true), // Includes a proven offline/deferred target.
+                Err(NativeSqmAttestationError::Failed(_)) => Ok(false),
+                Err(error) => Err(sqm_error_message(&error).to_string()),
+            }
+        }
         struct Backend<'a, R, P> {
             reload: &'a ReloadPublication,
             paths: &'a ServicePaths,
@@ -798,28 +826,7 @@ impl ReloadPublication {
                 (self.preserved)()
             }
             fn desired_ready(&mut self, spec: &ManagedSqmAttestationSpec) -> Result<bool, String> {
-                let mut observed = spec.clone();
-                if self.live.contains(&spec.instance) {
-                    let cake = self.reload.start.published.config().package(CAKE_PACKAGE)?;
-                    let section = cake
-                        .sections
-                        .get(&spec.instance)
-                        .ok_or("reload-controller-config-missing")?;
-                    let policy = managed_sqm_rate_policy_from_options(&section.options)
-                        .map_err(|e| sqm_error_message(&e).to_string())?;
-                    observed.minimum_download_kbps = policy.minimum_download_kbps;
-                    observed.maximum_download_kbps = policy.maximum_download_kbps;
-                    observed.minimum_upload_kbps = policy.minimum_upload_kbps;
-                    observed.maximum_upload_kbps = policy.maximum_upload_kbps;
-                }
-                match super::sqm_recovery_openwrt::attest_managed_sqm_from_published(
-                    &observed,
-                    &self.reload.start.published,
-                ) {
-                    Ok(_) => Ok(true), // Includes a proven offline/deferred target.
-                    Err(NativeSqmAttestationError::Failed(_)) => Ok(false),
-                    Err(error) => Err(sqm_error_message(&error).to_string()),
-                }
+                desired_ready_in(self.reload, &self.live, spec)
             }
             fn stop_old(&mut self, spec: &ManagedSqmStopSpec) -> Result<(), String> {
                 if self.reload.start.plan.managed.iter().any(|new| {
@@ -828,12 +835,44 @@ impl ReloadPublication {
                 }) {
                     return Err("reload-sqm-running-desired-controller-needs-recovery".into());
                 }
+                let (reload, paths, resolver) = (self.reload, self.paths, self.resolver);
+                let desired = reload
+                    .start
+                    .plan
+                    .managed
+                    .iter()
+                    .find(|new| new.target_interface == spec.target_interface);
+                let mut interfaces = vec![spec.target_interface.clone()];
+                interfaces.extend(
+                    [&spec.download_interface]
+                        .into_iter()
+                        .chain(desired.map(|new| &new.download_interface))
+                        .filter(|name| super::runtime_health::safe_interface(name))
+                        .cloned(),
+                );
+                let mut events =
+                    subscribe_sqm_targets(paths, [(spec.target_interface.clone(), interfaces)])?;
+                let live = &self.live;
+                let controllers = &self.controllers;
+                let preserved = &mut self.preserved;
                 let input = self
                     .inputs
                     .get(&spec.instance)
                     .ok_or("reload-old-sqm-input-missing")?;
-                super::sqm_recovery_openwrt::stop_managed_sqm_from_input(spec, input)
-                    .map_err(|e| sqm_error_message(&e).to_string())
+                stop_with_events(
+                    &mut events,
+                    Instant::now() + SQM_START_ATTEST_TIMEOUT,
+                    || {
+                        reload.attest(resolver)?;
+                        controllers.attest_stopped(paths)?;
+                        (preserved)()
+                    },
+                    || super::sqm_recovery_openwrt::stop_managed_sqm_from_input(spec, input),
+                    || match desired {
+                        Some(desired) => desired_ready_in(reload, live, desired),
+                        None => Ok(false),
+                    },
+                )
             }
             fn start_new(&mut self, spec: &ManagedSqmAttestationSpec) -> Result<(), String> {
                 if self.live.contains(&spec.instance) {
@@ -843,15 +882,39 @@ impl ReloadPublication {
                     .profiles
                     .remove(&spec.target_interface)
                     .ok_or("reload-sqm-profile-missing")?;
-                super::sqm_recovery_openwrt::start_managed_sqm_from_published(
-                    spec,
-                    &self.reload.start.published,
-                    profile,
-                    &self.paths.runtime_root,
-                    || false,
+                // The SQM iface hotplug can restart this queue while it starts.
+                let (reload, paths) = (self.reload, self.paths);
+                let mut events = subscribe_sqm_events(paths, std::slice::from_ref(spec))?;
+                settle_managed_sqm_with(
+                    &mut events,
+                    Instant::now() + SQM_START_ATTEST_TIMEOUT,
+                    std::slice::from_ref(spec),
+                    &[profile],
+                    || self.attest(),
+                    |spec, profile| {
+                        super::sqm_recovery_openwrt::start_managed_sqm_from_published(
+                            spec,
+                            &reload.start.published,
+                            profile,
+                            &paths.runtime_root,
+                            || false,
+                        )
+                    },
                 )
                 .map(|_| ())
-                .map_err(|e| sqm_error_message(&e).to_string())
+            }
+            fn await_ready(&mut self, spec: &ManagedSqmAttestationSpec) -> Result<bool, String> {
+                let mut events = subscribe_sqm_events(self.paths, std::slice::from_ref(spec))?;
+                await_ready_with(
+                    &mut events,
+                    Instant::now() + SQM_START_ATTEST_TIMEOUT,
+                    || {
+                        self.attest()?;
+                        let ready = self.desired_ready(spec)?;
+                        self.attest()?;
+                        Ok(ready)
+                    },
+                )
             }
         }
         let mut backend = Backend {
@@ -3523,30 +3586,7 @@ fn settle_managed_sqm(
         start.attest(resolver)?;
         return Ok(Vec::new());
     }
-    let sqm_paths = OpenWrtPaths::from_environment();
-    // Subscribe before the scoped service action sequence. Upstream iface
-    // hotplug can independently stop/start SQM despite our global lock.
-    let mut files = Vec::with_capacity(specs.len() + 2);
-    files.push(paths.config_root.join(CAKE_PACKAGE));
-    files.push(paths.config_root.join(SQM_PACKAGE));
-    let mut interfaces = BTreeSet::new();
-    for spec in specs {
-        files.push(
-            sqm_paths
-                .sqm_state_root
-                .join(format!("{}.state", spec.target_interface)),
-        );
-        interfaces.insert(spec.target_interface.clone());
-        interfaces.insert(spec.upload_interface.clone());
-        if spec.direction_mode != "upload_only" {
-            interfaces.insert(spec.download_interface.clone());
-        }
-    }
-    let mut events = SqmStartEvents::subscribe_owned(
-        files,
-        interfaces.into_iter().collect(),
-        &sqm_paths.sys_class_net,
-    )?;
+    let mut events = subscribe_sqm_events(paths, specs)?;
     start.attest(resolver)?;
     settle_managed_sqm_with(
         &mut events,
@@ -3563,6 +3603,46 @@ fn settle_managed_sqm(
                 || false,
             )
         },
+    )
+}
+
+/// Subscribe before the scoped service action sequence. Upstream iface
+/// hotplug can independently stop/start SQM despite our global lock.
+fn subscribe_sqm_events(
+    paths: &ServicePaths,
+    specs: &[ManagedSqmAttestationSpec],
+) -> Result<SqmStartEvents, String> {
+    subscribe_sqm_targets(
+        paths,
+        specs.iter().map(|spec| {
+            let mut interfaces = vec![spec.target_interface.clone(), spec.upload_interface.clone()];
+            if spec.direction_mode != "upload_only" {
+                interfaces.push(spec.download_interface.clone());
+            }
+            (spec.target_interface.clone(), interfaces)
+        }),
+    )
+}
+
+/// The state file of each target queue, both UCI packages and the interfaces.
+fn subscribe_sqm_targets(
+    paths: &ServicePaths,
+    targets: impl IntoIterator<Item = (String, Vec<String>)>,
+) -> Result<SqmStartEvents, String> {
+    let sqm_paths = OpenWrtPaths::from_environment();
+    let mut files = vec![
+        paths.config_root.join(CAKE_PACKAGE),
+        paths.config_root.join(SQM_PACKAGE),
+    ];
+    let mut watched = BTreeSet::new();
+    for (target, interfaces) in targets {
+        files.push(sqm_paths.sqm_state_root.join(format!("{target}.state")));
+        watched.extend(interfaces);
+    }
+    SqmStartEvents::subscribe_owned(
+        files,
+        watched.into_iter().collect(),
+        &sqm_paths.sys_class_net,
     )
 }
 
@@ -3640,6 +3720,79 @@ pub(super) fn await_sqm_start(
         }
         if offline_instances.len() == specs.len() {
             return Ok(offline_instances);
+        }
+        if !events.wait(deadline)? {
+            return Err(last_error);
+        }
+    }
+}
+
+/// The final readiness proof of a reload, with the same rules: a queue that is
+/// not ready yet (the SQM iface hotplug may be restarting it) is observed again
+/// only after a real event; false once the deadline passes without readiness.
+/// An observation error is terminal.
+pub(super) fn await_ready_with(
+    events: &mut impl StartEvents,
+    deadline: Instant,
+    mut observe: impl FnMut() -> Result<bool, String>,
+) -> Result<bool, String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        events.drain()?;
+        let ready = observe()?;
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        if events.drain()? {
+            continue;
+        }
+        if ready {
+            return Ok(true);
+        }
+        if !events.wait(deadline)? {
+            return Ok(false);
+        }
+    }
+}
+
+/// Stop an old queue during a reload. The SQM iface hotplug may be restarting
+/// that target with the configuration the reload already published: a failed
+/// stop is repeated only after a real event, and if the hotplug has left the
+/// exact desired queue running it is not stopped through the old recipe (as on
+/// replay; the start that follows only attests it). Busy, cancellation and a
+/// changed source stay terminal.
+pub(super) fn stop_with_events(
+    events: &mut impl StartEvents,
+    deadline: Instant,
+    mut attest: impl FnMut() -> Result<(), String>,
+    mut stop: impl FnMut() -> Result<(), NativeSqmAttestationError>,
+    mut desired_ready: impl FnMut() -> Result<bool, String>,
+) -> Result<(), String> {
+    let mut last_error = "SQM topology kept changing during the reload stop".to_string();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(last_error);
+        }
+        events.drain()?;
+        attest()?;
+        match stop() {
+            Ok(()) => return Ok(()),
+            Err(error @ NativeSqmAttestationError::Failed(_)) => {
+                last_error = sqm_error_message(&error).to_string();
+                if desired_ready()? {
+                    return Ok(());
+                }
+            }
+            Err(error) => return Err(sqm_error_message(&error).to_string()),
+        }
+        attest()?;
+        if Instant::now() >= deadline {
+            return Err(last_error);
+        }
+        if events.drain()? {
+            continue;
         }
         if !events.wait(deadline)? {
             return Err(last_error);
@@ -7418,6 +7571,174 @@ fi
             "managed SQM did not reach its exact start postcondition for wan: managed SQM counter /sys/class/net/ifb4eth0/statistics/tx_bytes is missing"
         );
         assert_eq!(actions, 1); // one start action per real event, no timer polling
+    }
+
+    #[test]
+    fn reload_readiness_waits_for_an_event_and_stays_bounded() {
+        // Not ready (hotplug gap), an event, then ready.
+        let mut events = ScriptedStartEvents {
+            drains: [false, false, true, false].into(),
+            waits: [true].into(),
+        };
+        let mut looks = 0;
+        let ready = await_ready_with(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            || {
+                looks += 1;
+                Ok(looks == 2)
+            },
+        )
+        .unwrap();
+        assert!(ready);
+        assert_eq!(looks, 2);
+        // Never ready: one look per real event, false at the deadline.
+        let mut events = ScriptedStartEvents {
+            drains: [false, false].into(),
+            waits: [false].into(),
+        };
+        let mut looks = 0;
+        assert!(!await_ready_with(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            || {
+                looks += 1;
+                Ok(false)
+            }
+        )
+        .unwrap());
+        assert_eq!(looks, 1);
+        // An event during a ready look invalidates it.
+        let mut events = ScriptedStartEvents {
+            drains: [false, true, false, false].into(),
+            waits: [].into(),
+        };
+        let mut looks = 0;
+        assert!(await_ready_with(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            || {
+                looks += 1;
+                Ok(true)
+            }
+        )
+        .unwrap());
+        assert_eq!(looks, 2);
+        // A changed configuration (or any other observation error) is terminal.
+        let mut events = ScriptedStartEvents {
+            drains: [false].into(),
+            waits: [].into(),
+        };
+        assert_eq!(
+            await_ready_with(
+                &mut events,
+                Instant::now() + Duration::from_secs(10),
+                || { Err("reload source changed".into()) }
+            )
+            .unwrap_err(),
+            "reload source changed"
+        );
+        // An expired deadline never looks.
+        let mut events = ScriptedStartEvents {
+            drains: [].into(),
+            waits: [].into(),
+        };
+        assert!(!await_ready_with(&mut events, Instant::now(), || panic!("no look")).unwrap());
+    }
+
+    #[test]
+    fn reload_stop_waits_out_a_hotplug_restart() {
+        let gap = || {
+            Err(NativeSqmAttestationError::Failed(
+                "managed SQM counter /sys/class/net/ifb4eth0/statistics/tx_bytes is missing".into(),
+            ))
+        };
+        // The stop lands in a hotplug gap, an event follows, the stop succeeds.
+        let mut events = ScriptedStartEvents {
+            drains: [false, false, true].into(),
+            waits: [true].into(),
+        };
+        let mut stops = 0;
+        stop_with_events(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            || Ok(()),
+            || {
+                stops += 1;
+                if stops == 1 {
+                    gap()
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(false),
+        )
+        .unwrap();
+        assert_eq!(stops, 2);
+        // The hotplug already runs the exact desired queue: no stop through
+        // the old recipe and no wait.
+        let mut events = ScriptedStartEvents {
+            drains: [false].into(),
+            waits: [].into(),
+        };
+        let mut stops = 0;
+        stop_with_events(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            || Ok(()),
+            || {
+                stops += 1;
+                gap()
+            },
+            || Ok(true),
+        )
+        .unwrap();
+        assert_eq!(stops, 1);
+        // A lasting failure: one stop per real event, the reason at the deadline.
+        let mut events = ScriptedStartEvents {
+            drains: [false, false].into(),
+            waits: [false].into(),
+        };
+        let mut stops = 0;
+        assert_eq!(
+            stop_with_events(
+                &mut events,
+                Instant::now() + Duration::from_secs(10),
+                || Ok(()),
+                || {
+                    stops += 1;
+                    gap()
+                },
+                || Ok(false),
+            )
+            .unwrap_err(),
+            "managed SQM counter /sys/class/net/ifb4eth0/statistics/tx_bytes is missing"
+        );
+        assert_eq!(stops, 1);
+        // Busy and a changed source are terminal.
+        let mut events = ScriptedStartEvents {
+            drains: [false, false].into(),
+            waits: [].into(),
+        };
+        assert!(stop_with_events(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            || Ok(()),
+            || Err(NativeSqmAttestationError::Busy("owner busy".into())),
+            || panic!("busy is not a gap"),
+        )
+        .is_err());
+        assert_eq!(
+            stop_with_events(
+                &mut events,
+                Instant::now() + Duration::from_secs(10),
+                || Err("reload source changed".into()),
+                || panic!("no stop after a changed source"),
+                || panic!("no look after a changed source"),
+            )
+            .unwrap_err(),
+            "reload source changed"
+        );
     }
 
     /// A fake `uci -c DIR -C .. -t .. -q -X show ALIAS` for snapshot captures.
