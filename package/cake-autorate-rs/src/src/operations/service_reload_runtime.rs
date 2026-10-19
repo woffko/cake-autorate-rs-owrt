@@ -324,9 +324,6 @@ impl ReloadControllers {
 pub(super) trait SqmReloadBackend {
     fn attest(&mut self) -> Result<(), String>;
     fn desired_ready(&mut self, spec: &ManagedSqmAttestationSpec) -> Result<bool, String>;
-    /// desired_ready, bounded and event-driven: the SQM iface hotplug can be
-    /// restarting a queue at the moment of the final proof.
-    fn await_ready(&mut self, spec: &ManagedSqmAttestationSpec) -> Result<bool, String>;
     fn stop_old(&mut self, spec: &ManagedSqmStopSpec) -> Result<(), String>;
     fn start_new(&mut self, spec: &ManagedSqmAttestationSpec) -> Result<(), String>;
 }
@@ -362,7 +359,7 @@ pub(super) fn reconcile_sqm(
         }
     }
     for spec in desired {
-        if !backend.await_ready(spec)? {
+        if !backend.desired_ready(spec)? {
             return Err("reload-sqm-desired-runtime-not-ready".into());
         }
         backend.attest()?;
@@ -391,9 +388,6 @@ mod tests {
         actions: Vec<String>,
         fail: Option<&'static str>,
         starts_ready: bool,
-        /// Targets that become ready only after a wait (a hotplug restart).
-        settles: BTreeSet<String>,
-        awaited: Vec<String>,
     }
     impl SqmReloadBackend for SqmFixture {
         fn attest(&mut self) -> Result<(), String> {
@@ -405,13 +399,6 @@ mod tests {
         }
         fn desired_ready(&mut self, spec: &ManagedSqmAttestationSpec) -> Result<bool, String> {
             Ok(self.ready.contains(&spec.target_interface))
-        }
-        fn await_ready(&mut self, spec: &ManagedSqmAttestationSpec) -> Result<bool, String> {
-            self.awaited.push(spec.target_interface.clone());
-            if self.settles.remove(&spec.target_interface) {
-                self.ready.insert(spec.target_interface.clone());
-            }
-            self.desired_ready(spec)
         }
         fn stop_old(&mut self, spec: &ManagedSqmStopSpec) -> Result<(), String> {
             self.actions.push(format!("stop:{}", spec.target_interface));
@@ -466,8 +453,6 @@ mod tests {
             actions: Vec::new(),
             fail: None,
             starts_ready: true,
-            settles: BTreeSet::new(),
-            awaited: Vec::new(),
         };
         reconcile_sqm(&old, &desired, &mut fixture).unwrap();
         assert_eq!(fixture.actions, ["stop:a", "stop:b", "start:b", "start:a"]);
@@ -492,8 +477,6 @@ mod tests {
             actions: Vec::new(),
             fail: Some("fence"),
             starts_ready: true,
-            settles: BTreeSet::new(),
-            awaited: Vec::new(),
         };
         assert!(reconcile_sqm(
             std::slice::from_ref(&old),
@@ -527,30 +510,6 @@ mod tests {
         fixture.ready.insert("a".into()); // A delayed postcondition became ready.
         reconcile_sqm(&[old], &[desired], &mut fixture).unwrap();
         assert!(fixture.actions.is_empty());
-    }
-
-    #[test]
-    fn reload_sqm_final_proof_waits_for_a_queue_the_hotplug_restarts() {
-        // Save & Apply while the SQM iface hotplug restarts the new queue: one
-        // look right after the start found it not ready and failed the reload.
-        let (old, desired) = queue("lab", "a");
-        let mut fixture = SqmFixture {
-            ready: BTreeSet::new(),
-            actions: Vec::new(),
-            fail: None,
-            starts_ready: false,
-            settles: BTreeSet::from(["a".into()]),
-            awaited: Vec::new(),
-        };
-        reconcile_sqm(
-            std::slice::from_ref(&old),
-            std::slice::from_ref(&desired),
-            &mut fixture,
-        )
-        .unwrap();
-        assert_eq!(fixture.actions, ["stop:a", "start:a"]);
-        assert_eq!(fixture.awaited, ["a"]);
-        assert!(fixture.ready.contains("a"));
     }
 
     #[test]
