@@ -765,9 +765,11 @@ impl ReloadPublication {
             return Ok(None);
         };
         let expected = recovery.expected_source.clone();
-        let original = super::uci_transaction::recover_checked(
+        // A file committed after the failed reload is kept (owner decision M2).
+        let original = super::uci_transaction::recover_checked_with(
             &paths.config_root,
             expected.as_ref(),
+            super::uci_transaction::LaterCommits::Keep,
             |event| {
                 recovery.attest()?;
                 attest_original_runtime(recovery.previous.generations())?;
@@ -1296,6 +1298,9 @@ struct OpenWrtServiceStop {
     restored_source: Option<super::uci_transaction::SourceReceipt>,
     committed: Option<CommittedSnapshot>,
     applied: BTreeMap<String, super::controller_input::Loaded>,
+    /// The accepted generation of an ordinary reload that failed after it
+    /// published its update: its controllers and queues may still run.
+    predecessor: BTreeMap<String, super::controller_input::Loaded>,
     batch: Option<super::controller_input::Batch>,
 }
 
@@ -2135,6 +2140,7 @@ fn stop_under_lock(
         restored_source: None,
         committed: None,
         applied: BTreeMap::new(),
+        predecessor: BTreeMap::new(),
         batch: None,
     };
     let sqm_paths = OpenWrtPaths::from_environment();
@@ -2659,7 +2665,20 @@ fn execute_reload_in(context: &LifecycleContext) -> Result<String, String> {
         if !pending.is_reload_update() {
             return Err("reload refuses another pending generation owner".into());
         }
-        pending.attest()?;
+        if let Err(error) = pending.attest() {
+            if error != "uci-transaction-source-receipt-changed" {
+                return Err(error);
+            }
+            // The files changed after this reload failed (Save & Apply again
+            // with other settings), so nothing can resume it. Stop its remains
+            // under this lock (owner decision M1); the init script then stops
+            // and starts the service from the current files.
+            eprintln!("WARNING: stopping the remains of a reload that did not complete");
+            stop_under_lock(paths.clone(), None).map_err(|error| {
+                format!("unable to stop a reload that did not complete: {error}")
+            })?;
+            return Ok("service-reload-v1 legacy\n".into());
+        }
         let candidate = preflight_start_candidate(&paths, &environment)?;
         if let Some(expected) = expected_source_id()? {
             check_source_handoff(&candidate.config.original, Some(&expected))?;
@@ -3024,10 +3043,18 @@ fn recover_unconfirmed_start_with(
     let unconfirmed = batch
         .as_ref()
         .is_some_and(|batch| batch.unconfirmed_start());
+    // An ordinary reload that failed after it published its update: the same
+    // reload could finish it, but a start runs Stop first (owner decision M1).
+    let failed_reload = batch.as_ref().is_some_and(|batch| batch.is_reload_update());
     // Without any batch, a pending file journal belongs to a start or reload
     // that was interrupted (typically by a reboot) before it registered one.
     let orphan_files =
         batch.is_none() && super::uci_transaction::recovery_pending(&paths.config_root)?;
+    if failed_reload {
+        eprintln!("WARNING: stopping the remains of a reload that did not complete");
+        return stop()
+            .map_err(|error| format!("unable to stop a reload that did not complete: {error}"));
+    }
     if !unconfirmed && !orphan_files {
         return Ok(());
     }
@@ -4087,7 +4114,14 @@ fn recover_unregistered_publication(
         }
         attest_runtime_absent(&targets)
     };
-    let restored = super::uci_transaction::recover_checked(&paths.config_root, None, &mut check)?;
+    // A file committed after the interrupted publication is kept (owner
+    // decision M2), e.g. a Save & Apply after a reload failed and a reboot.
+    let restored = super::uci_transaction::recover_checked_with(
+        &paths.config_root,
+        None,
+        super::uci_transaction::LaterCommits::Keep,
+        &mut check,
+    )?;
     super::controller_input::discard_unpublished_batch(&input_root, || {
         check(RecoveryCheck::Absent)?;
         if let Some(restored) = &restored {
@@ -4115,8 +4149,12 @@ fn finish_stopped_publication(
     committed.attest()?;
     let expected = batch.ordinary_stop_receipt()?;
     let mut targets = Vec::new();
-    let restored =
-        super::uci_transaction::recover_checked(config_root, Some(&expected), |check| {
+    // A file committed after the publication is kept (owner decision M2).
+    let restored = super::uci_transaction::recover_checked_with(
+        config_root,
+        Some(&expected),
+        super::uci_transaction::LaterCommits::Keep,
+        |check| {
             batch.attest_record()?;
             if let super::uci_transaction::RecoveryCheck::Versions { before, after } = check {
                 targets = recovery_targets(&committed.parse_retained_versions(before, uci)?)?;
@@ -4125,18 +4163,44 @@ fn finish_stopped_publication(
                 )?);
             }
             attest_absent(&targets)
-        })?;
+        },
+    )?;
     let attest_source = || match &restored {
         Some(original) => original.attest(config_root),
         None => committed.attest(),
     };
     attest_source()?;
-    batch.retire(|_| {
+    let retire_proof = |_: &BTreeMap<String, String>| {
         attest_source()?;
         attest_absent(&targets)?;
         attest_source()
-    })?;
+    };
+    if batch.is_reload_update() {
+        // An ordinary reload that failed after its publication: both
+        // generations go (owner decision M1).
+        batch.retire_reload_update(retire_proof)?;
+    } else {
+        batch.retire(retire_proof)?;
+    }
     Ok(restored)
+}
+
+impl OpenWrtServiceStop {
+    /// The queues of the applied inputs, and of the accepted predecessor of a
+    /// reload that failed after it published its update.
+    fn stop_plan(&self, committed: &CommittedSnapshot) -> Result<ServiceStopPlan, String> {
+        let mut plan = stop_plan_with_applied(committed, &self.applied, &self.environment)?;
+        if !self.predecessor.is_empty() {
+            for spec in
+                stop_plan_with_applied(committed, &self.predecessor, &self.environment)?.managed
+            {
+                if !plan.managed.contains(&spec) {
+                    plan.managed.push(spec);
+                }
+            }
+        }
+        Ok(plan)
+    }
 }
 
 impl ServiceStopBackend for OpenWrtServiceStop {
@@ -4158,17 +4222,24 @@ impl ServiceStopBackend for OpenWrtServiceStop {
         )?;
         if let Some(batch) = &self.batch {
             self.applied = batch.load_inputs()?;
+            if batch.is_reload_update() {
+                self.predecessor = batch.applied_predecessor()?.load_inputs()?;
+            }
         }
         for controller in discover_controllers(&self.paths.proc_root)? {
             if controller.kind != ServiceProcessKind::Controller {
                 continue;
             }
             if let Some(id) = controller_generation(&self.paths.proc_root, &controller)? {
-                if self
+                let current = self
                     .batch
                     .as_ref()
-                    .is_some_and(|batch| batch.generations().get(&controller.instance) != Some(&id))
-                {
+                    .is_none_or(|batch| batch.generations().get(&controller.instance) == Some(&id));
+                let predecessor = self
+                    .predecessor
+                    .get(&controller.instance)
+                    .is_some_and(|input| input.guard.generation() == id);
+                if !current && !predecessor {
                     return Err("applied-stop-process-generation-mismatch".into());
                 }
                 let input = super::controller_input::load_for_recovery(
@@ -4180,12 +4251,14 @@ impl ServiceStopBackend for OpenWrtServiceStop {
                 if !controller_identity_matches(&self.paths.proc_root, &controller)? {
                     return Err("applied-stop-process-changed".into());
                 }
-                self.applied.insert(controller.instance, input);
+                if current {
+                    self.applied.insert(controller.instance, input);
+                }
             } else if self.batch.is_some() {
                 return Err("applied-stop-process-generation-missing".into());
             }
         }
-        let plan = stop_plan_with_applied(&committed, &self.applied, &self.environment)?;
+        let plan = self.stop_plan(&committed)?;
         committed.attest()?;
         self.committed = Some(committed);
         Ok(plan)
@@ -4199,10 +4272,10 @@ impl ServiceStopBackend for OpenWrtServiceStop {
             .committed
             .as_ref()
             .ok_or("service Stop has no committed snapshot")?;
-        if self.applied.is_empty() {
+        if self.applied.is_empty() && self.predecessor.is_empty() {
             return attest_stop_configuration(&self.environment, committed, plan);
         }
-        if stop_plan_with_applied(committed, &self.applied, &self.environment)? != *plan {
+        if self.stop_plan(committed)? != *plan {
             return Err("applied-stop-plan-changed".into());
         }
         committed.attest()
@@ -4305,34 +4378,47 @@ impl ServiceStopBackend for OpenWrtServiceStop {
     }
 
     fn stop_sqm(&mut self, spec: &ManagedSqmStopSpec) -> Result<(), String> {
-        if let Some(input) = self.applied.get(&spec.instance) {
-            return match super::sqm_recovery_openwrt::stop_managed_sqm_from_input(spec, input) {
-                Ok(()) => Ok(()),
-                // The SQM iface hotplug may have restarted the queue from the
-                // current files, e.g. those an interrupted reload published:
-                // the queue is still ours, under the current files' authority.
-                Err(applied @ NativeSqmAttestationError::Failed(_)) => {
-                    stop_managed_sqm_from_committed(
-                        spec,
-                        self.committed
-                            .as_ref()
-                            .ok_or("service Stop has no committed snapshot")?,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "unable to stop applied SQM section {}: {} (current files: {})",
+        // The applied input first; after a reload that failed once it had
+        // published its update, the queue may still run the predecessor's
+        // recipe instead.
+        let inputs = [
+            self.applied.get(&spec.instance),
+            self.predecessor.get(&spec.instance),
+        ];
+        if inputs.iter().any(Option::is_some) {
+            let mut failures = Vec::new();
+            for input in inputs.into_iter().flatten() {
+                match super::sqm_recovery_openwrt::stop_managed_sqm_from_input(spec, input) {
+                    Ok(()) => return Ok(()),
+                    Err(error @ NativeSqmAttestationError::Failed(_)) => {
+                        failures.push(sqm_error_message(&error).to_string());
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "unable to stop applied SQM section {}: {}",
                             spec.sqm_section,
-                            sqm_error_message(&applied),
                             sqm_error_message(&error)
-                        )
-                    })
+                        ))
+                    }
                 }
-                Err(error) => Err(format!(
-                    "unable to stop applied SQM section {}: {}",
+            }
+            // The SQM iface hotplug may have restarted the queue from the
+            // current files, e.g. those an interrupted reload published:
+            // the queue is still ours, under the current files' authority.
+            return stop_managed_sqm_from_committed(
+                spec,
+                self.committed
+                    .as_ref()
+                    .ok_or("service Stop has no committed snapshot")?,
+            )
+            .map_err(|error| {
+                format!(
+                    "unable to stop applied SQM section {}: {} (current files: {})",
                     spec.sqm_section,
+                    failures.join("; "),
                     sqm_error_message(&error)
-                )),
-            };
+                )
+            });
         }
         stop_managed_sqm_from_committed(
             spec,
@@ -6468,7 +6554,29 @@ mod tests {
                 );
                 continue;
             }
-            if matches!(case, 4 | 5 | 8) {
+            if case == 5 {
+                // A commit made after the interrupted publication (Save & Apply,
+                // then a reboot) is kept, and only the publication's own
+                // untouched file is rolled back (owner decision M2). Before,
+                // every start refused this for ever.
+                let restored = recover_unregistered_publication(&paths, |_| Ok(()))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fs::read(paths.config_root.join(CAKE_PACKAGE)).unwrap(),
+                    current[0]
+                );
+                assert_eq!(
+                    fs::read(paths.config_root.join(SQM_PACKAGE)).unwrap(),
+                    original[1]
+                );
+                restored.attest(&paths.config_root).unwrap();
+                assert!(
+                    !super::super::uci_transaction::recovery_pending(&paths.config_root).unwrap()
+                );
+                continue;
+            }
+            if matches!(case, 4 | 8) {
                 assert!(recover_unregistered_publication(&paths, |_| Ok(())).is_err());
                 for (name, bytes) in [CAKE_PACKAGE, SQM_PACKAGE].into_iter().zip(current) {
                     assert_eq!(fs::read(paths.config_root.join(name)).unwrap(), bytes);
@@ -6548,6 +6656,9 @@ mod tests {
                 .map(|name| fs::read(paths.config_root.join(name)).unwrap());
             drop(start);
             if case == 3 {
+                // A commit made after the failed start is kept, and only the
+                // start's own untouched publication is rolled back (owner
+                // decision M2). Before, Stop refused this for ever.
                 let foreign = paths.config_root.join("foreign");
                 fs::write(
                     &foreign,
@@ -6555,21 +6666,39 @@ mod tests {
                 )
                 .unwrap();
                 fs::rename(foreign, paths.config_root.join(CAKE_PACKAGE)).unwrap();
-                let current = [CAKE_PACKAGE, SQM_PACKAGE]
-                    .map(|name| fs::read(paths.config_root.join(name)).unwrap());
-                assert!(finish_stopped_publication(
+                let later = fs::read(paths.config_root.join(CAKE_PACKAGE)).unwrap();
+                assert!(super::super::uci_transaction::recover_checked(
+                    &paths.config_root,
+                    None,
+                    |_| Ok(())
+                )
+                .is_err());
+                let restored = finish_stopped_publication(
                     &paths.config_root,
                     &paths.uci,
                     &capture(),
                     &batch,
-                    |_| Ok(())
+                    |_| Ok(()),
                 )
-                .is_err());
-                for (name, bytes) in [CAKE_PACKAGE, SQM_PACKAGE].into_iter().zip(current) {
-                    assert_eq!(fs::read(paths.config_root.join(name)).unwrap(), bytes);
-                }
-                batch.attest_record().unwrap();
-                assert!(paths.config_root.join(".start-uci/pending").exists());
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    fs::read(paths.config_root.join(CAKE_PACKAGE)).unwrap(),
+                    later
+                );
+                let sqm = paths.config_root.join(SQM_PACKAGE);
+                assert_eq!(
+                    (fs::metadata(&sqm).unwrap().ino(), fs::read(&sqm).unwrap()),
+                    original[1]
+                );
+                restored.attest(&paths.config_root).unwrap();
+                assert!(!paths.config_root.join(".start-uci/pending").exists());
+                assert!(super::super::controller_input::load_batch(
+                    &paths.runtime_root.join(".controller-input"),
+                    &paths.config_root
+                )
+                .unwrap()
+                .is_none());
                 continue;
             }
             let committed = capture();
@@ -7415,6 +7544,249 @@ mod tests {
 
     #[test]
     #[ignore = "requires explicit inspected SDK UCI and loader paths"]
+    fn r4_stop_finishes_a_failed_reload_and_keeps_a_later_commit() {
+        // A reload published its files and its update, then failed; the owner
+        // committed cake-autorate again (Save & Apply). Stop refused the update
+        // (controller-batch-update-recovery-required) and the file journal
+        // refused the later commit (uci-transaction-recovery-conflict), even
+        // after a reboot. Owner decisions M1 and M2.
+        let root = test_root("stop-failed-reload");
+        let config = root.join("config");
+        for path in [&config, &root.join("proc"), &root.join("run")] {
+            fs::create_dir(path).unwrap();
+        }
+        let cake = "config cake_autorate 'lab'\n option enabled '0'\n option manage_sqm '0'\n option sqm_enabled '0'\n";
+        fs::write(config.join(CAKE_PACKAGE), cake).unwrap();
+        fs::write(
+            config.join(SQM_PACKAGE),
+            "config queue 'other'\n option enabled '0'\n",
+        )
+        .unwrap();
+        let quote = |value: &std::ffi::OsStr| {
+            format!(
+                "'{}'",
+                value
+                    .to_str()
+                    .expect("test path must be UTF-8")
+                    .replace('\'', "'\\''")
+            )
+        };
+        let binary = std::env::var_os("CAKE_TEST_UCI").expect("explicit UCI required");
+        let command = if let Some(loader) = std::env::var_os("CAKE_TEST_MUSL_LOADER") {
+            format!(
+                "{} --library-path {} {}",
+                quote(&loader),
+                quote(&std::env::var_os("CAKE_TEST_LIB_DIR").expect("explicit libraries required")),
+                quote(&binary)
+            )
+        } else {
+            quote(&binary)
+        };
+        let uci = root.join("uci-wrapper");
+        write_executable(&uci, &format!("#!/bin/sh\nexec {command} \"$@\"\n"));
+        let paths = ServicePaths {
+            config_root: config.clone(),
+            uci,
+            tc: root.join("no-tc"),
+            ubus: root.join("no-ubus"),
+            proc_root: root.join("proc"),
+            runtime_root: root.join("run"),
+            runtime_lock_root: root.join("locks"),
+            bridger_init: root.join("no-bridger"),
+            bridger_config: root.join("no-bridger-config"),
+            uci_workspace_root: root.join("uci-work"),
+        };
+        let inputs = paths.runtime_root.join(".controller-input");
+        let capture = || {
+            CommittedSnapshot::capture(&paths.config_root, &paths.runtime_root, &paths.uci).unwrap()
+        };
+        // An accepted start.
+        let published = super::super::uci_transaction::publish(
+            capture().prepare([&[], &[]], &paths.uci).unwrap(),
+        )
+        .unwrap();
+        let lab =
+            super::super::controller_input::store(&published, "lab", &inputs, &config).unwrap();
+        let first = super::super::controller_input::store_batch(
+            &published,
+            &["lab".into()],
+            &BTreeMap::from([("lab".into(), lab)]),
+            &inputs,
+            &config,
+        )
+        .unwrap();
+        drop(published);
+        first.accept(|_| Ok(())).unwrap();
+        let previous = super::super::controller_input::load_batch(&inputs, &config)
+            .unwrap()
+            .unwrap();
+        // The reload publishes a change of sqm and its update, then exits.
+        let original_sqm = fs::read(config.join(SQM_PACKAGE)).unwrap();
+        let edits = [super::super::uci_edits::Edit::Set {
+            section: "other".into(),
+            option: "marker".into(),
+            value: "reload".into(),
+        }];
+        let published = super::super::uci_transaction::publish(
+            capture().prepare([&[], &edits], &paths.uci).unwrap(),
+        )
+        .unwrap();
+        let replacement =
+            super::super::controller_input::store(&published, "lab", &inputs, &config).unwrap();
+        let update = super::super::controller_input::replace_reload_batch(
+            &published,
+            &previous,
+            &["lab".into()],
+            &BTreeMap::new(),
+            &BTreeMap::from([("lab".into(), replacement)]),
+            |_| Ok(()),
+        )
+        .unwrap();
+        drop(published);
+        assert_ne!(fs::read(config.join(SQM_PACKAGE)).unwrap(), original_sqm);
+        assert!(super::super::uci_transaction::recovery_pending(&config).unwrap());
+        // The owner commits cake-autorate again.
+        let later = format!("{cake} option marker 'later'\n");
+        fs::write(root.join("later"), &later).unwrap();
+        fs::rename(root.join("later"), config.join(CAKE_PACKAGE)).unwrap();
+        let committed = capture();
+        let restored =
+            finish_stopped_publication(&config, &paths.uci, &committed, &update, |_| Ok(()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(fs::read(config.join(SQM_PACKAGE)).unwrap(), original_sqm);
+        assert_eq!(
+            fs::read_to_string(config.join(CAKE_PACKAGE)).unwrap(),
+            later
+        );
+        restored.attest(&config).unwrap();
+        assert!(!super::super::uci_transaction::recovery_pending(&config).unwrap());
+        assert!(super::super::controller_input::load_batch(&inputs, &config)
+            .unwrap()
+            .is_none());
+        drop(committed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires explicit inspected SDK UCI and loader paths"]
+    fn r4_stop_plan_covers_both_generations_of_a_failed_reload() {
+        // A reload that failed before its SQM steps leaves the queue on the
+        // predecessor's recipe; Stop only knew the update's and refused.
+        let root = test_root("stop-plan-failed-reload");
+        let config = root.join("config");
+        let sys = root.join("sys");
+        for path in [&config, &sys, &sys.join("fixture0"), &root.join("proc")] {
+            fs::create_dir(path).unwrap();
+        }
+        fs::write(config.join(CAKE_PACKAGE), "config cake_autorate 'lab'\n option enabled '1'\n option sqm_enabled '1'\n option wan_if 'fixture0'\n option sqm_interface 'fixture0'\n option sqm_section 'owned'\n option no_pingers '6'\n option sqm_download '20000'\n option sqm_upload '20000'\n option min_dl_shaper_rate_kbps '5000'\n option base_dl_shaper_rate_kbps '10000'\n option max_dl_shaper_rate_kbps '20000'\n option min_ul_shaper_rate_kbps '5000'\n option base_ul_shaper_rate_kbps '10000'\n option max_ul_shaper_rate_kbps '20000'\n option traffic_rules_enabled '0'\n option mqtt_enabled '0'\n").unwrap();
+        fs::write(config.join(SQM_PACKAGE), "config queue 'owned'\n option _cake_autorate_managed 'lab'\n option interface 'fixture0'\n option download '20000'\n option upload '20000'\n").unwrap();
+        let quote = |value: &std::ffi::OsStr| {
+            format!(
+                "'{}'",
+                value
+                    .to_str()
+                    .expect("test path must be UTF-8")
+                    .replace('\'', "'\\''")
+            )
+        };
+        let binary = std::env::var_os("CAKE_TEST_UCI").expect("explicit UCI required");
+        let command = if let Some(loader) = std::env::var_os("CAKE_TEST_MUSL_LOADER") {
+            format!(
+                "{} --library-path {} {}",
+                quote(&loader),
+                quote(&std::env::var_os("CAKE_TEST_LIB_DIR").expect("explicit libraries required")),
+                quote(&binary)
+            )
+        } else {
+            quote(&binary)
+        };
+        let uci = root.join("uci-wrapper");
+        write_executable(&uci, &format!("#!/bin/sh\nexec {command} \"$@\"\n"));
+        let paths = ServicePaths {
+            config_root: config.clone(),
+            uci: uci.clone(),
+            tc: root.join("no-tc"),
+            ubus: root.join("no-ubus"),
+            proc_root: root.join("proc"),
+            runtime_root: root.join("run"),
+            runtime_lock_root: root.join("locks"),
+            bridger_init: root.join("no-bridger"),
+            bridger_config: root.join("no-bridger-config"),
+            uci_workspace_root: root.join("uci-work"),
+        };
+        let inputs = paths.runtime_root.join(".controller-input");
+        let capture = || {
+            CommittedSnapshot::capture(&paths.config_root, &paths.runtime_root, &paths.uci).unwrap()
+        };
+        let published = super::super::uci_transaction::publish(
+            capture().prepare([&[], &[]], &paths.uci).unwrap(),
+        )
+        .unwrap();
+        let lab =
+            super::super::controller_input::store(&published, "lab", &inputs, &config).unwrap();
+        let first = super::super::controller_input::store_batch(
+            &published,
+            &["lab".into()],
+            &BTreeMap::from([("lab".into(), lab)]),
+            &inputs,
+            &config,
+        )
+        .unwrap();
+        drop(published);
+        first.accept(|_| Ok(())).unwrap();
+        let previous = super::super::controller_input::load_batch(&inputs, &config)
+            .unwrap()
+            .unwrap();
+        let edits = [super::super::uci_edits::Edit::Set {
+            section: "lab".into(),
+            option: "max_dl_shaper_rate_kbps".into(),
+            value: "30000".into(),
+        }];
+        let published = super::super::uci_transaction::publish(
+            capture().prepare([&edits, &[]], &paths.uci).unwrap(),
+        )
+        .unwrap();
+        let replacement =
+            super::super::controller_input::store(&published, "lab", &inputs, &config).unwrap();
+        super::super::controller_input::replace_reload_batch(
+            &published,
+            &previous,
+            &["lab".into()],
+            &BTreeMap::new(),
+            &BTreeMap::from([("lab".into(), replacement)]),
+            |_| Ok(()),
+        )
+        .unwrap();
+        drop(published);
+        let mut backend = OpenWrtServiceStop {
+            environment: OpenWrtEnvironment::test_paths(uci, root.join("no-ubus"), sys),
+            paths,
+            expected_source: None,
+            restored_source: None,
+            committed: None,
+            applied: BTreeMap::new(),
+            predecessor: BTreeMap::new(),
+            batch: None,
+        };
+        let plan = backend.snapshot().unwrap();
+        let mut maxima = plan
+            .managed
+            .iter()
+            .map(|spec| {
+                assert_eq!(spec.target_interface, "fixture0");
+                spec.rate_policy.as_ref().unwrap().maximum_download_kbps
+            })
+            .collect::<Vec<_>>();
+        maxima.sort_unstable();
+        assert_eq!(maxima, [20_000, 30_000]);
+        backend.attest_unchanged(&plan).unwrap();
+        drop(backend);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires explicit inspected SDK UCI and loader paths"]
     fn r4_stop_real_uci_snapshot_preserves_both_savedirs_and_committed_target() {
         let root = test_root("stop-real-uci");
         let config = root.join("config");
@@ -7496,6 +7868,7 @@ mod tests {
             restored_source: None,
             committed: None,
             applied: BTreeMap::new(),
+            predecessor: BTreeMap::new(),
             batch: None,
         };
         let plan = backend.snapshot().unwrap();
@@ -7573,6 +7946,7 @@ fi
             restored_source: None,
             committed: None,
             applied: BTreeMap::new(),
+            predecessor: BTreeMap::new(),
             batch: None,
         };
         let plan = backend.snapshot().unwrap();
@@ -8417,6 +8791,45 @@ fi
         assert!(fixture.applied());
         recover_unconfirmed_start_with(paths, || panic!("a confirmed start must not be stopped"))
             .unwrap();
+        // An ordinary reload that failed after it published its update: the
+        // start runs Stop first too (owner decision M1).
+        let inputs = paths.runtime_root.join(".controller-input");
+        let previous = super::super::controller_input::load_batch(&inputs, &paths.config_root)
+            .unwrap()
+            .unwrap();
+        fs::write(paths.config_root.join(SQM_PACKAGE), b"# reload source\n").unwrap();
+        let snapshot =
+            CommittedSnapshot::capture(&paths.config_root, &paths.runtime_root, &paths.uci)
+                .unwrap();
+        let published = super::super::uci_transaction::publish(
+            snapshot.prepare([&[], &[]], &paths.uci).unwrap(),
+        )
+        .unwrap();
+        let replacement =
+            super::super::controller_input::store(&published, "lab", &inputs, &paths.config_root)
+                .unwrap();
+        let update = super::super::controller_input::replace_reload_batch(
+            &published,
+            &previous,
+            &["lab".into()],
+            &BTreeMap::new(),
+            &BTreeMap::from([("lab".into(), replacement)]),
+            |_| Ok(()),
+        )
+        .unwrap();
+        drop(published);
+        assert!(update.is_reload_update());
+        let mut stops = 0;
+        recover_unconfirmed_start_with(paths, || {
+            stops += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stops, 1);
+        assert_eq!(
+            recover_unconfirmed_start_with(paths, || Err("SQM is restarting".into())).unwrap_err(),
+            "unable to stop a reload that did not complete: SQM is restarting"
+        );
         // No batch at all: an ordinary first start.
         fs::remove_dir_all(paths.runtime_root.join(".controller-input")).unwrap();
         recover_unconfirmed_start_with(paths, || panic!("nothing to recover")).unwrap();
