@@ -72,9 +72,12 @@ still fails and names the instance (`retained SQM <instance> did not settle`).
 A Save & Apply that fails before it switches the controllers leaves the
 previous settings running, and **Stop** rolls its files back (`rolling back the
 files of a reload that did not complete`). One that fails later leaves the
-controllers stopped: run Save & Apply again with the same settings to complete
-it. Until then, Stop and Start are refused, and changing the settings first
-leaves the service unable to start, even after a reboot (a known limit).
+controllers stopped. Save & Apply again with the same settings completes it.
+Save & Apply with other settings, **Stop**, **Start** or a reboot instead stops
+what it left behind (`stopping the remains of a reload that did not complete`),
+and the next start applies the current settings. Settings saved after the
+failure are kept: only what the failed Save & Apply itself wrote, if nobody
+changed it since, is rolled back.
 
 ## Get rating
 

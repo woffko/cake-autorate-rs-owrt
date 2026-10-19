@@ -396,6 +396,27 @@ decision (L1) is to wait and pin again, never to accept a different queue:
   before `uci-transaction-source-busy`. With one try, the publication and then
   its rollback found the source busy and the reload left
   `uci-transaction-recovery-required`.
+- A reload that fails after it published its update leaves that update next
+  to its accepted predecessor (both records under `/var/run`) and the journal
+  of its files. The same reload resumes it. Anything else lets the ordinary
+  Stop finish it (owner decision M1): `snapshot` accepts controllers of either
+  generation, the plan covers the queues of both recipes
+  (`OpenWrtServiceStop::stop_plan`), and `stop_sqm` tries the update's input,
+  then the predecessor's, then the current files. `finish_stopped_publication`
+  rolls the files back, and `Batch::retire_reload_update` abandons the update
+  through the restore marker and retires the predecessor. A start runs this
+  Stop first; a reload whose files changed since runs it and answers
+  `service-reload-v1 legacy`, so the init script stops and starts the service
+  from the current files. A selected Native Apply update keeps its own
+  recovery.
+- Stop, and the recoveries of a reload's preparation and of an unregistered
+  publication, roll files back with `LaterCommits::Keep` (owner decision M2):
+  a member the transaction did not change, or one committed again since, stays
+  as it is; only the transaction's own untouched publications are restored, and
+  the receipt names what is public afterwards. Before, a commit made after the
+  failure refused the rollback for ever (`uci-transaction-recovery-conflict`,
+  or `uci-transaction-recovery-pending` at every boot). The in-process rollback
+  of an operation that has just failed stays strict.
 - The SQM event subscription reads the `ifindex` of each watched interface.
   sysfs refuses an attribute of a device being unregistered with `EINVAL`
   (`ENODEV` at open); such an interface counts as absent, like a missing one,
