@@ -383,6 +383,8 @@ mod timer_ownership_tests {
                 "thread::sleep(POLL_INTERVAL);",
                 "thread::sleep(POLL_INTERVAL);",
             ],
+            // Polling: a released libuci reader lock raises no event (bounded).
+            "uci_transaction" => vec!["std::thread::sleep(SOURCE_LOCK_RETRY);"],
             _ => Vec::new(),
         };
         allowed.sort_unstable();

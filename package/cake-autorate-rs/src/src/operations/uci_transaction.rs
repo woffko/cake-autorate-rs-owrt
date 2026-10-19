@@ -18,6 +18,12 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, String>;
+/// libuci holds a shared lock on a package while it reads it, and the SQM
+/// scripts read theirs many times while the iface hotplug restarts a queue.
+/// A release raises no event, so the exclusive lock of the sources is retried
+/// every 10 ms, at most 2 s in all, before they count as busy.
+const SOURCE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const SOURCE_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 const OWNER: &[u8] = b"cake-autorate start transaction v1\n";
 const RECEIPT: &[u8] = b"cake-autorate start receipt v1\n";
 const ACCEPTED: &[u8] = b"cake-autorate start transaction retired v1\n";
@@ -442,11 +448,21 @@ impl Journal {
     }
     fn lock_sources(&self) -> Result<Vec<File>> {
         self.root.attest()?;
+        let deadline = std::time::Instant::now() + SOURCE_LOCK_WAIT;
         let mut files = Vec::new();
         for name in PACKAGES {
             let (_, file, _) = regular(&self.root.config.path.join(name), MAX_CONFIG, false)?;
-            if sys::flock(&file, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-                return Err("uci-transaction-source-busy".into());
+            loop {
+                match sys::flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
+                    Ok(()) => break,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(SOURCE_LOCK_RETRY);
+                    }
+                    Err(_) => return Err("uci-transaction-source-busy".into()),
+                }
             }
             files.push(file);
         }
@@ -1385,6 +1401,38 @@ mod tests {
         fixture.assert_versions(&after, false);
         fixture.foreign_commit("sqm");
         assert!(committed.attest().is_err());
+    }
+
+    #[test]
+    fn transaction_waits_out_a_reader_of_a_source() {
+        // Seen on the test VM: a reload published while the SQM scripts read
+        // /etc/config/sqm through libuci (a shared lock) during a hotplug
+        // restart; the publication and its rollback both found the source
+        // busy and left uci-transaction-recovery-required.
+        let fixture = Fixture::new();
+        let reader = File::open(fixture.config.join("sqm")).unwrap();
+        sys::flock(&reader, libc::LOCK_SH | libc::LOCK_NB).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(reader);
+        });
+        let published = publish(fixture.prepare(true)).unwrap();
+        release.join().unwrap();
+        published.attest().unwrap();
+        published.accept().unwrap();
+        // A lock that outlasts the bound still refuses, after the bound, and
+        // leaves a journal that recovery restores once the lock is gone.
+        let fixture = Fixture::new();
+        let before = fixture.versions();
+        let reader = File::open(fixture.config.join("sqm")).unwrap();
+        sys::flock(&reader, libc::LOCK_SH | libc::LOCK_NB).unwrap();
+        let config = fixture.prepare(true);
+        let started = std::time::Instant::now();
+        assert!(publish(config).is_err());
+        assert!(started.elapsed() >= SOURCE_LOCK_WAIT);
+        drop(reader);
+        recover(&fixture.config).unwrap();
+        fixture.assert_versions(&before, false);
     }
 
     #[test]
