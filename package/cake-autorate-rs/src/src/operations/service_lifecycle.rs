@@ -4134,8 +4134,7 @@ fn discover_controllers_with_policy(
     proc_root: &Path,
     reject_duplicates: bool,
 ) -> Result<Vec<ControllerIdentity>, String> {
-    let mut controllers = Vec::new();
-    let mut instances = BTreeSet::new();
+    let mut found = Vec::new();
     for entry in fs::read_dir(proc_root)
         .map_err(|error| format!("unable to enumerate controller processes: {error}"))?
     {
@@ -4152,23 +4151,44 @@ fn discover_controllers_with_policy(
         let Some((kind, instance)) = controller_instance(&entry.path().join("cmdline"))? else {
             continue;
         };
-        let mut identity =
-            match inspect_controller_identity(&entry.path().join("stat"), pid, kind, &instance) {
-                Ok(identity) => identity,
+        let (identity, parent) =
+            match inspect_controller_process(&entry.path().join("stat"), pid, kind, &instance) {
+                Ok(found) => found,
                 Err(error) if error == "controller process is a zombie" => continue,
                 Err(error) => return Err(error),
             };
         if identity.process_group == 0 || identity.starttime_ticks == 0 {
             return Err("controller process identity contains a zero field".to_string());
         }
-        if !instances.insert((kind, instance.clone())) && reject_duplicates {
+        found.push((identity, parent));
+    }
+    // Between fork and exec a helper of a controller (tc, ip, uci) still has
+    // the controller's command line. Its parent is that controller: it is not
+    // a second one. A second controller started by procd has procd as parent.
+    let helpers = found
+        .iter()
+        .filter(|(identity, parent)| {
+            found.iter().any(|(other, _)| {
+                other.pid == *parent
+                    && other.kind == identity.kind
+                    && other.instance == identity.instance
+            })
+        })
+        .map(|(identity, _)| identity.pid)
+        .collect::<BTreeSet<_>>();
+    let mut controllers = Vec::new();
+    let mut instances = BTreeSet::new();
+    for (identity, _) in found {
+        if helpers.contains(&identity.pid) {
+            continue;
+        }
+        if !instances.insert((identity.kind, identity.instance.clone())) && reject_duplicates {
             return Err(format!(
-                "multiple exact {} processes are running for {instance}",
-                kind.label()
+                "multiple exact {} processes are running for {}",
+                identity.kind.label(),
+                identity.instance
             ));
         }
-        identity.kind = kind;
-        identity.instance = instance;
         controllers.push(identity);
     }
     controllers.sort_by(|left, right| {
@@ -4238,6 +4258,16 @@ fn inspect_controller_identity(
     kind: ServiceProcessKind,
     instance: &str,
 ) -> Result<ControllerIdentity, String> {
+    inspect_controller_process(path, pid, kind, instance).map(|(identity, _)| identity)
+}
+
+/// The identity and the parent PID from one read of /proc/<pid>/stat.
+fn inspect_controller_process(
+    path: &Path,
+    pid: u32,
+    kind: ServiceProcessKind,
+    instance: &str,
+) -> Result<(ControllerIdentity, u32), String> {
     let stat = match fs::read_to_string(path) {
         Ok(stat) => stat,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -4264,19 +4294,25 @@ fn inspect_controller_identity(
     if fields[0] == "Z" {
         return Err("controller process is a zombie".to_string());
     }
+    let parent = fields[1]
+        .parse::<u32>()
+        .map_err(|_| "controller parent process is invalid".to_string())?;
     let process_group = fields[2]
         .parse::<u32>()
         .map_err(|_| "controller process group is invalid".to_string())?;
     let starttime_ticks = fields[19]
         .parse::<u64>()
         .map_err(|_| "controller process start time is invalid".to_string())?;
-    Ok(ControllerIdentity {
-        kind,
-        instance: instance.to_string(),
-        pid,
-        process_group,
-        starttime_ticks,
-    })
+    Ok((
+        ControllerIdentity {
+            kind,
+            instance: instance.to_string(),
+            pid,
+            process_group,
+            starttime_ticks,
+        },
+        parent,
+    ))
 }
 
 fn controller_identity_matches(
@@ -7418,6 +7454,43 @@ fi
             "managed SQM did not reach its exact start postcondition for wan: managed SQM counter /sys/class/net/ifb4eth0/statistics/tx_bytes is missing"
         );
         assert_eq!(actions, 1); // one start action per real event, no timer polling
+    }
+
+    #[test]
+    fn controller_scan_ignores_a_helper_between_fork_and_exec() {
+        let root = test_root("controller-helper");
+        let process = |pid: u32, parent: u32| {
+            let dir = root.join(pid.to_string());
+            fs::create_dir(&dir).unwrap();
+            fs::write(
+                dir.join("cmdline"),
+                b"/usr/sbin/cake-autorated\0--instance\0wan\0",
+            )
+            .unwrap();
+            fs::write(
+                dir.join("stat"),
+                format!("{pid} (cake-autorated) S {parent} 100 100 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 {pid}0\n"),
+            )
+            .unwrap();
+        };
+        process(100, 1);
+        // The controller forked tc; the child has not reached exec yet.
+        process(101, 100);
+        let found = discover_controllers(&root).unwrap();
+        assert_eq!(found.iter().map(|c| c.pid).collect::<Vec<_>>(), [100]);
+        // A second controller with another parent is still refused.
+        process(102, 1);
+        assert_eq!(
+            discover_controllers(&root).unwrap_err(),
+            "multiple exact controller processes are running for wan"
+        );
+        assert_eq!(
+            discover_controllers_allowing_duplicates(&root)
+                .unwrap()
+                .len(),
+            2
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A fake `uci -c DIR -C .. -t .. -q -X show ALIAS` for snapshot captures.
