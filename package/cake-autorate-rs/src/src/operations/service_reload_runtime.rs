@@ -654,6 +654,7 @@ mod tests {
                 bridger_init: case.join("unused-bridger"),
                 bridger_config: case.join("unused-bridger-config"),
                 uci_workspace_root: case.join("unused-work"),
+                sqm_state_root: case.join("unused-sqm-state"),
             };
             let mut desired = previous.clone();
             if mode != "unchanged" {

@@ -338,6 +338,92 @@ struct PrivateSqmStopSnapshot {
     private_sqm: Vec<u8>,
 }
 
+/// The upstream SQM run lock. run.sh creates `sqm-run.lock` in the SQM state
+/// directory before it reads /etc/config/sqm, writes its PID into it and
+/// removes it when it exits; while it exists, run.sh retries every second, ten
+/// times. The iface hotplug runs it outside the lifecycle lock. While a
+/// rollback of the files run.sh reads holds this lock, no run can start a
+/// queue from the old files afterwards: a run that read them has finished and
+/// its queue fails the absence proof, a later run waits and reads the
+/// rolled-back files. It is held around observations and renames only, never
+/// around a wait for SQM, so a waiting run.sh does not give up.
+pub(crate) struct SqmRunLock {
+    directory: PathBuf,
+    pid: u32,
+}
+
+const SQM_RUN_LOCK_WAIT: Duration = Duration::from_secs(5);
+const SQM_RUN_LOCK_RETRY: Duration = Duration::from_millis(50);
+/// Marks the lock as ours: one left behind by a process of ours that was
+/// killed while it held the lock may be removed; run.sh's never is.
+const SQM_RUN_LOCK_OWNER: &str = "cake-autorate";
+
+impl SqmRunLock {
+    pub(crate) fn acquire(state_root: &Path) -> Result<Self, String> {
+        Self::acquire_within(state_root, SQM_RUN_LOCK_WAIT)
+    }
+
+    fn acquire_within(state_root: &Path, wait: Duration) -> Result<Self, String> {
+        let directory = state_root.join("sqm-run.lock");
+        let pid = std::process::id();
+        let deadline = Instant::now() + wait;
+        loop {
+            fs::create_dir_all(state_root).map_err(|_| "sqm-run-lock-io".to_string())?;
+            match fs::create_dir(&directory) {
+                Ok(()) => {
+                    let lock = Self { directory, pid };
+                    // The marker first: run.sh reads only the PID.
+                    fs::write(lock.directory.join(SQM_RUN_LOCK_OWNER), b"")
+                        .and_then(|()| fs::write(lock.directory.join("pid"), format!("{pid}\n")))
+                        .map_err(|_| "sqm-run-lock-io".to_string())?;
+                    return Ok(lock);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if stale_own_sqm_run_lock(&directory) {
+                        fs::remove_dir_all(&directory)
+                            .map_err(|_| "sqm-run-lock-io".to_string())?;
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("sqm-run-lock-busy".into());
+                    }
+                    thread::sleep(SQM_RUN_LOCK_RETRY);
+                }
+                Err(_) => return Err("sqm-run-lock-io".into()),
+            }
+        }
+    }
+}
+
+impl Drop for SqmRunLock {
+    fn drop(&mut self) {
+        let ours = self.directory.join(SQM_RUN_LOCK_OWNER).is_file()
+            && fs::read_to_string(self.directory.join("pid"))
+                .is_ok_and(|pid| pid.trim() == self.pid.to_string());
+        if ours {
+            let _ = fs::remove_file(self.directory.join("pid"));
+            let _ = fs::remove_file(self.directory.join(SQM_RUN_LOCK_OWNER));
+            let _ = fs::remove_dir(&self.directory);
+        }
+    }
+}
+
+/// A lock of ours whose process is gone. Only one lifecycle operation runs at
+/// a time, so a marker without a live PID cannot belong to a running one.
+fn stale_own_sqm_run_lock(directory: &Path) -> bool {
+    if !directory.join(SQM_RUN_LOCK_OWNER).is_file() {
+        return false;
+    }
+    match fs::read_to_string(directory.join("pid")) {
+        Ok(pid) => match pid.trim().parse::<u32>() {
+            Ok(pid) => !Path::new("/proc").join(pid.to_string()).exists(),
+            Err(_) => true,
+        },
+        // Killed between the marker and the PID.
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 trait StopConfigAuthority {
     fn cake_section(&self) -> Option<&[u8]>;
     fn sqm_section(&self) -> &[u8];
@@ -2995,6 +3081,48 @@ fn safe_ram_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn rollback_takes_the_sqm_run_lock_like_run_sh_and_never_a_foreign_one() {
+        let root = std::env::temp_dir().join(format!(
+            "sqm-run-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let lock_dir = root.join("sqm-run.lock");
+        let short = Duration::from_millis(100);
+        let lock = SqmRunLock::acquire_within(&root, short).unwrap();
+        // What run.sh sees: the directory, with our PID in it.
+        assert_eq!(
+            fs::read_to_string(lock_dir.join("pid")).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        assert_eq!(
+            SqmRunLock::acquire_within(&root, short).err().unwrap(),
+            "sqm-run-lock-busy"
+        );
+        drop(lock);
+        assert!(!lock_dir.exists());
+        // run.sh's own lock is waited for, never removed, even if stale.
+        fs::create_dir(&lock_dir).unwrap();
+        fs::write(lock_dir.join("pid"), b"999999999\n").unwrap();
+        assert_eq!(
+            SqmRunLock::acquire_within(&root, short).err().unwrap(),
+            "sqm-run-lock-busy"
+        );
+        assert!(lock_dir.join("pid").is_file());
+        fs::remove_dir_all(&lock_dir).unwrap();
+        // Ours, left by a process killed while it held it, is taken over.
+        fs::create_dir(&lock_dir).unwrap();
+        fs::write(lock_dir.join(SQM_RUN_LOCK_OWNER), b"").unwrap();
+        fs::write(lock_dir.join("pid"), b"999999999\n").unwrap();
+        drop(SqmRunLock::acquire_within(&root, short).unwrap());
+        assert!(!lock_dir.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn rate_policy_options(values: &[(&str, &str)]) -> BTreeMap<String, String> {
         values

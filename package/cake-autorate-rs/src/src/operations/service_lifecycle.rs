@@ -1121,6 +1121,8 @@ struct ServicePaths {
     bridger_init: PathBuf,
     bridger_config: PathBuf,
     uci_workspace_root: PathBuf,
+    /// Where run.sh keeps its state files and its run lock.
+    sqm_state_root: PathBuf,
 }
 
 /// Explicit runtime context below the CLI's root gate. Test contexts use owned
@@ -1176,6 +1178,7 @@ impl ServicePaths {
                 "CAKE_AUTORATE_SERVICE_UCI_WORK_ROOT",
                 "/tmp/cake-autorate-service-uci",
             ),
+            sqm_state_root: OpenWrtPaths::from_environment().sqm_state_root,
         }
     }
 }
@@ -4091,6 +4094,15 @@ fn recover_unregistered_publication(
     if !draft && !pending {
         return Ok(None);
     }
+    // No run.sh may read the files while they are rolled back (at boot the
+    // iface hotplug runs it at the same time).
+    let _sqm_run = if pending {
+        Some(super::sqm_recovery_openwrt::SqmRunLock::acquire(
+            &paths.sqm_state_root,
+        )?)
+    } else {
+        None
+    };
     let mut targets = Vec::new();
     // A no-op publication has no file journal. Its current committed source is
     // used only to fence draft cleanup, not as authority to restore other files.
@@ -4152,12 +4164,22 @@ fn recover_unregistered_publication(
 fn finish_stopped_publication(
     config_root: &Path,
     uci: &Path,
+    sqm_state_root: &Path,
     committed: &CommittedSnapshot,
     batch: &super::controller_input::Batch,
     mut attest_absent: impl FnMut(&[ManagedSqmStopSpec]) -> Result<(), String>,
 ) -> Result<Option<super::uci_transaction::SourceReceipt>, String> {
     committed.attest()?;
     let expected = batch.ordinary_stop_receipt()?;
+    // No run.sh may read the files while they are rolled back, nor start a
+    // queue before the records that own it are retired.
+    let _sqm_run = if super::uci_transaction::recovery_pending(config_root)? {
+        Some(super::sqm_recovery_openwrt::SqmRunLock::acquire(
+            sqm_state_root,
+        )?)
+    } else {
+        None
+    };
     let mut targets = Vec::new();
     // A file committed after the publication is kept (owner decision M2).
     let restored = super::uci_transaction::recover_checked_with(
@@ -4326,7 +4348,11 @@ impl ServiceStopBackend for OpenWrtServiceStop {
             // consumer is already stopped, so its file transaction can be
             // rolled back on the proof that nothing runs at all.
             eprintln!("WARNING: rolling back the files of a reload that did not complete");
-            ReloadPublication::recover_preparation(&self.paths, |_| absent(&[]))?;
+            {
+                let _sqm_run =
+                    super::sqm_recovery_openwrt::SqmRunLock::acquire(&self.paths.sqm_state_root)?;
+                ReloadPublication::recover_preparation(&self.paths, |_| absent(&[]))?;
+            }
             // Release the private workspace of the old view before the new one.
             self.committed = None;
             self.committed = Some(CommittedSnapshot::capture(
@@ -4342,6 +4368,7 @@ impl ServiceStopBackend for OpenWrtServiceStop {
         self.restored_source = finish_stopped_publication(
             &self.paths.config_root,
             &self.paths.uci,
+            &self.paths.sqm_state_root,
             committed,
             batch,
             |extra_targets| absent(extra_targets),
@@ -5522,6 +5549,7 @@ mod tests {
                 bridger_init: root.join("unused-bridger"),
                 bridger_config: root.join("unused-bridger-config"),
                 uci_workspace_root: root.join("uci-work"),
+                sqm_state_root: root.join("sqm-state"),
             };
             let batch = super::super::controller_input::store_batch(
                 &published,
@@ -5825,6 +5853,7 @@ mod tests {
             bridger_init: root.join("unused-bridger"),
             bridger_config: root.join("unused-bridger-config"),
             uci_workspace_root: root.join("uci-work"),
+            sqm_state_root: root.join("sqm-state"),
         };
         let resolver = Resolver(BTreeMap::new());
         let section = |name: &str, interface: &str, download: u64| {
@@ -6179,6 +6208,7 @@ mod tests {
             bridger_init: runtime.join("unused-bridger"),
             bridger_config: runtime.join("unused-bridger-config"),
             uci_workspace_root: runtime.join("uci-work"),
+            sqm_state_root: runtime.join("sqm-state"),
         };
         let capture = || {
             StartCandidate::prepare(
@@ -6479,6 +6509,7 @@ mod tests {
                     finish_stopped_publication(
                         &paths.config_root,
                         &paths.uci,
+                        &paths.sqm_state_root,
                         &snapshot,
                         &batch,
                         |targets| {
@@ -6496,6 +6527,7 @@ mod tests {
                 let restored = finish_stopped_publication(
                     &paths.config_root,
                     &paths.uci,
+                    &paths.sqm_state_root,
                     &snapshot,
                     &batch,
                     |_| Ok(()),
@@ -6582,9 +6614,15 @@ mod tests {
                 // then a reboot) is kept, and only the publication's own
                 // untouched file is rolled back (owner decision M2). Before,
                 // every start refused this for ever.
-                let restored = recover_unregistered_publication(&paths, |_| Ok(()))
-                    .unwrap()
-                    .unwrap();
+                let run_lock = paths.sqm_state_root.join("sqm-run.lock");
+                let restored = recover_unregistered_publication(&paths, |_| {
+                    // run.sh must not read the files while they are rolled back.
+                    assert!(run_lock.is_dir());
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+                assert!(!run_lock.exists());
                 assert_eq!(
                     fs::read(paths.config_root.join(CAKE_PACKAGE)).unwrap(),
                     current[0]
@@ -6699,6 +6737,7 @@ mod tests {
                 let restored = finish_stopped_publication(
                     &paths.config_root,
                     &paths.uci,
+                    &paths.sqm_state_root,
                     &capture(),
                     &batch,
                     |_| Ok(()),
@@ -6730,6 +6769,7 @@ mod tests {
                     finish_stopped_publication(
                         &paths.config_root,
                         &paths.uci,
+                        &paths.sqm_state_root,
                         &committed,
                         &batch,
                         |_| Err("runtime-still-present".into())
@@ -6750,6 +6790,7 @@ mod tests {
                 assert!(finish_stopped_publication(
                     &paths.config_root,
                     &paths.uci,
+                    &paths.sqm_state_root,
                     &committed,
                     &batch,
                     |_| {
@@ -6769,6 +6810,7 @@ mod tests {
                 finish_stopped_publication(
                     &paths.config_root,
                     &paths.uci,
+                    &paths.sqm_state_root,
                     &capture(),
                     &batch,
                     |_| Ok(()),
@@ -6778,6 +6820,7 @@ mod tests {
                 finish_stopped_publication(
                     &paths.config_root,
                     &paths.uci,
+                    &paths.sqm_state_root,
                     &committed,
                     &batch,
                     |_| Ok(()),
@@ -6898,6 +6941,7 @@ mod tests {
             bridger_init: root.join("unused-init"),
             bridger_config: root.join("unused-bridger"),
             uci_workspace_root: root.join("uci-work"),
+            sqm_state_root: root.join("sqm-state"),
         };
         struct Backend<'a> {
             paths: &'a ServicePaths,
@@ -7241,6 +7285,7 @@ mod tests {
             bridger_init: runtime.join("unused-bridger"),
             bridger_config: runtime.join("unused-bridger-config"),
             uci_workspace_root: runtime.join("uci-work"),
+            sqm_state_root: runtime.join("sqm-state"),
         };
         let operation_input =
             super::super::controller_input::load("lab", old_input.generation(), &inputs, config)
@@ -7618,6 +7663,7 @@ mod tests {
             bridger_init: root.join("no-bridger"),
             bridger_config: root.join("no-bridger-config"),
             uci_workspace_root: root.join("uci-work"),
+            sqm_state_root: root.join("sqm-state"),
         };
         let inputs = paths.runtime_root.join(".controller-input");
         let capture = || {
@@ -7673,10 +7719,22 @@ mod tests {
         fs::write(root.join("later"), &later).unwrap();
         fs::rename(root.join("later"), config.join(CAKE_PACKAGE)).unwrap();
         let committed = capture();
-        let restored =
-            finish_stopped_publication(&config, &paths.uci, &committed, &update, |_| Ok(()))
-                .unwrap()
-                .unwrap();
+        let run_lock = paths.sqm_state_root.join("sqm-run.lock");
+        let restored = finish_stopped_publication(
+            &config,
+            &paths.uci,
+            &paths.sqm_state_root,
+            &committed,
+            &update,
+            |_| {
+                // run.sh must not read the files while they are rolled back.
+                assert!(run_lock.is_dir());
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!run_lock.exists());
         assert_eq!(fs::read(config.join(SQM_PACKAGE)).unwrap(), original_sqm);
         assert_eq!(
             fs::read_to_string(config.join(CAKE_PACKAGE)).unwrap(),
@@ -7737,6 +7795,7 @@ mod tests {
             bridger_init: root.join("no-bridger"),
             bridger_config: root.join("no-bridger-config"),
             uci_workspace_root: root.join("uci-work"),
+            sqm_state_root: root.join("sqm-state"),
         };
         let inputs = paths.runtime_root.join(".controller-input");
         let capture = || {
@@ -7881,6 +7940,7 @@ mod tests {
             bridger_init: root.join("no-bridger"),
             bridger_config: root.join("no-bridger-config"),
             uci_workspace_root: root.join("uci-work"),
+            sqm_state_root: root.join("sqm-state"),
         };
         fs::create_dir(&paths.proc_root).unwrap();
         let environment = OpenWrtEnvironment::test_paths(wrapper, root.join("no-ubus"), sys);
@@ -7959,6 +8019,7 @@ fi
             bridger_init: root.join("no-bridger"),
             bridger_config: root.join("no-bridger-config"),
             uci_workspace_root: root.join("uci-work"),
+            sqm_state_root: root.join("sqm-state"),
         };
         fs::create_dir(&paths.proc_root).unwrap();
         let environment = OpenWrtEnvironment::test_paths(uci, root.join("no-ubus"), sys);
@@ -8646,6 +8707,7 @@ fi
                         bridger_init: root.join("bridger"),
                         bridger_config: root.join("bridger-config"),
                         uci_workspace_root: root.join("uci-work"),
+                        sqm_state_root: root.join("sqm-state"),
                     },
                     environment: OpenWrtEnvironment::test_paths(
                         uci,
@@ -9168,6 +9230,7 @@ esac
             bridger_init,
             bridger_config: config.clone(),
             uci_workspace_root: root.join("workspace"),
+            sqm_state_root: root.join("sqm-state"),
         };
         sync_bridger_blacklist(&paths, &BTreeSet::from(["ifb4wwan0".to_string()])).unwrap();
 
@@ -9458,6 +9521,7 @@ esac
             bridger_init: root.join("bridger"),
             bridger_config: root.join("bridger-config"),
             uci_workspace_root: root.join("uci-work"),
+            sqm_state_root: root.join("sqm-state"),
         };
         let expected = vec!["wan".to_string()];
 

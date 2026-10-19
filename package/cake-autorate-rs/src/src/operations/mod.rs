@@ -369,6 +369,8 @@ mod timer_ownership_tests {
             ],
             "sqm_recovery_openwrt" => vec![
                 "thread::sleep(PROCESS_WAIT_INTERVAL.min(deadline.saturating_duration_since(now)));",
+                // Polling: run.sh releases its run lock without an event (bounded).
+                "thread::sleep(SQM_RUN_LOCK_RETRY);",
             ],
             "rating" => vec![
                 "thread::sleep(PERMIT_POLL_INTERVAL);",
