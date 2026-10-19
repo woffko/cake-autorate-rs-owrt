@@ -1115,25 +1115,150 @@ start from `/proc/<pid>/stat`, both in seconds since boot.
 
 ### Known limits
 
-- A reload (Save & Apply) is not part of this change. On the VM with this daemon,
-  every reload that changed the managed queue while the hotplug restarted it
-  failed (8 of 8, delays from 0 to 0.75 s: `managed SQM counter ... is missing`,
-  `ingress redirect is not an exact single match`, `Cannot find device
-  "ifb4eth1"`). The next reload of the same configuration completed three of
-  four; the fourth could be finished neither by the next reload nor by `stop`
-  (`SQM runtime state does not match the frozen managed section`,
-  `uci-transaction-recovery-receipt-mismatch`), and the journal of its file
-  transaction outlived a reboot, so all three start attempts at boot failed with
-  `uci-transaction-recovery-pending`. `/etc/init.d/sqm stop`, then `stop` and
-  `start` of the service recovered it. The reload pins every current queue when
-  it begins and attests the pins until it publishes; a hotplug restart replaces
-  the pinned queue, so the reload fails before it reaches its own SQM steps. A
-  change that waited only in those steps did not help on the VM and was
-  withdrawn; tolerating the hotplug needs a decision on what a reload does with
-  a pinned queue that was replaced.
+- A reload (Save & Apply) was not part of this change; it failed when the
+  hotplug restarted a managed queue during it. The next section records the
+  failure and its fix.
 - A start that fails at boot three times stays stopped until it is started by
   hand; the log says so.
 - A busy global lock during readiness raises no event, so it is retried every
   second, within the 90 s readiness limit.
+- Only x86_64 was run; the AArch64 packages were built and verified. The
+  owner's router still runs the release daemon.
+
+## Changes after RC27 r320/r128: Save & Apply while SQM restarts (unreleased)
+
+### The failure
+
+A reload (Save & Apply, `/etc/init.d/cake-autorate reload`) pins every current
+managed queue when it begins (the state file, the IFB and qdisc identities)
+and attests the pins up to its confirmation. The upstream iface hotplug
+restarts a queue (`run.sh stop`, then `run.sh start`) outside the lifecycle
+lock, which replaces a pinned queue: the reload failed within a second, before
+its own SQM steps. Now and then it also left the journal of its file
+transaction behind; that journal outlived a reboot and every start at boot then
+failed with `uci-transaction-recovery-pending`.
+
+### Reproduction on the test VM (before the change)
+
+Daemon `c4683636` (source gate 192) and `tools/goal-k-vm-start-race.py
+--mode reload` (git-ignored): change `sqm_download` of the instance (19999 and
+20000 in turn), start the reload, and run the iface hotplug (`ACTION=ifup ...
+11-sqm`) after a delay.
+
+| Scenario | Failed | Errors |
+|---|---:|---|
+| the hotplug restarts the queue the reload changes (eth1), delays 0 to 1 s | 8 of 8 | `managed SQM counter ... is missing`, `ingress redirect is not an exact single match`, `Cannot find device "ifb4eth1"`, after 0.1 to 1.1 s |
+| the next reload of the same configuration | 1 of 4 | stuck: the next reload and `stop` refused (`SQM runtime state does not match the frozen managed section`, `uci-transaction-recovery-receipt-mismatch`); after a reboot all three start attempts failed with `uci-transaction-recovery-pending`; `/etc/init.d/sqm stop`, `stop` and `start` recovered it |
+| a second instance on eth2 whose queue the reload keeps; the hotplug restarts that one (`--hotplug wan2:eth2`), delays 0 to 3 s | 7 of 8 | `managed SQM runtime state is missing`, `ingress redirect is not an exact single match`, `retained SQM runtime identity changed`, `managed SQM counter .../ifb4eth2/... is missing`, after 0.4 to 3.1 s; the next reload completed each |
+
+A change that only waited in the reload's own SQM steps (gate 194) failed the
+same way and was withdrawn: the pins fail first.
+
+### What changed
+
+The owner's decision is to wait and pin again (L1), never to accept a
+different queue.
+
+- A failed pin, or a failed attestation of a pin, waits for a real event
+  (inotify, netlink) and pins again, at most 30 s. The new pin is taken under
+  the same lease and only when the queue again runs exactly the frozen recipe
+  of the same generation; anything else fails at the deadline with `retained
+  SQM <instance> did not settle: ...`.
+- Once the reload has published its files, a queue it changes may run exactly
+  its published recipe, which the hotplug starts on its own.
+- The old queue's stop waits out a hotplug gap and is skipped when the hotplug
+  already runs exactly the desired queue; the new queue's start and the final
+  readiness proof wait for events like the service start; the confirmation
+  attests each reloaded queue with the same wait.
+- A start that meets a queue started from the files it replaced stops that
+  queue through the replaced files' frozen copies and starts the published one.
+- Stop rolls back the file transaction of a reload that did not publish its
+  batch, and stops a queue the hotplug restarted from the published files
+  through the current files; after a reboot, Stop and the next start stop the
+  queues S50sqm started before they roll the journal back.
+- The controller scan ignores a helper of a controller between fork and exec
+  (`multiple exact controller processes are running` during a reload).
+- Found by the acceptance of the first build (source gate 195), 2 of 26
+  reloads: the event subscription failed on the `ifindex` of a device being
+  removed (`EINVAL` from sysfs, `invalid owned SQM interface index`), and the
+  file transaction found `/etc/config/sqm` locked by a libuci reader of the
+  SQM scripts, then its rollback too (`uci-transaction-recovery-required`). A
+  device being removed now counts as absent; the source lock is retried every
+  10 ms, at most 2 s.
+- No recovery record changes.
+
+### Tests that fail without the change
+
+Each was run against its fix reverted (the wait replaced by one look, the
+helper filter, the orphan-journal check, the device classification, the lock
+retry), and each failed:
+
+- `retained_pin_is_retaken_once_the_hotplug_restart_settles`: a pin found in a
+  gap subscribes and looks again at once, a later look waits for an event, a
+  foreign queue fails at the deadline after one look per event, Busy is
+  terminal.
+- `reload_stop_waits_out_a_hotplug_restart`,
+  `reload_readiness_waits_for_an_event_and_stays_bounded` and
+  `reload_sqm_final_proof_waits_for_a_queue_the_hotplug_restarts`: the stop,
+  the readiness wait and the final proof of `reconcile_sqm`.
+- `controller_scan_ignores_a_helper_between_fork_and_exec`; a second
+  controller with another parent is still refused.
+- `start_stops_only_the_remains_of_an_unconfirmed_start`, extended: a file
+  journal without any batch (after a reboot) runs the Stop transaction first.
+- `an_interface_being_removed_is_absent_not_an_error` and
+  `transaction_waits_out_a_reader_of_a_source`; the latter reproduces
+  `uci-transaction-recovery-required` with one try, and checks that a lock held
+  past the bound still refuses and leaves a recoverable journal.
+
+The re-pinning inside `RetainedSqmSet`, the replaced-recipe stop and the Stop
+rollback of a reload's files are exercised on the VM, not by unit tests.
+
+### Source gate and packages
+
+- Source gate 197, 58 commands: Full (1,879) and Lite (451) Rust tests, seven
+  new in each since gate 192, formatting, clippy, LuCI checks, shell tests and
+  real-UCI tests; the sources did not change during the run. Gate 196 stopped
+  at the structural audit of production sleeps until the bounded lock retry
+  was classified as polling.
+- Daemon packages for x86_64 and aarch64_cortex-a76 built from that gate and
+  verified (payload, metadata, ELF, overflow checks on).
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+Daemon `868cb92a` from gate 197.
+
+| Scenario | Before | After |
+|---|---|---|
+| reload while the hotplug restarts the changed queue, 52 reloads, delays 0 to 4 s | 8 of 8 failed, one stuck | 0 failed, 0 stuck; each reload 3.1 to 15.2 s (median 4.5 s) |
+| reload while the hotplug restarts a retained queue of a second instance, 24 reloads | 7 of 8 failed | 0 failed; each reload 26.1 to 26.9 s |
+| `kill -9` of a reload after it published its files, a hotplug restart, then power loss (`reboot -f`), 4 times | not run; in the stuck case above the journal outlived a reboot and 3 of 3 boot starts failed | 4 of 4 running after boot, files and queue at the reload's target, no journal |
+| start with one hotplug restart, the 29 delays of goal K | — | 0 failed |
+| start with ten back-to-back restarts, 5 delays | — | 0 failed |
+| start with the ingress redirect removed for longer than the wait | — | the start fails after 30 s; the next one runs in 1.3 s (`stopping the remains of an earlier start that did not complete`) |
+| plain reboot, 10 boots | — | 10 running; the hotplug stopped SQM at 12.7 to 15.2 s and the controller came up at 13.1 to 15.0 s |
+| reboot, SQM restarted back to back during `S97cake-autorate`, 10 boots | — | 10 running, controller up 13.3 to 16.7 s after boot |
+| reboot, global lock held for the first 10 s of `S96`, 2 boots | — | 2 running after one retry, controller up 28 s after boot |
+
+- The second instance (eth2, `wan2`) was added for the retained-queue series
+  and removed afterwards; the configuration read by uci was the same at the
+  end of every series.
+- The build of gate 195 passed the retained series (24 of 24), power loss
+  (4 of 4) and the start scenarios, and failed 2 of 26 reloads on eth1 with the
+  two errors fixed above. A local build with those fixes then passed 52 of 52
+  and 24 of 24 before gate 197.
+- Service checks: 33 of 33. Speed Test (capped, current topology): completed
+  in 24.0 s.
+- In one plain boot the controller still reported `WAITING_SQM` (a runtime
+  recovery attempt met the hotplug restart) when the driver took its single
+  sample; its loop checks the queue again at every poll interval and returns
+  to `HEALTHY` once the queue is exact. That code did not change.
+
+### Known limits
+
+- A reload of two instances takes about 26 s; the same reload took about 24 s
+  with the daemon of gate 192 and no hotplug restart, so the time is not new.
+- A reader that holds a lock on `/etc/config/sqm` or `/etc/config/cake-autorate`
+  for longer than 2 s still fails the reload with
+  `uci-transaction-recovery-required`; Stop or the next reload recovers it.
 - Only x86_64 was run; the AArch64 packages were built and verified. The
   owner's router still runs the release daemon.
