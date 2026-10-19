@@ -1261,16 +1261,134 @@ Daemon `868cb92a` from gate 197.
   for longer than 2 s still fails the reload with
   `uci-transaction-recovery-required`; the next reload of the same
   configuration recovers it (seen on the VM).
-- A reload that fails after it published its batch (on the VM: the ingress
-  redirect deleted for longer than the 30 s wait, `tools/goal-k-vm-start-race.py
-  --mode reloadfail`) leaves the controllers stopped, the batch and the file
-  journal pending. The same reload again completes it (2.1 s). `stop` refuses
-  (`controller-batch-update-recovery-required`) and `start` too
-  (`service-start-pending-generation-recovery-required`). After a change of
-  the configuration (`uci commit`, as Save & Apply does) the next reload is
-  refused (`uci-transaction-source-receipt-changed`), and every start, at boot
-  too, fails until `/etc/config/.start-uci/pending` is removed by hand
-  (`uci-transaction-recovery-conflict`; `uci-transaction-recovery-pending` with
-  the daemon of gate 192, which behaves the same). Not changed by this work.
+- A reload that fails after it published its batch could be finished only by
+  the same reload again; the next section records that failure and its fix.
+- Only x86_64 was run; the AArch64 packages were built and verified. The
+  owner's router still runs the release daemon.
+
+## Changes after RC27 r320/r128: a failed Save & Apply no longer blocks the service (unreleased)
+
+### The failure
+
+A reload that fails after it published its update (the controllers of the
+changed instances are already stopped) leaves that update next to its accepted
+predecessor, and the journal of its files. Only the same reload again could
+finish it. `stop` refused (`controller-batch-update-recovery-required`),
+`start` refused (`service-start-pending-generation-recovery-required`), and a
+Save & Apply of other settings refused (`uci-transaction-source-receipt-changed`).
+Once the settings had been committed again, every start, at boot too, failed
+until `/etc/config/.start-uci/pending` was removed by hand
+(`uci-transaction-recovery-conflict`; `uci-transaction-recovery-pending` with
+the daemon of gate 192).
+
+### Reproduction on the test VM (before the change)
+
+`tools/goal-k-vm-start-race.py --mode reloadfail --recovery ...` (git-ignored):
+set `sqm_download` to 19999 and reload; once the new queue runs, delete its
+ingress redirect in a tight loop for 45 s, longer than the 30 s wait, so that
+the reload fails after its publication. Then:
+
+| Recovery | Daemon of gate 192 or 197 |
+|---|---|
+| the same reload again | completes in 2.1 s |
+| `stop`, then `start` | both refused |
+| the old setting committed again, then reload | refused; `stop` and `start` refused too; after a reboot all three start attempts failed |
+
+### What changed
+
+Owner decisions: Stop finishes a failed ordinary reload (M1), and settings
+committed after the failure are kept (M2).
+
+- Stop accepts controllers of either generation, plans the queues of both
+  recipes and stops each through the update's input, the predecessor's or the
+  current files; it then rolls the reload's files back and retires both
+  records. A start runs that Stop first (`stopping the remains of a reload that
+  did not complete`); a reload whose files changed since runs it and answers
+  `service-reload-v1 legacy`, so the init script stops and starts the service
+  from the current files. A selected Native Apply update keeps its own
+  recovery.
+- The rollbacks of Stop and of the recoveries of an unregistered publication or
+  a reload's preparation keep a file committed after the failure, and restore
+  only the transaction's own publications that nobody changed since. This
+  applies to a failed start too: two real-UCI cases that expected a refusal
+  after such a commit now expect the commit kept.
+- Found by the acceptance of the first build (source gate 199): after a power
+  cut, the iface hotplug at boot read the failed reload's files before the
+  rollback and started their queue after it; no file described that queue any
+  more, and every start attempt failed (1 of 2 runs). Those rollbacks now hold
+  run.sh's own run lock, so a run that read the old files has finished before
+  the rollback and a later one reads the rolled-back files.
+- Found by the same acceptance (1 of 26 reloads): a readiness check that had
+  just opened `status.json` when the controller renamed the next one over it
+  failed with `status.json is not an exclusive regular configuration file`. It
+  now waits for the next status.
+- No recovery record changes.
+
+### Tests that fail without the change
+
+Each was run with its part of the change reverted (eleven reversions) and
+failed:
+
+- `stop_rollback_keeps_later_commits_and_restores_only_its_own_file`: a later
+  commit of the other file is kept and the transaction's own file restored; a
+  later commit of its own file is kept; before READY the preparation is
+  retired; the strict recovery still refuses.
+- `stop_retires_a_failed_ordinary_reload_and_its_predecessor`, and the reload
+  batch test now expects the receipt that Stop needs.
+- `r4_stop_finishes_a_failed_reload_and_keeps_a_later_commit` and
+  `r4_stop_plan_covers_both_generations_of_a_failed_reload` (real UCI): Stop
+  finishes the failed update with a later commit of `cake-autorate`, holding
+  run.sh's lock during the rollback; the plan covers both recipes of a queue.
+- `start_stops_only_the_remains_of_an_unconfirmed_start`, extended with a
+  pending reload update.
+- `rollback_takes_the_sqm_run_lock_like_run_sh_and_never_a_foreign_one` and
+  `a_status_file_replaced_after_its_open_is_read_again`.
+- The real-UCI recovery of an interrupted start publication with a later
+  commit now checks the kept commit and run.sh's lock.
+
+### Source gate and packages
+
+- Source gate 200, 58 commands: Full (1,883) and Lite (455) Rust tests,
+  formatting, clippy, LuCI checks, shell tests and real-UCI tests; the sources
+  did not change during the run. Gate 198 stopped at the real-UCI case that
+  expected the old refusal.
+- Daemon and LuCI packages for x86_64 and aarch64_cortex-a76 built from that
+  gate and verified (payload, metadata, ELF, overflow checks on).
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+Daemon `c7040af2` from gate 200. The reload fails after its publication each
+time, as above.
+
+| Recovery after the failed reload | Before | After |
+|---|---|---|
+| the same reload again | completes | completes (11.6 s) |
+| `stop`, then `start` | refused | running with the committed setting (2.1 s) |
+| the old setting committed again, then Save & Apply | refused, after a reboot too | running with the old setting (2.3 s) |
+| the old setting committed, then a reboot | — | running; the stop at shutdown finished the reload |
+| the old setting committed, then a power cut | every start at boot failed | running; the start at boot finished the reload |
+
+| Scenario | Result |
+|---|---|
+| reload while the hotplug restarts the queue, 26 reloads | 0 failed (3.4 to 15.1 s) |
+| power loss after a killed reload, 4 times | 4 running after boot |
+| start with one hotplug restart, the 29 delays of goal K | 1 first start failed, the second ran (see below) |
+| start with ten back-to-back restarts, 5 delays | 0 failed |
+| start with the ingress redirect removed for longer than the wait | the next start stops the remains and runs |
+| plain reboot / restarts during `S97` / global lock held, 10 / 10 / 2 boots | all running |
+
+- The build of gate 199 recovered from the first four cases and failed the
+  power cut and 1 of 26 reloads, with the two errors fixed above; a local build
+  with those fixes then recovered from 6 of 6 power cuts.
+- Service checks: 33 of 33. Speed Test (capped, current topology): completed
+  in 24.5 s. The VM configuration was the same at the end.
+
+### Known limits
+
+- One first start in 116 (four series of the 29 delays) failed at the readiness
+  confirmation within 0.3 s, before the hotplug restart; the second start ran.
+  The init script discards the error of `confirm-started`, so its reason is
+  not known; three more series with the error captured did not repeat it.
+- A start or reload of two instances takes about 26 s, as before.
 - Only x86_64 was run; the AArch64 packages were built and verified. The
   owner's router still runs the release daemon.
