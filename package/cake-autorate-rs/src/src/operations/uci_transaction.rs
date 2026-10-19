@@ -645,32 +645,8 @@ impl Journal {
                     return Err("uci-transaction-recovery-conflict".into());
                 }
             } else if self.public_matches(i, &self.after[i], true)? {
-                let displaced = self.swap_version(i)?;
-                let (bytes, _, identity) = regular(
-                    &self.pending.path.join(format!("{}.swap", PACKAGES[i])),
-                    MAX_CONFIG,
-                    false,
-                )?;
-                if !self.before[i].matches(&bytes, &identity, true) {
-                    // Do not mistake private backup corruption/replacement for
-                    // a foreign inode observed at the publication exchange.
-                    let proof = read_receipt(&self.pending, "displaced")?;
-                    let expected = Version::parse(&proof["version"])?;
-                    let candidate = Version::parse(&proof["candidate"])?;
-                    if proof["name"].as_str() != Some(PACKAGES[i])
-                        || !expected.matches(&bytes, &identity, false)
-                        || candidate.identity != self.after[i].identity
-                        || candidate.sha256 != self.after[i].sha256
-                    {
-                        return Err("uci-transaction-displacement-unproven".into());
-                    }
-                    foreign_restored = true;
-                }
-                if displaced.identity.ino == self.after[i].identity.ino
-                    && displaced.identity.dev == self.after[i].identity.dev
-                {
-                    return Err("uci-transaction-recovery-conflict".into());
-                }
+                let (displaced, foreign) = self.swap_to_restore(i)?;
+                foreign_restored |= foreign;
                 restore[i] = Some(displaced);
             } else if !self.public_matches(i, &self.before[i], true)? {
                 return Err("uci-transaction-recovery-conflict".into());
@@ -685,6 +661,19 @@ impl Journal {
                 }
             }
         }
+        self.restore_swaps(&restore, |i| checkpoint(i, foreign_restored))?;
+        checkpoint(2, foreign_restored)?;
+        self.root.retire(&self.pending)?;
+        Ok(foreign_restored)
+    }
+    /// Exchange each swap back to its public name, last member first. A writer
+    /// that wins the gap during the exchange gets its inode back and the
+    /// rollback stops.
+    fn restore_swaps(
+        &self,
+        restore: &[Option<Version>; 2],
+        mut checkpoint: impl FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
         for i in (0..2).rev() {
             let Some(displaced) = &restore[i] else {
                 continue;
@@ -696,7 +685,7 @@ impl Journal {
             if current.identity != displaced.identity || current.sha256 != displaced.sha256 {
                 return Err("uci-transaction-recovery-conflict".into());
             }
-            checkpoint(i, foreign_restored)?;
+            checkpoint(i)?;
             rename(
                 &self.root.config,
                 PACKAGES[i],
@@ -732,9 +721,106 @@ impl Journal {
                 return Err("uci-transaction-recovery-conflict".into());
             }
         }
-        checkpoint(2, foreign_restored)?;
+        Ok(())
+    }
+    /// The swap of a member this transaction published and that is still
+    /// untouched: the version to put back, and whether it is a commit that the
+    /// publication displaced in its exchange gap.
+    fn swap_to_restore(&self, i: usize) -> Result<(Version, bool)> {
+        let displaced = self.swap_version(i)?;
+        let (bytes, _, identity) = regular(
+            &self.pending.path.join(format!("{}.swap", PACKAGES[i])),
+            MAX_CONFIG,
+            false,
+        )?;
+        let mut foreign = false;
+        if !self.before[i].matches(&bytes, &identity, true) {
+            // Do not mistake private backup corruption/replacement for
+            // a foreign inode observed at the publication exchange.
+            let proof = read_receipt(&self.pending, "displaced")?;
+            let expected = Version::parse(&proof["version"])?;
+            let candidate = Version::parse(&proof["candidate"])?;
+            if proof["name"].as_str() != Some(PACKAGES[i])
+                || !expected.matches(&bytes, &identity, false)
+                || candidate.identity != self.after[i].identity
+                || candidate.sha256 != self.after[i].sha256
+            {
+                return Err("uci-transaction-displacement-unproven".into());
+            }
+            foreign = true;
+        }
+        if displaced.identity.ino == self.after[i].identity.ino
+            && displaced.identity.dev == self.after[i].identity.dev
+        {
+            return Err("uci-transaction-recovery-conflict".into());
+        }
+        Ok((displaced, foreign))
+    }
+    /// A public file as it is now.
+    fn public_version(&self, i: usize) -> Result<(Vec<u8>, Version)> {
+        self.root.attest()?;
+        let (bytes, _, identity) =
+            regular(&self.root.config.path.join(PACKAGES[i]), MAX_CONFIG, false)?;
+        let version = Version::of(&bytes, identity.clone());
+        Ok((bytes, version))
+    }
+    /// recovery_views when later commits are kept: a version that is no
+    /// longer anywhere was replaced by such a commit, whose bytes stand in.
+    fn recovery_views_keeping_later(&self) -> Result<([Vec<u8>; 2], [Vec<u8>; 2])> {
+        let missing = |error: &String| error == "uci-transaction-recovery-version-missing";
+        let mut before = [Vec::new(), Vec::new()];
+        let mut after = [Vec::new(), Vec::new()];
+        for i in 0..2 {
+            after[i] = match self.version_bytes(i, &self.after[i]) {
+                Ok(bytes) => bytes,
+                Err(error) if missing(&error) => self.public_version(i)?.0,
+                Err(error) => return Err(error),
+            };
+            before[i] = match self.version_bytes(i, &self.before[i]) {
+                Ok(bytes) => bytes,
+                Err(error) if missing(&error) => {
+                    let proof = if exists(&self.pending, "displaced")? {
+                        Some(read_receipt(&self.pending, "displaced")?)
+                    } else {
+                        None
+                    };
+                    match proof.filter(|proof| proof["name"].as_str() == Some(PACKAGES[i])) {
+                        Some(proof) => {
+                            self.version_bytes(i, &Version::parse(&proof["version"])?)?
+                        }
+                        None => self.public_version(i)?.0,
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+        }
+        Ok((before, after))
+    }
+    /// Roll back only this transaction's own publications that are still
+    /// public and untouched, and keep every later commit (owner decision M2):
+    /// a member the transaction did not change, or one committed again since,
+    /// stays as it is. The receipt names what is public afterwards.
+    fn rollback_keeping_later(
+        &self,
+        mut checkpoint: impl FnMut(usize, &SourceReceipt) -> Result<()>,
+    ) -> Result<SourceReceipt> {
+        let _locks = self.lock_sources()?;
+        self.root.inspect(&self.pending)?;
+        let mut restore: [Option<Version>; 2] = [None, None];
+        let mut versions = [self.public_version(0)?.1, self.public_version(1)?.1];
+        for i in 0..2 {
+            if !self.changed[i] || !self.public_matches(i, &self.after[i], true)? {
+                continue;
+            }
+            let (displaced, _) = self.swap_to_restore(i)?;
+            versions[i] = displaced.clone();
+            restore[i] = Some(displaced);
+        }
+        let receipt = SourceReceipt { versions };
+        self.restore_swaps(&restore, |i| checkpoint(i, &receipt))?;
+        checkpoint(2, &receipt)?;
         self.root.retire(&self.pending)?;
-        Ok(foreign_restored)
+        Ok(receipt)
     }
 }
 
@@ -1036,6 +1122,27 @@ pub(crate) fn recovery_pending(config_dir: &Path) -> Result<bool> {
 pub(crate) fn recover_checked(
     config_dir: &Path,
     expected: Option<&SourceReceipt>,
+    check: impl FnMut(RecoveryCheck<'_>) -> Result<()>,
+) -> Result<Option<SourceReceipt>> {
+    recover_checked_with(config_dir, expected, LaterCommits::Refuse, check)
+}
+
+/// What a recovery does with a public commit made after the transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaterCommits {
+    /// Any later change refuses: the operation's own retry.
+    Refuse,
+    /// Ordinary Stop, or a reload, finishing an operation that failed (owner
+    /// decision M2): a file somebody committed since stays as it is, only the
+    /// transaction's own untouched publications are rolled back, and the
+    /// receipt names what is public afterwards.
+    Keep,
+}
+
+pub(crate) fn recover_checked_with(
+    config_dir: &Path,
+    expected: Option<&SourceReceipt>,
+    later: LaterCommits,
     mut check: impl FnMut(RecoveryCheck<'_>) -> Result<()>,
 ) -> Result<Option<SourceReceipt>> {
     check(RecoveryCheck::Absent)?;
@@ -1071,9 +1178,12 @@ pub(crate) fn recover_checked(
         if exists(&pending, "displaced")? || exists(&pending, "displaced.tmp")? {
             return Err("uci-transaction-readiness-unproven".into());
         }
-        if PACKAGES
-            .iter()
-            .any(|name| names.contains(&format!("{name}.swap")))
+        // Nothing was exchanged before READY: a public file that differs from
+        // its original is a later commit, which Keep leaves alone.
+        if later == LaterCommits::Refuse
+            && PACKAGES
+                .iter()
+                .any(|name| names.contains(&format!("{name}.swap")))
         {
             let intent = read_receipt(&pending, "intent")?;
             let entries = intent["entries"]
@@ -1104,6 +1214,26 @@ pub(crate) fn recover_checked(
             .encode()
     }) {
         return Err("uci-transaction-recovery-receipt-mismatch".into());
+    }
+    if later == LaterCommits::Keep {
+        let (before, after) = journal.recovery_views_keeping_later()?;
+        check(RecoveryCheck::Versions {
+            before: &before,
+            after: &after,
+        })?;
+        let restored = journal.rollback_keeping_later(|step, receipt| {
+            check(RecoveryCheck::Absent)?;
+            if step == 2 {
+                receipt.attest(config_dir)?;
+                check(RecoveryCheck::Restored(receipt))?;
+                receipt.attest(config_dir)?;
+            }
+            Ok(())
+        })?;
+        restored.attest(config_dir)?;
+        check(RecoveryCheck::Absent)?;
+        restored.attest(config_dir)?;
+        return Ok(Some(restored));
     }
     let original = SourceReceipt {
         versions: journal.before.clone(),
@@ -1401,6 +1531,89 @@ mod tests {
         fixture.assert_versions(&after, false);
         fixture.foreign_commit("sqm");
         assert!(committed.attest().is_err());
+    }
+
+    #[test]
+    fn stop_rollback_keeps_later_commits_and_restores_only_its_own_file() {
+        // Owner decision M2. A reload published sqm only, failed, and then the
+        // owner committed cake-autorate again (Save & Apply): the strict
+        // rollback refused for ever, even after a reboot.
+        let sqm_only = |fixture: &Fixture| {
+            let snapshot = CommittedSnapshot::capture_fixture(
+                &fixture.config,
+                &fixture.root.join("run"),
+                fixture_query,
+            )
+            .unwrap();
+            let edits = [Edit::Set {
+                section: "lab".into(),
+                option: "marker".into(),
+                value: "after".into(),
+            }];
+            snapshot
+                .prepare_fixture([&[], &edits], fixture_query)
+                .unwrap()
+        };
+        let read = |fixture: &Fixture, name: &str| fs::read(fixture.config.join(name)).unwrap();
+        // A later commit of the file the transaction did not change is kept,
+        // and the transaction's own publication is rolled back.
+        let fixture = Fixture::new();
+        let original_sqm = read(&fixture, "sqm");
+        drop(publish(sqm_only(&fixture)).unwrap()); // The reload exits after it.
+        assert_ne!(read(&fixture, "sqm"), original_sqm);
+        let foreign = fixture.foreign_commit("cake-autorate");
+        assert_eq!(
+            recover_checked(&fixture.config, None, |_| Ok(())).unwrap_err(),
+            "uci-transaction-recovery-conflict"
+        );
+        let mut views = None;
+        let restored = recover_checked_with(&fixture.config, None, LaterCommits::Keep, |event| {
+            if let RecoveryCheck::Versions { before, after } = event {
+                views = Some((before.clone(), after.clone()));
+            }
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(read(&fixture, "sqm"), original_sqm);
+        assert_eq!(read(&fixture, "cake-autorate"), foreign);
+        restored.attest(&fixture.config).unwrap();
+        assert!(!fixture.config.join(".start-uci/pending").exists());
+        let (before, after) = views.unwrap();
+        assert_eq!((&before[0], &after[0]), (&foreign, &foreign));
+        assert_eq!(before[1], original_sqm);
+        // A later commit of the file the transaction published is kept too.
+        let fixture = Fixture::new();
+        let original_cake = read(&fixture, "cake-autorate");
+        drop(publish(sqm_only(&fixture)).unwrap());
+        let foreign = fixture.foreign_commit("sqm");
+        assert!(recover_checked(&fixture.config, None, |_| Ok(())).is_err());
+        let restored = recover_checked_with(&fixture.config, None, LaterCommits::Keep, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read(&fixture, "sqm"), foreign);
+        assert_eq!(read(&fixture, "cake-autorate"), original_cake);
+        restored.attest(&fixture.config).unwrap();
+        assert!(!fixture.config.join(".start-uci/pending").exists());
+        // Interrupted before READY nothing was exchanged: a later commit stays
+        // and the preparation is retired.
+        let fixture = Fixture::new();
+        let config = sqm_only(&fixture);
+        drop(Journal::prepare(&config).unwrap());
+        drop(config);
+        fs::remove_file(fixture.config.join(".start-uci/pending/ready")).unwrap();
+        let foreign = fixture.foreign_commit("sqm");
+        assert_eq!(
+            recover_checked(&fixture.config, None, |_| Ok(())).unwrap_err(),
+            "uci-transaction-readiness-unproven"
+        );
+        assert!(
+            recover_checked_with(&fixture.config, None, LaterCommits::Keep, |_| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(read(&fixture, "sqm"), foreign);
+        assert!(!fixture.config.join(".start-uci/pending").exists());
     }
 
     #[test]
