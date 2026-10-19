@@ -1912,10 +1912,20 @@ fn observe_controller_start(
             .find(|controller| &controller.instance == instance)
             .ok_or_else(|| format!("controller process disappeared for {instance}"))?;
         let status_path = paths.runtime_root.join(instance).join("status.json");
-        let Some(status) = read_exact_file(&status_path)? else {
-            return Ok(ControllerStartReadiness::Waiting(format!(
-                "controller status is missing for {instance}"
-            )));
+        let status = match read_exact_file(&status_path) {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                return Ok(ControllerStartReadiness::Waiting(format!(
+                    "controller status is missing for {instance}"
+                )))
+            }
+            // The controller renames each new status over the old one.
+            Err(error) if error == replaced_while_read(&status_path) => {
+                return Ok(ControllerStartReadiness::Waiting(format!(
+                    "controller status was being replaced for {instance}"
+                )))
+            }
+            Err(error) => return Err(error),
         };
         if status.uid != sys::effective_uid() || status.mode & 0o022 != 0 {
             return Err(format!(
@@ -5081,7 +5091,7 @@ fn owner_directory_is_exact(path: &Path) -> bool {
 }
 
 fn read_exact_file(path: &Path) -> Result<Option<ExactFileSnapshot>, String> {
-    let mut file = match OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
@@ -5090,9 +5100,22 @@ fn read_exact_file(path: &Path) -> Result<Option<ExactFileSnapshot>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("unable to open {}: {error}", path.display())),
     };
+    read_exact_open_file(file, path).map(Some)
+}
+
+/// A regular file renamed over between its open and its check: the name now
+/// holds a new file, which the next read sees.
+fn replaced_while_read(path: &Path) -> String {
+    format!("{} was replaced while it was read", path.display())
+}
+
+fn read_exact_open_file(mut file: File, path: &Path) -> Result<ExactFileSnapshot, String> {
     let before = file
         .metadata()
         .map_err(|error| format!("unable to inspect {}: {error}", path.display()))?;
+    if before.file_type().is_file() && before.nlink() == 0 {
+        return Err(replaced_while_read(path));
+    }
     if !before.file_type().is_file() || before.nlink() != 1 {
         return Err(format!(
             "{} is not an exclusive regular configuration file",
@@ -5121,14 +5144,14 @@ fn read_exact_file(path: &Path) -> Result<Option<ExactFileSnapshot>, String> {
     {
         return Err(format!("{} changed while it was read", path.display()));
     }
-    Ok(Some(ExactFileSnapshot {
+    Ok(ExactFileSnapshot {
         bytes,
         device: after.dev(),
         inode: after.ino(),
         mode: after.mode(),
         uid: after.uid(),
         gid: after.gid(),
-    }))
+    })
 }
 
 fn write_new_file(path: &Path, bytes: &[u8], mode: u32, uid: u32, gid: u32) -> Result<(), String> {
@@ -8769,6 +8792,30 @@ fi
             run_service_lifecycle(["boot-retry", "3"].into_iter().map(String::from)).unwrap_err(),
             boot_retry_attempt("3").unwrap_err()
         );
+    }
+
+    #[test]
+    fn a_status_file_replaced_after_its_open_is_read_again() {
+        // The controller renames status.json.tmp over status.json; a readiness
+        // check that had just opened the old file failed the reload with "is
+        // not an exclusive regular configuration file" (test VM, 1 of 26).
+        let root = test_root("replaced-status");
+        let path = root.join("status.json");
+        fs::write(&path, b"old").unwrap();
+        let opened = File::open(&path).unwrap();
+        fs::write(root.join("status.json.tmp"), b"new").unwrap();
+        fs::rename(root.join("status.json.tmp"), &path).unwrap();
+        assert_eq!(
+            read_exact_open_file(opened, &path).unwrap_err(),
+            replaced_while_read(&path)
+        );
+        assert_eq!(read_exact_file(&path).unwrap().unwrap().bytes, b"new");
+        // A file with a second name is still refused.
+        fs::hard_link(&path, root.join("second")).unwrap();
+        assert!(read_exact_file(&path)
+            .unwrap_err()
+            .ends_with("is not an exclusive regular configuration file"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
