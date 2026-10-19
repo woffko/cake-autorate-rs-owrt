@@ -165,13 +165,15 @@ impl SqmStartEvents {
         for name in &self.interfaces {
             let file = match File::open(root.join(name).join("ifindex")) {
                 Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if device_gone(&error) => continue,
                 Err(_) => return Err("read owned SQM interface index".into()),
             };
             let mut text = String::with_capacity(32);
-            file.take(32)
-                .read_to_string(&mut text)
-                .map_err(|_| "invalid owned SQM interface index")?;
+            match file.take(32).read_to_string(&mut text) {
+                Ok(_) => {}
+                Err(error) if device_gone(&error) => continue,
+                Err(_) => return Err("invalid owned SQM interface index".into()),
+            }
             if text.len() == 32 {
                 return Err("oversized owned SQM interface index".into());
             }
@@ -439,6 +441,18 @@ impl StartEvents for SqmStartEvents {
     }
 }
 
+/// A device that is absent, or that the SQM iface hotplug is removing right
+/// now: sysfs refuses an attribute of a device being unregistered with EINVAL
+/// (ENODEV at open) and reports ENOENT once it is gone. Absent is not an
+/// error here; the next look of the exact attestor decides.
+fn device_gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENODEV | libc::ENOENT)
+        )
+}
+
 fn event_error(action: &str) -> String {
     format!("{action}: {}", io::Error::last_os_error())
 }
@@ -576,6 +590,22 @@ mod tests {
         assert!(events.file_events(&overflow).unwrap());
         assert!(events.file_events(&[0; 3]).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_interface_being_removed_is_absent_not_an_error() {
+        // Seen on the test VM: a reload subscribed while `run.sh stop` deleted
+        // ifb4eth1 and failed with "invalid owned SQM interface index".
+        for errno in [libc::EINVAL, libc::ENODEV, libc::ENOENT] {
+            assert!(device_gone(&io::Error::from_raw_os_error(errno)), "{errno}");
+        }
+        for errno in [libc::EACCES, libc::EIO, libc::EISDIR] {
+            assert!(
+                !device_gone(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        assert!(device_gone(&io::ErrorKind::NotFound.into()));
     }
 
     #[test]
