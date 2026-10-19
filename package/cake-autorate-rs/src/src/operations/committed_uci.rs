@@ -719,7 +719,7 @@ impl CommittedSnapshot {
         }
         Ok(())
     }
-    fn attest_private(&self) -> Result<()> {
+    pub(super) fn attest_private(&self) -> Result<()> {
         self.directory.attest()?;
         self.workspace.attest()?;
         for copy in self.copies.values() {

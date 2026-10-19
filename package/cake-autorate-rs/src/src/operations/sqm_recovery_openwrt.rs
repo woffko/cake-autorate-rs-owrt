@@ -418,6 +418,71 @@ impl StopConfigAuthority for CommittedStopAuthority<'_> {
     }
 }
 
+/// The files a publication replaced, as its private frozen copies hold them.
+/// S50sqm or the iface hotplug may have started a managed queue from those
+/// files before the publication; that queue is still ours to replace.
+struct ReplacedStopAuthority<'a> {
+    snapshot: &'a CommittedSnapshot,
+    sqm: Vec<u8>,
+}
+impl StopConfigAuthority for ReplacedStopAuthority<'_> {
+    fn cake_section(&self) -> Option<&[u8]> {
+        None
+    }
+    fn sqm_section(&self) -> &[u8] {
+        &self.sqm
+    }
+    fn runner_directory(&self) -> &Path {
+        self.snapshot.stop_context_directory()
+    }
+    fn attest(
+        &self,
+        _: &ManagedSqmStopSpec,
+        _: &OpenWrtPaths,
+    ) -> Result<(), NativeSqmAttestationError> {
+        // The public files are the published ones now; the frozen copies stay.
+        self.snapshot
+            .attest_private()
+            .map_err(NativeSqmAttestationError::failed)
+    }
+}
+
+/// Stop a managed queue that runs exactly the recipe of the files this
+/// publication replaced. Any other runtime (foreign, half restarted) is left
+/// alone and reported as Failed by the exact stop checks.
+pub(crate) fn stop_managed_sqm_replaced_by(
+    spec: &ManagedSqmAttestationSpec,
+    published: &PublishedConfig,
+) -> Result<(), NativeSqmAttestationError> {
+    let source = ManagedSqmStopSpec {
+        instance: spec.instance.clone(),
+        sqm_section: spec.sqm_section.clone(),
+        target_interface: spec.target_interface.clone(),
+        download_interface: spec.download_interface.clone(),
+        rate_policy: None,
+    };
+    source.validate()?;
+    let snapshot = &published.config().original;
+    let replaced = snapshot
+        .section_show("sqm", &source.sqm_section)
+        .map_err(NativeSqmAttestationError::failed)?;
+    let current = published
+        .config()
+        .section_show("sqm", &source.sqm_section)
+        .map_err(NativeSqmAttestationError::failed)?;
+    if replaced == current {
+        // Nothing replaced: never stop the queue of the published recipe.
+        return Err(NativeSqmAttestationError::failed(
+            "managed SQM recipe was not replaced by this publication",
+        ));
+    }
+    let authority = ReplacedStopAuthority {
+        snapshot,
+        sqm: replaced,
+    };
+    stop_managed_sqm_with_authority(&source, &OpenWrtPaths::from_environment(), &authority)
+}
+
 struct PreparedManagedSqm {
     _locks: RuntimeLockClaim,
     snapshot: PrivateSqmSnapshot,
@@ -532,6 +597,51 @@ fn published_sections(
     )?;
     validate_live_configuration(spec, &cake, &sqm)?;
     Ok(sqm)
+}
+
+/// A queue as a prepared, not yet published, configuration describes it: the
+/// recipe a reload is about to publish. Once the files are published, the SQM
+/// iface hotplug can start exactly this recipe on its own.
+pub(crate) struct DesiredSqm {
+    spec: ManagedSqmAttestationSpec,
+    sqm: ParsedUciSection,
+}
+impl DesiredSqm {
+    pub(crate) fn prepare(
+        spec: &ManagedSqmAttestationSpec,
+        config: &super::committed_uci::PreparedConfig,
+    ) -> Result<Self, NativeSqmAttestationError> {
+        spec.validate()?;
+        let cake = config
+            .section_show("cake-autorate", &spec.instance)
+            .map_err(NativeSqmAttestationError::failed)?;
+        let sqm = config
+            .section_show("sqm", &spec.sqm_section)
+            .map_err(NativeSqmAttestationError::failed)?;
+        let cake = parse_uci_show(
+            &cake,
+            "cake-autorate",
+            &spec.instance,
+            "cake_autorate",
+            UciListPolicy::Allow,
+        )?;
+        let sqm = parse_uci_show(
+            &sqm,
+            "sqm",
+            &spec.sqm_section,
+            "queue",
+            UciListPolicy::Reject,
+        )?;
+        validate_live_configuration(spec, &cake, &sqm)?;
+        Ok(Self {
+            spec: spec.clone(),
+            sqm,
+        })
+    }
+    /// The exact runtime of this recipe (or its proven offline deferral).
+    pub(crate) fn attest_runtime(&self) -> Result<bool, NativeSqmAttestationError> {
+        attest_frozen_runtime(&self.spec, &self.sqm, &OpenWrtPaths::from_environment())
+    }
 }
 
 /// The caller owns the global lifecycle lock. Frozen configuration is used for
