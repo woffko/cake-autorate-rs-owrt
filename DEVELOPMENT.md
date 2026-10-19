@@ -351,6 +351,56 @@ boot this happens when `wan` and `wan6` come up while `S97cake-autorate` runs.
   (`tests/shipped-shell-boundary.test.sh`); `tests/init-boot-retry.test.sh`
   runs the inherited-lock case under BusyBox ash.
 
+### Reload (Save & Apply)
+
+A reload pins every current managed queue when it begins (`RetainedSqmSet`:
+the state file, the IFB and qdisc identities) and attests the pins up to its
+confirmation, so that it never replaces or keeps a queue it did not prove. The
+iface hotplug can replace a pinned queue at any of those points. The owner's
+decision (L1) is to wait and pin again, never to accept a different queue:
+
+- A failed pin or pin attestation goes through `settle_observation`: the first
+  failure subscribes to the queue's events and looks again at once, every later
+  one waits for a real event, bounded by `SQM_START_ATTEST_TIMEOUT` (30 s).
+  Busy and cancellation stay terminal. The new pin is taken under the same
+  lease, and only if the queue is again exactly the frozen recipe of the same
+  generation (`retained SQM <instance> did not settle: ...` otherwise).
+- Once the reload has published its files, the hotplug can restart a queue
+  that the reload changes, from the new files. For such a queue the exact
+  published recipe (`DesiredSqm`) is accepted instead of a pin.
+- In `reconcile_sqm` the stop of an old queue waits out a hotplug gap and is
+  skipped when the hotplug already runs exactly the desired queue
+  (`stop_with_events`); the start of a new queue goes through
+  `settle_managed_sqm_with`; the final readiness proof waits for an event
+  (`await_ready_with`). The confirmation attests each reloaded queue with the
+  same bounded wait.
+- A start that meets a queue started from the files it replaced (by S50sqm or
+  the hotplug before the publication) stops that queue through the replaced
+  files' private frozen copies (`stop_managed_sqm_replaced_by`) and starts the
+  published one.
+- A reload that fails before it publishes its batch leaves the journal of its
+  file transaction. Stop rolls it back once every consumer is stopped (`rolling
+  back the files of a reload that did not complete`), and stops a queue the
+  hotplug restarted from the published files through the current files'
+  authority. After a reboot only the journal survives: Stop first stops the
+  queues S50sqm started from those files, and the next start runs the Stop
+  transaction before it publishes. No recovery record changed.
+- Between fork and exec a helper of a controller (`tc`, `ip`, `uci`) still has
+  the controller's command line; the controller scan ignores a process whose
+  parent is a controller of the same instance, instead of reporting two
+  controllers.
+- The file transaction takes an exclusive `flock` on both packages to publish
+  or roll back. libuci holds a shared one while it reads a package, which the
+  SQM scripts do many times during a hotplug restart, and a release raises no
+  event: the lock is retried every 10 ms, at most 2 s (`SOURCE_LOCK_WAIT`),
+  before `uci-transaction-source-busy`. With one try, the publication and then
+  its rollback found the source busy and the reload left
+  `uci-transaction-recovery-required`.
+- The SQM event subscription reads the `ifindex` of each watched interface.
+  sysfs refuses an attribute of a device being unregistered with `EINVAL`
+  (`ENODEV` at open); such an interface counts as absent, like a missing one,
+  instead of failing the wait with `invalid owned SQM interface index`.
+
 ## Notes
 
 Rust is a reasonable daemon language for this project because it provides one static-ish native binary, predictable memory safety, and better long-term maintainability than a large shell daemon. The main practical cost on OpenWrt is build complexity: the first SDK build of `rust/host` is heavy because it compiles Rust/LLVM tooling.

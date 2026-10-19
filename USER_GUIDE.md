@@ -64,6 +64,15 @@ next one: the next start, from the command line or from **Start** in Status,
 first stops what the failed attempt left behind and writes
 `stopping the remains of an earlier start that did not complete` to the log.
 
+**Save & Apply** waits for such a restart the same way, up to 30 seconds per
+check, when it changes a queue or keeps one that the SQM scripts restart
+meanwhile. It accepts a restarted queue only when it runs exactly the
+configuration it had before, or exactly the one being applied; anything else
+still fails and names the instance (`retained SQM <instance> did not settle`).
+A failed Save & Apply never blocks the next start: **Stop** rolls its files
+back (`rolling back the files of a reload that did not complete`), and after a
+reboot the start first stops what it left behind.
+
 ## Get rating
 
 **Get rating** offers an automatic router-side test and a guided client
