@@ -1259,6 +1259,18 @@ Daemon `868cb92a` from gate 197.
   with the daemon of gate 192 and no hotplug restart, so the time is not new.
 - A reader that holds a lock on `/etc/config/sqm` or `/etc/config/cake-autorate`
   for longer than 2 s still fails the reload with
-  `uci-transaction-recovery-required`; Stop or the next reload recovers it.
+  `uci-transaction-recovery-required`; the next reload of the same
+  configuration recovers it (seen on the VM).
+- A reload that fails after it published its batch (on the VM: the ingress
+  redirect deleted for longer than the 30 s wait, `tools/goal-k-vm-start-race.py
+  --mode reloadfail`) leaves the controllers stopped, the batch and the file
+  journal pending. The same reload again completes it (2.1 s). `stop` refuses
+  (`controller-batch-update-recovery-required`) and `start` too
+  (`service-start-pending-generation-recovery-required`). After a change of
+  the configuration (`uci commit`, as Save & Apply does) the next reload is
+  refused (`uci-transaction-source-receipt-changed`), and every start, at boot
+  too, fails until `/etc/config/.start-uci/pending` is removed by hand
+  (`uci-transaction-recovery-conflict`; `uci-transaction-recovery-pending` with
+  the daemon of gate 192, which behaves the same). Not changed by this work.
 - Only x86_64 was run; the AArch64 packages were built and verified. The
   owner's router still runs the release daemon.

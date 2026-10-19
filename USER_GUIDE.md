@@ -69,9 +69,12 @@ check, when it changes a queue or keeps one that the SQM scripts restart
 meanwhile. It accepts a restarted queue only when it runs exactly the
 configuration it had before, or exactly the one being applied; anything else
 still fails and names the instance (`retained SQM <instance> did not settle`).
-A failed Save & Apply never blocks the next start: **Stop** rolls its files
-back (`rolling back the files of a reload that did not complete`), and after a
-reboot the start first stops what it left behind.
+A Save & Apply that fails before it switches the controllers leaves the
+previous settings running, and **Stop** rolls its files back (`rolling back the
+files of a reload that did not complete`). One that fails later leaves the
+controllers stopped: run Save & Apply again with the same settings to complete
+it. Until then, Stop and Start are refused, and changing the settings first
+leaves the service unable to start, even after a reboot (a known limit).
 
 ## Get rating
 
