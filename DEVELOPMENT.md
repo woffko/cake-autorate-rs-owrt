@@ -417,6 +417,20 @@ decision (L1) is to wait and pin again, never to accept a different queue:
   failure refused the rollback for ever (`uci-transaction-recovery-conflict`,
   or `uci-transaction-recovery-pending` at every boot). The in-process rollback
   of an operation that has just failed stays strict.
+- These rollbacks hold the upstream SQM run lock (`SqmRunLock`): run.sh
+  creates `sqm-run.lock` in the SQM state directory before it reads
+  `/etc/config/sqm` and removes it when it exits, retrying every second, ten
+  times. A run that read the old files has finished when the lock is ours, so
+  its queue fails the absence proof; a later run waits and reads the
+  rolled-back files. Without it the iface hotplug at boot could read the
+  failed reload's files before the rollback and start their queue after it,
+  and no file described that queue any more. The lock is held only around
+  observations and renames, carries a marker so that one left by a killed
+  process of ours is taken over, and never removes run.sh's own.
+- The readiness check reads each controller's `status.json`, which the
+  controller replaces by rename. A file whose link count is 0 at the check was
+  replaced after it was opened; the check waits for the next status instead
+  of failing the start or the reload.
 - The SQM event subscription reads the `ifindex` of each watched interface.
   sysfs refuses an attribute of a device being unregistered with `EINVAL`
   (`ENODEV` at open); such an interface counts as absent, like a missing one,
