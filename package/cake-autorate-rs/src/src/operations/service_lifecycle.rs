@@ -1869,6 +1869,46 @@ fn execute_stop_openwrt() -> Result<String, String> {
     stop_under_lock(paths, expected_source_id()?)
 }
 
+/// Only the file journal of an interrupted start or reload is left (after a
+/// reboot nothing else survives), while S50sqm or the iface hotplug already
+/// run the managed queues from the current files. Rolling the journal back
+/// needs those queues absent: stop them through the current files' authority.
+fn stop_queues_of_unregistered_publication(paths: &ServicePaths) -> Result<(), String> {
+    let root = paths.runtime_root.join(".controller-input");
+    if super::controller_input::unregistered_store(&root)?.is_none()
+        || !super::uci_transaction::recovery_pending(&paths.config_root)?
+        || !discover_controllers(&paths.proc_root)?.is_empty()
+        || !super::procd_control::service_absent(&paths.ubus)?
+    {
+        // Nothing to do, or the recovery refuses with its own reason.
+        return Ok(());
+    }
+    super::sqm_runner::ensure_idle(&paths.runtime_root)?;
+    let committed =
+        CommittedSnapshot::capture(&paths.config_root, &paths.runtime_root, &paths.uci)?;
+    let sqm_paths = OpenWrtPaths::from_environment();
+    for spec in recovery_targets(&[
+        committed.package(CAKE_PACKAGE)?.clone(),
+        committed.package(SQM_PACKAGE)?.clone(),
+    ])? {
+        if super::sqm_recovery_openwrt::attest_managed_sqm_absent(&spec, &sqm_paths).is_ok() {
+            continue;
+        }
+        eprintln!(
+            "WARNING: stopping managed SQM {} to recover an interrupted file transaction",
+            spec.instance
+        );
+        stop_managed_sqm_from_committed(&spec, &committed).map_err(|error| {
+            format!(
+                "unable to stop managed SQM section {}: {}",
+                spec.sqm_section,
+                sqm_error_message(&error)
+            )
+        })?;
+    }
+    committed.attest()
+}
+
 /// The ordinary Stop transaction. The caller holds the global lifecycle lock
 /// and has already refused every pending Native Apply recovery.
 fn stop_under_lock(
@@ -1895,6 +1935,7 @@ fn stop_under_lock(
         batch: None,
     };
     let sqm_paths = OpenWrtPaths::from_environment();
+    stop_queues_of_unregistered_publication(&backend.paths)?;
     let orphan_restored = recover_unregistered_publication(&backend.paths, |specs| {
         if !discover_controllers(&backend.paths.proc_root)?.is_empty()
             || !super::procd_control::service_absent(&backend.paths.ubus)?
@@ -2757,12 +2798,18 @@ fn recover_unconfirmed_start_with(
     paths: &ServicePaths,
     stop: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let unconfirmed = super::controller_input::load_batch(
+    let batch = super::controller_input::load_batch(
         &paths.runtime_root.join(".controller-input"),
         &paths.config_root,
-    )?
-    .is_some_and(|batch| batch.unconfirmed_start());
-    if !unconfirmed {
+    )?;
+    let unconfirmed = batch
+        .as_ref()
+        .is_some_and(|batch| batch.unconfirmed_start());
+    // Without any batch, a pending file journal belongs to a start or reload
+    // that was interrupted (typically by a reboot) before it registered one.
+    let orphan_files =
+        batch.is_none() && super::uci_transaction::recovery_pending(&paths.config_root)?;
+    if !unconfirmed && !orphan_files {
         return Ok(());
     }
     eprintln!("WARNING: stopping the remains of an earlier start that did not complete");
@@ -3841,33 +3888,49 @@ impl ServiceStopBackend for OpenWrtServiceStop {
             }
             return Ok(());
         };
+        let sqm_paths = OpenWrtPaths::from_environment();
+        let absent = |extra_targets: &[ManagedSqmStopSpec]| -> Result<(), String> {
+            if !discover_controllers(&self.paths.proc_root)?.is_empty() {
+                return Err("applied-stop-process-still-running".into());
+            }
+            if !super::procd_control::service_absent(&self.paths.ubus)? {
+                return Err("applied-stop-procd-still-registered".into());
+            }
+            if !live_input_references(&self.paths)?.is_empty() {
+                return Err("applied-stop-input-still-referenced".into());
+            }
+            super::sqm_runner::ensure_idle(&self.paths.runtime_root)?;
+            for spec in plan.managed.iter().chain(extra_targets) {
+                super::sqm_recovery_openwrt::attest_managed_sqm_absent(spec, &sqm_paths)
+                    .map_err(|error| sqm_error_message(&error).to_string())?;
+            }
+            Ok(())
+        };
+        if !batch.pending() && super::uci_transaction::recovery_pending(&self.paths.config_root)? {
+            // An ordinary reload failed before it published its batch. Its
+            // own recovery must prove the old runtime unchanged; here every
+            // consumer is already stopped, so its file transaction can be
+            // rolled back on the proof that nothing runs at all.
+            eprintln!("WARNING: rolling back the files of a reload that did not complete");
+            ReloadPublication::recover_preparation(&self.paths, |_| absent(&[]))?;
+            // Release the private workspace of the old view before the new one.
+            self.committed = None;
+            self.committed = Some(CommittedSnapshot::capture(
+                &self.paths.config_root,
+                &self.paths.runtime_root,
+                &self.paths.uci,
+            )?);
+        }
         let committed = self
             .committed
             .as_ref()
             .ok_or("service Stop has no committed snapshot")?;
-        let sqm_paths = OpenWrtPaths::from_environment();
         self.restored_source = finish_stopped_publication(
             &self.paths.config_root,
             &self.paths.uci,
             committed,
             batch,
-            |extra_targets| {
-                if !discover_controllers(&self.paths.proc_root)?.is_empty() {
-                    return Err("applied-stop-process-still-running".into());
-                }
-                if !super::procd_control::service_absent(&self.paths.ubus)? {
-                    return Err("applied-stop-procd-still-registered".into());
-                }
-                if !live_input_references(&self.paths)?.is_empty() {
-                    return Err("applied-stop-input-still-referenced".into());
-                }
-                super::sqm_runner::ensure_idle(&self.paths.runtime_root)?;
-                for spec in plan.managed.iter().chain(extra_targets) {
-                    super::sqm_recovery_openwrt::attest_managed_sqm_absent(spec, &sqm_paths)
-                        .map_err(|error| sqm_error_message(&error).to_string())?;
-                }
-                Ok(())
-            },
+            |extra_targets| absent(extra_targets),
         )?;
         self.batch = None;
         if let Err(error) = collect_controller_inputs(&self.paths) {
@@ -3912,15 +3975,33 @@ impl ServiceStopBackend for OpenWrtServiceStop {
 
     fn stop_sqm(&mut self, spec: &ManagedSqmStopSpec) -> Result<(), String> {
         if let Some(input) = self.applied.get(&spec.instance) {
-            return super::sqm_recovery_openwrt::stop_managed_sqm_from_input(spec, input).map_err(
-                |error| {
-                    format!(
-                        "unable to stop applied SQM section {}: {}",
-                        spec.sqm_section,
-                        sqm_error_message(&error)
+            return match super::sqm_recovery_openwrt::stop_managed_sqm_from_input(spec, input) {
+                Ok(()) => Ok(()),
+                // The SQM iface hotplug may have restarted the queue from the
+                // current files, e.g. those an interrupted reload published:
+                // the queue is still ours, under the current files' authority.
+                Err(applied @ NativeSqmAttestationError::Failed(_)) => {
+                    stop_managed_sqm_from_committed(
+                        spec,
+                        self.committed
+                            .as_ref()
+                            .ok_or("service Stop has no committed snapshot")?,
                     )
-                },
-            );
+                    .map_err(|error| {
+                        format!(
+                            "unable to stop applied SQM section {}: {} (current files: {})",
+                            spec.sqm_section,
+                            sqm_error_message(&applied),
+                            sqm_error_message(&error)
+                        )
+                    })
+                }
+                Err(error) => Err(format!(
+                    "unable to stop applied SQM section {}: {}",
+                    spec.sqm_section,
+                    sqm_error_message(&error)
+                )),
+            };
         }
         stop_managed_sqm_from_committed(
             spec,
@@ -7755,6 +7836,19 @@ fi
         // No batch at all: an ordinary first start.
         fs::remove_dir_all(paths.runtime_root.join(".controller-input")).unwrap();
         recover_unconfirmed_start_with(paths, || panic!("nothing to recover")).unwrap();
+        // No batch, but the file journal of an interrupted start or reload
+        // (after a reboot): the stop transaction recovers it first.
+        let journal = paths.config_root.join(".start-uci");
+        fs::create_dir(&journal).unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(journal.join("pending")).unwrap();
+        let mut stops = 0;
+        recover_unconfirmed_start_with(paths, || {
+            stops += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stops, 1);
     }
 
     #[test]
