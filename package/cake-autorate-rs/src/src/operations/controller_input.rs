@@ -460,11 +460,13 @@ impl Batch {
         }
         self.attest_record()
     }
-    /// Ordinary Stop may finish only its own complete publication. A selected
-    /// replacement still belongs to its parent Native Apply recovery protocol.
+    /// Ordinary Stop may finish its own complete publication, and an ordinary
+    /// reload that failed after it published this update (owner decision M1).
+    /// A selected replacement still belongs to its parent Native Apply recovery
+    /// protocol.
     pub(crate) fn ordinary_stop_receipt(&self) -> Result<SourceReceipt> {
         self.attest_record()?;
-        if self.pending() && self.previous.is_some() {
+        if self.pending() && self.previous.is_some() && !self.reload {
             return Err("controller-batch-update-recovery-required".into());
         }
         Ok(self.sources.clone())
@@ -784,6 +786,35 @@ impl Batch {
         previous.cleanup_restore(&directory)?;
         previous.attest_record()?;
         attest_restored(&previous.generations)
+    }
+    /// Ordinary Stop of an ordinary reload that failed after it published this
+    /// update (owner decision M1). Once the reload process is gone nothing else
+    /// can finish it, unlike a selected update. With every process and queue
+    /// of both generations proven absent, the update is abandoned through the
+    /// restore marker (an interruption leaves the predecessor as the current
+    /// record) and the predecessor is retired.
+    pub(crate) fn retire_reload_update(
+        &self,
+        mut attest_absent: impl FnMut(&BTreeMap<String, String>) -> Result<()>,
+    ) -> Result<()> {
+        if !self.is_reload_update() || self.previous.is_none() {
+            return Err("controller-batch-update-authority-invalid".into());
+        }
+        let (directory, _lock) = lock_store(&self.root)?;
+        self.attest_record()?;
+        let previous = read_batch_file(&self.root, &self.config_root, BATCH_APPLIED)?;
+        self.require_accepted_predecessor(&previous, &directory)?;
+        attest_absent(&self.generations)?;
+        attest_absent(&previous.generations)?;
+        self.attest_record()?;
+        previous.attest_record()?;
+        self.cleanup_supersession_temp(&directory, true)?;
+        self.write_restore_marker(&previous, &directory)?;
+        previous.cleanup_restore(&directory)?;
+        previous.attest_record()?;
+        attest_absent(&previous.generations)?;
+        io(fs::remove_file(self.root.join(previous.name)))?;
+        io(directory.file.sync_all())
     }
     /// Only lifecycle Stop/recovery may retire this registry, after proving
     /// both procd/process absence and absence of every owned SQM runtime.
@@ -2769,6 +2800,98 @@ mod tests {
     }
 
     #[test]
+    fn stop_retires_a_failed_ordinary_reload_and_its_predecessor() {
+        // A reload that failed after it published its update could only be
+        // finished by the same reload again; Stop refused both records.
+        let fixture = Fixture::new();
+        let published = fixture.published();
+        let lab = fixture.input(&published);
+        let first = store_batch(
+            &published,
+            &["lab".into()],
+            &BTreeMap::from([("lab".into(), lab.clone())]),
+            &fixture.inputs,
+            &fixture.config,
+        )
+        .unwrap();
+        drop(published);
+        first.accept(|_| Ok(())).unwrap();
+        let previous = load_batch(&fixture.inputs, &fixture.config)
+            .unwrap()
+            .unwrap();
+        fs::write(fixture.config.join("sqm"), b"# ordinary reload source\n").unwrap();
+        let published = fixture.published();
+        let replacement = fixture.input(&published);
+        let pending = replace_reload_batch(
+            &published,
+            &previous,
+            &["lab".into()],
+            &BTreeMap::new(),
+            &BTreeMap::from([("lab".into(), replacement.clone())]),
+            |_| Ok(()),
+        )
+        .unwrap();
+        drop(published);
+        // The general retirement still keeps both authorities.
+        assert_eq!(
+            pending.retire(|_| Ok(())).unwrap_err(),
+            "controller-batch-update-recovery-required"
+        );
+        assert_eq!(
+            pending
+                .retire_reload_update(|_| Err("old-queue-still-running".into()))
+                .unwrap_err(),
+            "old-queue-still-running"
+        );
+        assert!(fixture.inputs.join(BATCH_PENDING).exists());
+        assert!(fixture.inputs.join(BATCH_APPLIED).exists());
+        let mut proven = Vec::new();
+        pending
+            .retire_reload_update(|generations| {
+                proven.push(generations.clone());
+                Ok(())
+            })
+            .unwrap();
+        let new = BTreeMap::from([("lab".to_string(), replacement.id.clone())]);
+        let old = BTreeMap::from([("lab".to_string(), lab.id.clone())]);
+        assert_eq!(proven, [new, old.clone(), old]);
+        assert!(load_batch(&fixture.inputs, &fixture.config)
+            .unwrap()
+            .is_none());
+        for name in [BATCH_PENDING, BATCH_APPLIED, BATCH_RESTORE] {
+            assert!(!fixture.inputs.join(name).exists(), "{name}");
+        }
+        // A selected update is not an ordinary reload.
+        let published = fixture.published();
+        let lab = fixture.input(&published);
+        let first = store_batch(
+            &published,
+            &["lab".into()],
+            &BTreeMap::from([("lab".into(), lab)]),
+            &fixture.inputs,
+            &fixture.config,
+        )
+        .unwrap();
+        drop(published);
+        first.accept(|_| Ok(())).unwrap();
+        let previous = load_batch(&fixture.inputs, &fixture.config)
+            .unwrap()
+            .unwrap();
+        let published = fixture.published();
+        let replacement = fixture.input(&published);
+        let selected =
+            replace_selected_batch(&published, &previous, "lab", &replacement, |_| Ok(())).unwrap();
+        assert_eq!(
+            selected.retire_reload_update(|_| Ok(())).unwrap_err(),
+            "controller-batch-update-authority-invalid"
+        );
+        assert_eq!(
+            selected.ordinary_stop_receipt().unwrap_err(),
+            "controller-batch-update-recovery-required"
+        );
+    }
+
+    #[test]
     fn r4_controller_batch_reload_retains_peers_and_cannot_be_adopted_as_native_apply() {
         let fixture = Fixture::new();
         let mut cake = fs::read(fixture.config.join("cake-autorate")).unwrap();
@@ -2856,7 +2979,11 @@ mod tests {
             |_| panic!("reload is not native selected authority")
         )
         .is_err());
-        assert!(pending.ordinary_stop_receipt().is_err());
+        // Ordinary Stop may finish a failed ordinary reload (owner decision M1).
+        assert_eq!(
+            pending.ordinary_stop_receipt().unwrap().encode(),
+            published.source_receipt().unwrap().encode()
+        );
         assert!(replace_reload_batch(
             &published,
             &previous,
