@@ -1,21 +1,20 @@
 # Release history
 
 The current supported build is
-[`v1.0-rc27-r320-r128`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r320-r128).
-It contains daemon r320, Full LuCI r128, the manual-only Lite r320/r8 pair,
-the `speedtest-go` 1.7.10-r5 backend for every ABI, the 12-ABI package matrix,
+[`v1.0-rc27-r321-r129`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r321-r129).
+It contains daemon r321, Full LuCI r129, the manual-only Lite r321/r9 pair,
+the `speedtest-go` 1.7.10-r6 backend for every ABI, the 12-ABI package matrix,
 checksums, and machine-readable release manifests.
 
-This release makes Full Auto-Tune finish on real, imperfect networks: an
-explicit total traffic choice, retries after a server failure, a switch to
-another qualified server when one keeps failing, measured CAKE options after
-an incomplete search, and tolerant handling of a raw control below the server
-comparison, of mwan3 tracker flaps and of a route restore during a
-measurement. It also adds explicit policy routes (for example a VPN) for the
-controller, Speed Test, Auto-Tune and scheduled calibration.
+This release keeps the service running while the SQM scripts restart a queue
+under it: at boot, during Save & Apply, and after a Save & Apply that failed.
+It also adds MQTT over TLS, moves the time limits of Speed Test, Rating and
+Auto-Tune to the boot clock, makes automatic Rating work on dual-stack routers
+with refusals of test traffic counted by reason, and ships a `speedtest-go`
+backend with current TLS defaults.
 
 The previous maintenance release
-[`v1.0-rc27-r318-r127`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r318-r127)
+[`v1.0-rc27-r320-r128`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r320-r128)
 is superseded. Its tag remains; install a complete matching set from one
 release and never mix revisions.
 
@@ -69,6 +68,51 @@ must not be read as current CLI, package, schema, or installation instructions.
 - Put all current installation, operation, dependency, and troubleshooting
   instructions in `README.md` and the feature guides without obsolete version
   branches.
+
+## RC27 r321/r129 release notes
+
+This release is **RC27 r321/r129**: daemon package r321 and Full LuCI package
+r129, with the parallel manual-only Lite pair r321/r9 and this project's
+`speedtest-go` 1.7.10-r6 backend (CLI only) for every ABI. Upgrades keep all
+configured instances.
+
+Service start and Save & Apply:
+
+- The start, at boot too, waits for an SQM restart by the iface hotplug (at
+  most 30 seconds per check) instead of failing on its first look. A start
+  that still fails at boot is retried twice, 15 seconds apart, and the next
+  start first stops whatever a failed one left behind.
+- Save & Apply waits for such a restart as well. It accepts a restarted queue
+  only when it runs exactly the settings it had before, or exactly the ones
+  being applied.
+- A Save & Apply that fails after it switched the controllers is completed by
+  the same Save & Apply, or finished by Save & Apply with other settings,
+  Stop, Start or a reboot. Settings saved after the failure are kept.
+
+MQTT, measurements and Rating:
+
+- The native MQTT publisher can use TLS (`mqtt_tls`, `mqtt_tls_ca_file`,
+  `mqtt_tls_verify`), on by default for new publishers; a publisher saved
+  without the option stays plain MQTT on upgrade. A publisher that cannot
+  reach its broker retries by itself.
+- The time limits of Speed Test, Rating and Auto-Tune and the freshness of the
+  runtime snapshot follow the boot clock, so a step of the wall clock neither
+  cuts them short nor stretches them.
+- Automatic Rating works on dual-stack routers. Test traffic that the
+  accounting refuses is counted by reason, each with its own code and an
+  explanation in LuCI: `speedtest-accounting-non-ipv4-traffic`,
+  `speedtest-accounting-flow-registration-failed` and
+  `speedtest-accounting-wrong-egress`.
+- Auto-Tune counts only restarts that used traffic against its restart limit.
+
+Backend and build:
+
+- `speedtest-go` 1.7.10-r6 uses the TLS defaults of current Go, is a
+  position-independent executable where Go supports it, and binds its packet
+  loss measurement to the selected source. The Full daemon requires r6.
+- The daemon's direct libc calls go through safe wrappers with a documented
+  reason for every `unsafe` block, and integer overflow checks stay on in the
+  release build.
 
 ## RC27 r320/r128 release notes
 
