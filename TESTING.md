@@ -1115,9 +1115,22 @@ start from `/proc/<pid>/stat`, both in seconds since boot.
 
 ### Known limits
 
-- A reload (Save & Apply) still starts a changed queue with one check; a hotplug
-  restart at that moment can fail the reload. That path is not part of this
-  change.
+- A reload (Save & Apply) is not part of this change. On the VM with this daemon,
+  every reload that changed the managed queue while the hotplug restarted it
+  failed (8 of 8, delays from 0 to 0.75 s: `managed SQM counter ... is missing`,
+  `ingress redirect is not an exact single match`, `Cannot find device
+  "ifb4eth1"`). The next reload of the same configuration completed three of
+  four; the fourth could be finished neither by the next reload nor by `stop`
+  (`SQM runtime state does not match the frozen managed section`,
+  `uci-transaction-recovery-receipt-mismatch`), and the journal of its file
+  transaction outlived a reboot, so all three start attempts at boot failed with
+  `uci-transaction-recovery-pending`. `/etc/init.d/sqm stop`, then `stop` and
+  `start` of the service recovered it. The reload pins every current queue when
+  it begins and attests the pins until it publishes; a hotplug restart replaces
+  the pinned queue, so the reload fails before it reaches its own SQM steps. A
+  change that waited only in those steps did not help on the VM and was
+  withdrawn; tolerating the hotplug needs a decision on what a reload does with
+  a pinned queue that was replaced.
 - A start that fails at boot three times stays stopped until it is started by
   hand; the log says so.
 - A busy global lock during readiness raises no event, so it is retried every
