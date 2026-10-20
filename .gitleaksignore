@@ -12,3 +12,7 @@ fe6140068a51d25184512538a6b36105aa65605a:package/luci-app-cake-autorate-rs/tests
 # Deterministic rpc upload-token fixture in the LuCI candidate test.
 4b0574b20f5bb52c5439aa63831fd83a28957924:package/luci-app-cake-autorate-rs/tests/candidate.test.js:generic-api-key:82
 package/luci-app-cake-autorate-rs/tests/candidate.test.js:generic-api-key:82
+# Deterministic 32-hex rating capture token fixtures in the main.rs tests (boot-clock deadlines).
+d15cdbe3c2b8bf8033ecf866ec519354c36aea7a:package/cake-autorate-rs/src/src/main.rs:generic-api-key:15545
+package/cake-autorate-rs/src/src/main.rs:generic-api-key:15521
+package/cake-autorate-rs/src/src/main.rs:generic-api-key:15633
