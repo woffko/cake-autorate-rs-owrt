@@ -68,7 +68,17 @@ assert.match(helpers.nativeRatingFailureText({ state: 'failed', diagnostic_code:
 	/another interface than the tested uplink.*\(speedtest-accounting-wrong-egress\)$/);
 assert.match(helpers.nativeRatingFailureText({ state: 'failed', diagnostic: 'speedtest-accounting-flow-registration-failed' }),
 	/tracked connection.*\(speedtest-accounting-flow-registration-failed\)$/);
-assert.equal(helpers.nativeRatingFailureText({ state: 'failed', diagnostic_code: 'quiet-window-timeout' }), 'quiet-window-timeout');
+// A rating that found no quiet window names the instance's own window, or the defaults.
+assert.equal(helpers.nativeRatingFailureText({ state: 'failed', diagnostic_code: 'quiet-window-timeout' }),
+	'The link was not quiet for 5 s within 30 s, so the test did not start. Background traffic, ' +
+	'usually from devices on the LAN, stayed above 5% of the CAKE rate in at least one direction. ' +
+	'Nothing was measured or changed; retry when the link is idle. (quiet-window-timeout)');
+assert.match(helpers.nativeRatingFailureText({ state: 'failed', diagnostic: 'quiet-window-timeout' },
+	{ rating_capture_quiet_s: '8', rating_capture_quiet_timeout_s: '120', rating_capture_quiet_ratio: '0.125' }),
+	/^The link was not quiet for 8 s within 120 s, .* above 12\.5% of the CAKE rate .*\(quiet-window-timeout\)$/);
+assert.match(helpers.nativeRatingFailureText({ state: 'failed', diagnostic_code: 'quiet-window-timeout' },
+	{ rating_capture_quiet_s: 'x', rating_capture_quiet_timeout_s: '-1', rating_capture_quiet_ratio: '' }),
+	/^The link was not quiet for 5 s within 30 s, .* above 5% of the CAKE rate /);
 assert.equal(helpers.nativeRatingFailureText({ state: 'failed', diagnostic_code: '__proto__' }), '__proto__');
 assert.equal(helpers.nativeRatingFailureText({ state: 'failed', error: 'boom' }), 'boom');
 assert.equal(helpers.nativeRatingFailureText({ state: 'failed' }), 'Rating capture did not complete.');

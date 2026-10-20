@@ -321,11 +321,25 @@ function nativeRatingStartArgs(section, mode) {
 	return args;
 }
 
+// Get rating waits for a quiet link before the test. The numbers are this
+// instance's quiet-window settings, or their defaults.
+function nativeRatingQuietWindowText(section) {
+	function setting(name, fallback) {
+		var value = Number(section && section[name]);
+		return isFinite(value) && value > 0 ? value : fallback;
+	}
+	return _('The link was not quiet for %d s within %d s, so the test did not start. Background traffic, usually from devices on the LAN, stayed above %s%% of the CAKE rate in at least one direction. Nothing was measured or changed; retry when the link is idle.').format(
+		setting('rating_capture_quiet_s', 5), setting('rating_capture_quiet_timeout_s', 30),
+		String(Math.round(setting('rating_capture_quiet_ratio', 0.05) * 1000) / 10));
+}
+
 // Why a rating stopped. Codes the user can act on get a plain explanation;
 // the code itself stays visible for a report.
-function nativeRatingFailureText(job) {
+function nativeRatingFailureText(job, section) {
 	var code = job && (job.diagnostic_code || job.diagnostic);
 	var explanation = typeof code === 'string' ? cakeUi.accountingFaultMessage(code) : null;
+	if (!explanation && code === 'quiet-window-timeout')
+		explanation = nativeRatingQuietWindowText(section);
 	if (explanation)
 		return _('%s (%s)').format(explanation, code);
 	return (job && (job.diagnostic || job.diagnostic_code || job.error)) ||
@@ -633,7 +647,7 @@ function showQualityTest(section, status, calibrationSummary) {
 				});
 			finish({
 				state: job.state,
-				error: nativeRatingFailureText(job)
+				error: nativeRatingFailureText(job, section)
 			});
 		}).catch(function(error) {
 			finish({ state: 'error', error: error.message || String(error) });
