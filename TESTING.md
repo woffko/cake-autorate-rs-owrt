@@ -6,6 +6,75 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
+## RC27 r321/r129 release acceptance
+
+This summary covers the RC27 r321/r129 release candidate (daemon r321, Full
+LuCI r129, Lite r321/r9, speedtest-go 1.7.10-r6), built from the audit
+follow-up of October 2026. Each change since r320/r128 and its own evidence
+are in the sections "Changes after RC27 r320/r128" below.
+
+### Source gate
+
+Source gate 201 of 58 commands: Full (1,883) and Lite (455) Rust tests,
+formatting, clippy with undocumented `unsafe` blocks denied, LuCI JavaScript
+tests, TypeScript checks, a real-Chromium DOM text-safety test, shell tests,
+real-UCI tests and a hash of all sources before and after the run, which did
+not change.
+
+### Package matrix
+
+The Full and Lite daemon packages and both LuCI packages were built in the
+OpenWrt 25.12 SDK for all 12 ABIs from that source and verified for payload,
+metadata, dependencies and ELF interpreter/ABI, with integer overflow checks
+on in every daemon build; the LuCI payloads are identical across all SDKs.
+`speedtest-go` 1.7.10-r6 (CLI only, with patch 140) was built and verified for
+the same 12 ABIs. Go builds here are not byte-reproducible: the x86_64 backend
+binary of this set differs from the r6 build installed earlier on the test VM
+and on the owner's router from the same source.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+The candidate's own packages were installed over r320/r128 (backend, daemon
+and Full LuCI); the configuration was unchanged.
+
+- Service checks: 33 of 33. Full → Lite → Full replacement with the documented
+  `apk` procedure restored services, UCI, qdiscs and the apk world.
+- Five reboots, each with an SQM hotplug restart during the start: running.
+  Twelve reloads during a hotplug restart: 0 failed. A reload made to fail
+  after its publication was recovered by Save & Apply of the old setting in
+  2.1 s, and after a power cut by the start at boot. A start whose queue lost
+  its ingress redirect failed after its wait; the next start ran.
+- Full Raw Auto-Tune reached Review in 583 s. With the selected server failing
+  (`selected-server`), both directions moved to a backup and the run reached
+  Review in 4 of 5 runs; with the upload search failing (`upload-search`),
+  1 of 2. The 2 other runs, the first two after the 12-ABI build, ended with
+  `owned-traffic-accounting-failed` (the worker's own
+  `speedtest-accounting-timeout`, with the VM's two cores reported under
+  sustained pressure at about 650 Mbit/s). The r320/r128 daemon on the same VM
+  that day reached Review in 3 of 3 `selected-server` runs; the code that reads
+  the accounting, and its time limits, are the same in both releases.
+- Get rating with an emulated dual-stack uplink completed (A+). The three
+  refusals of test traffic, provoked on purpose, each ended with its own code
+  (`speedtest-accounting-non-ipv4-traffic`, `-wrong-egress`,
+  `-flow-registration-failed`), and the VM was restored after each.
+- Speed Test (capped, current topology): completed in 24.5 s.
+
+### Physical routers
+
+Not run for this candidate. Installation on the owner's routers waits for the
+owner's decision.
+
+### Known limits
+
+- Under sustained CPU pressure, an Auto-Tune can fail with
+  `owned-traffic-accounting-failed` when the accounting cannot be read for
+  more than 0.5 s (see above). Nothing is changed on the router; the run can
+  be started again.
+- One first start in 116 failed at the readiness confirmation without a logged
+  reason during the acceptance of the service lifecycle changes (see that
+  section); the second start ran.
+- IPv6-only uplinks are not supported.
+
 ## RC27 r320/r128 release acceptance
 
 This summary covers the RC27 r320/r128 release (daemon r320, Full LuCI r128,
@@ -136,7 +205,7 @@ payloads and the public metadata pass a pinned secret scan.
   real WireGuard or OpenVPN tunnel.
 - Lite was verified on the VM; physical routers ran Full.
 
-## Changes after RC27 r320/r128 (unreleased)
+## Changes after RC27 r320/r128 (in r321/r129)
 
 These results cover the commits made after the r320/r128 release: the server
 switch window, the cap on measurement-basis restarts, strict traffic-rule
@@ -202,7 +271,7 @@ the topology repeat fix described below.
 - Lite and the physical routers were not run for these changes beyond the source
   gate.
 
-## Changes after RC27 r320/r128: operation deadlines and overflow checks (unreleased)
+## Changes after RC27 r320/r128: operation deadlines and overflow checks (in r321/r129)
 
 These results cover the commits that move the time limits of Speed Test, Rating
 and Auto-Tune, and the freshness check of the runtime snapshot, from the wall
@@ -287,7 +356,7 @@ manifest now states the setting; the packages are unchanged.
 - Lite and the physical routers were not run for these changes beyond the source
   gate.
 
-## Changes after RC27 r320/r128: MQTT over TLS (unreleased)
+## Changes after RC27 r320/r128: MQTT over TLS (in r321/r129)
 
 These results cover the commits that add TLS to the native MQTT publisher
 (`mqtt_tls`, `mqtt_tls_ca_file`, `mqtt_tls_verify`), the LuCI settings for it,
@@ -430,7 +499,7 @@ and the publisher keeps retrying.
   changed here.
 - Lite has no MQTT. The physical routers were not run for these changes.
 
-## Changes after RC27 r320/r128: unsafe code (unreleased)
+## Changes after RC27 r320/r128: unsafe code (in r321/r129)
 
 These results cover the commits that put the daemon's direct libc calls behind
 safe wrappers (`src/sys.rs`), write a SAFETY comment for every `unsafe` block
@@ -548,7 +617,7 @@ process whose parent is the controller would remove the first cause.
 - Lite and the physical routers were not run for these changes beyond the source
   gate and the package checks.
 
-## Changes after RC27 r320/r128: speedtest-go r6 (unreleased)
+## Changes after RC27 r320/r128: speedtest-go r6 (in r321/r129)
 
 These results cover the commit that gives the `speedtest-go` backend the TLS
 defaults of current Go and builds it as a position-independent executable
@@ -676,7 +745,7 @@ the same before and after.
   servers of the list the VM sees do; other locations and later lists were not
   checked.
 
-## Changes after RC27 r320/r128: MQTT TLS review fixes (unreleased)
+## Changes after RC27 r320/r128: MQTT TLS review fixes (in r321/r129)
 
 These results cover three fixes found in a review of the MQTT over TLS work: a
 slow broker could stretch the TLS handshake past its limit, a TLS record without
@@ -744,7 +813,7 @@ configuration equal to the original.
   on; the daemon would run plain MQTT for it too.
 - Only x86_64 was run; the AArch64 packages were built and verified.
 
-## Changes after RC27 r320/r128: restart limits and deadline anchors (unreleased)
+## Changes after RC27 r320/r128: restart limits and deadline anchors (in r321/r129)
 
 These results cover two fixes found in a review: the restart limit of an Auto-Tune
 measurement counted restarts that had used no traffic, and a deadline lookup could
@@ -798,7 +867,7 @@ previous one, backend `speedtest-go` r6:
   be bounded?) is unchanged: the duration is counted from admission by design.
 - Only x86_64 was run; the AArch64 packages were built and verified.
 
-## Changes after RC27 r320/r128: clean-up of duplicated code (unreleased)
+## Changes after RC27 r320/r128: clean-up of duplicated code (in r321/r129)
 
 These results cover a clean-up that is meant to change no behaviour: the boot clock
 is read with one system call, the three eventfd drain loops and the two pidfd wait
@@ -857,7 +926,7 @@ r6, installed over the previous build:
   runs exercise.
 - Only x86_64 was run; the AArch64 packages were built and verified.
 
-## Changes after RC27 r320/r128: Automatic Rating on dual-stack routers (unreleased)
+## Changes after RC27 r320/r128: Automatic Rating on dual-stack routers (in r321/r129)
 
 ### The failure
 
@@ -928,7 +997,7 @@ afterwards and its hash checked.
   the `flow_fault` counter of the backend table zero in all six samples taken while
   it ran, limits unchanged.
 
-## Changes after RC27 r320/r128: refusals of test traffic counted by reason (unreleased)
+## Changes after RC27 r320/r128: refusals of test traffic counted by reason (in r321/r129)
 
 A test's traffic is counted in temporary nftables tables, and a packet those
 rules cannot account for is dropped. Until now every such packet went into one
@@ -1004,7 +1073,7 @@ provoked on purpose, and each case put the VM back:
   `owned-traffic-accounting-failed`; the job's log line names the reason.
 - Only x86_64 was run; the AArch64 packages were built and verified.
 
-## Changes after RC27 r320/r128: service start while SQM restarts (unreleased)
+## Changes after RC27 r320/r128: service start while SQM restarts (in r321/r129)
 
 ### The failure
 
@@ -1125,7 +1194,7 @@ start from `/proc/<pid>/stat`, both in seconds since boot.
 - Only x86_64 was run; the AArch64 packages were built and verified. The
   owner's router still runs the release daemon.
 
-## Changes after RC27 r320/r128: Save & Apply while SQM restarts (unreleased)
+## Changes after RC27 r320/r128: Save & Apply while SQM restarts (in r321/r129)
 
 ### The failure
 
@@ -1266,7 +1335,7 @@ Daemon `868cb92a` from gate 197.
 - Only x86_64 was run; the AArch64 packages were built and verified. The
   owner's router still runs the release daemon.
 
-## Changes after RC27 r320/r128: a failed Save & Apply no longer blocks the service (unreleased)
+## Changes after RC27 r320/r128: a failed Save & Apply no longer blocks the service (in r321/r129)
 
 ### The failure
 
