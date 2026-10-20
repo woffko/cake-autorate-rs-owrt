@@ -17,7 +17,9 @@ case "$*" in
 		printf '%b\n' "${CALIBRATION_INIT_PLAN:-cake-autorate-calibration-service\\t1\\tcoordinator}"
 		;;
 	'--calibration-service confirm-started')
+		[ -z "${CALIBRATION_STARTED_ERROR:-}" ] || printf '%s\n' "$CALIBRATION_STARTED_ERROR" >&2
 		printf '%b\n' "${CALIBRATION_STARTED_PLAN:-cake-autorate-calibration-service\\t1\\tready}"
+		exit "${CALIBRATION_STARTED_STATUS:-0}"
 		;;
 	'--calibration-service prepare-stop')
 		[ "${CALIBRATION_STOP_READY_FAIL:-0}" != 1 ] || exit 1
@@ -31,7 +33,17 @@ esac
 EOF
 chmod +x "$daemon"
 
-logger() { :; }
+log="$work/log"
+# `logger -t TAG` reads its lines from stdin; `logger -t TAG MESSAGE` logs one.
+logger() {
+	if [ "$#" -eq 2 ]; then
+		while IFS= read -r line; do
+			printf '%s %s\n' "$2" "$line" >>"$log"
+		done
+	else
+		printf '%s %s\n' "$2" "$3" >>"$log"
+	fi
+}
 procd_open_instance() { printf 'open:%s\n' "$1" >>"$events"; }
 procd_set_param() { printf 'set:%s\n' "$*" >>"$events"; }
 procd_close_instance() { printf 'close\n' >>"$events"; }
@@ -88,11 +100,31 @@ for invalid in \
 done
 
 : >"$events"
+: >"$log"
 service_started
 [ "$(cat "$events")" = 'daemon:--calibration-service confirm-started' ] || {
 	echo 'calibration init did not confirm exact coordinator readiness after procd start' >&2
 	exit 1
 }
+[ ! -s "$log" ] || {
+	echo 'a clean readiness confirmation wrote to the system log' >&2
+	exit 1
+}
+
+: >"$log"
+CALIBRATION_STARTED_ERROR='ERROR: calibration coordinator did not become ready'
+CALIBRATION_STARTED_STATUS=1
+export CALIBRATION_STARTED_ERROR CALIBRATION_STARTED_STATUS
+if service_started >/dev/null 2>&1; then
+	echo 'calibration init accepted a failed readiness confirmation' >&2
+	exit 1
+fi
+[ "$(cat "$log")" = 'cake-autorate-autotune ERROR: calibration coordinator did not become ready
+cake-autorate-autotune native calibration lifecycle readiness confirmation failed' ] || {
+	echo 'calibration init did not log the reason for a failed readiness confirmation' >&2
+	exit 1
+}
+unset CALIBRATION_STARTED_ERROR CALIBRATION_STARTED_STATUS
 
 for invalid in \
 	'cake-autorate-calibration-service\t1\trunning' \

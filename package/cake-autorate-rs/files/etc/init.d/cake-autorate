@@ -398,9 +398,24 @@ start_service_locked() {
 }
 
 service_confirm_started() {
-	local result
+	local output status result
 
-	if ! result="$("$DAEMON" --service-lifecycle confirm-started 2>/dev/null)"; then
+	# The answer is on stdout. stderr names the reason for a refused
+	# confirmation and goes to the system log; the exit status follows the
+	# answer as the last line of the capture.
+	output="$(
+		{
+			{
+				"$DAEMON" --service-lifecycle confirm-started 3>&-
+				printf '%s' "$?"
+			} 2>&1 >&3 3>&- | logger -t cake-autorate
+		} 3>&1
+	)"
+	status="${output##*
+}"
+	result="${output%
+*}"
+	if [ "$status" != 0 ]; then
 		logger -t cake-autorate "native controller lifecycle readiness confirmation failed"
 		return 1
 	fi

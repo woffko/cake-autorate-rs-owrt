@@ -50,10 +50,25 @@ stop_service() {
 }
 
 service_started() {
-	local result expected
+	local output status result expected
 	[ "$CALIBRATION_START_DEFERRED" -eq 0 ] || return 0
 	expected="$(printf 'cake-autorate-calibration-service\t1\tready')"
-	result="$("$DAEMON" --calibration-service confirm-started 2>/dev/null)" || {
+	# The answer is on stdout. stderr names the reason for a refused
+	# confirmation and goes to the system log; the exit status follows the
+	# answer as the last line of the capture.
+	output="$(
+		{
+			{
+				"$DAEMON" --calibration-service confirm-started 3>&-
+				printf '%s' "$?"
+			} 2>&1 >&3 3>&- | logger -t cake-autorate-autotune
+		} 3>&1
+	)"
+	status="${output##*
+}"
+	result="${output%
+*}"
+	[ "$status" = 0 ] || {
 		logger -t cake-autorate-autotune "native calibration lifecycle readiness confirmation failed"
 		return 1
 	}
