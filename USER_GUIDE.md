@@ -89,6 +89,14 @@ job and worker identity, while closing during an in-flight Start receipt still
 cancels the exact admitted job. Raw lease/debug identities are never shown to
 the user.
 
+Before the test, Get rating waits for a quiet link: by default 5 seconds in a
+row within 30 seconds, with background traffic below 5% of the CAKE rate in
+each direction. When devices on the LAN keep the uplink busy, the rating stops
+with `quiet-window-timeout` before it measures anything, and nothing is
+changed; retry when the link is idle. The window, the timeout and the allowed
+share are the instance's **Pre-test quiet window**, **Quiet-window timeout**
+and **Allowed background ratio** settings.
+
 [![Get rating dialog in guided client-capture mode](docs/screenshots/rating-guided.png)](docs/screenshots/rating-guided.png)
 
 ## Graphs
