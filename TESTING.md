@@ -6,6 +6,28 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
+## Changes after RC27 r321/r129: refused readiness confirmations are logged (unreleased)
+
+After `procd` starts the controllers or the calibration coordinator, the init
+script asks the daemon to confirm that they are ready. The daemon names the
+reason for a refusal on stderr, and the init scripts discarded it, so the
+system log only said that the confirmation failed. One first start in 116
+during the acceptance of r321 failed that way, and its reason could not be
+recovered. Both init scripts now pass that stderr to the system log under
+their own tag (`cake-autorate`, `cake-autorate-autotune`), before the existing
+summary line; the answer on stdout and the exit status are checked as before.
+
+- Shell tests (`init-lite-readiness`, `calibration-init`), under `dash` and
+  BusyBox `ash`: a refusal logs its reason and the summary, a warning on a
+  successful confirmation is logged, a valid answer with a failed exit status
+  is refused, and a clean confirmation writes nothing to the log. Restoring
+  the old `2>/dev/null` or ignoring the exit status makes them fail.
+- VM (r321, the new Full init function run beside the installed one): with the
+  service running the confirmation passed and logged nothing; with the service
+  stopped it was refused after its wait and the log showed
+  `cake-autorate: ERROR: controller service did not become ready: expected 1
+  controllers but observed 0`, then the summary line.
+
 ## RC27 r321/r129 release acceptance
 
 This summary covers the RC27 r321/r129 release candidate (daemon r321, Full
@@ -61,8 +83,22 @@ and Full LuCI); the configuration was unchanged.
 
 ### Physical routers
 
-Not run for this candidate. Installation on the owner's routers waits for the
-owner's decision.
+After the publication, the release packages (backend, daemon, Full LuCI) were
+installed on the owner's three routers, each in one `apk` transaction with the
+previous set staged for a rollback that was not needed: two x86_64 routers,
+one from r320/r128 and one from r318/r127 with `speedtest-go` r1, and one
+aarch64_generic router from r320/r128. On each, the configuration, the boot
+and the pending UCI changes were unchanged, the installed binaries were the
+published ones, and every controller was back in its earlier state within
+180 s. The step from r318/r127 was repeated on the VM afterwards and passed
+the same checks.
+
+- A later reboot of one x86_64 router, with SQM restarting during the start
+  and the PPPoE uplink coming up after it: the deferred controller started
+  when its interface came up; the service was running.
+- Get rating on that router stopped twice with `quiet-window-timeout` before
+  any measurement: a LAN client was uploading in bursts of 145–190 Mbit/s
+  every few seconds against a quiet limit of about 45 Mbit/s.
 
 ### Known limits
 
