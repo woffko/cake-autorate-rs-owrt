@@ -42,6 +42,15 @@ pub(crate) struct Startup {
     name: String,
 }
 
+impl Drop for Startup {
+    /// Refuse later receipts at once: a child that got a copy of the
+    /// descriptor between fork and exec would otherwise keep the name bound
+    /// and accepting until it execs.
+    fn drop(&mut self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Read);
+    }
+}
+
 impl Startup {
     pub(crate) fn new() -> Result<Self, String> {
         let nonce = read_kernel_uuid(

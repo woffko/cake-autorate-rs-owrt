@@ -151,6 +151,9 @@ struct Workspace {
     delta: Directory,
     overrides: Directory,
     lock: File,
+    /// A copy of the lock went to a process tree that keeps the alias
+    /// namespace locked after this value is gone (`retain_alias_lease`).
+    lent: std::cell::Cell<bool>,
 }
 impl Workspace {
     fn copy_and_query(
@@ -229,6 +232,7 @@ impl Workspace {
             delta,
             overrides,
             lock,
+            lent: std::cell::Cell::new(false),
         };
         workspace.cleanup_copies()?;
         workspace.attest()?;
@@ -266,6 +270,12 @@ impl Workspace {
 impl Drop for Workspace {
     fn drop(&mut self) {
         let _ = self.cleanup_copies();
+        // Unlock before the close, unless a lent copy must keep the lock: a
+        // child that got a copy between fork and exec would otherwise keep
+        // it until it execs.
+        if !self.lent.get() {
+            let _ = sys::flock(&self.lock, libc::LOCK_UN);
+        }
     }
 }
 
@@ -383,6 +393,7 @@ impl PreparedConfig {
     }
     pub(super) fn retain_alias_lease(&self) -> Result<File> {
         self.attest_private()?;
+        self.original.workspace.lent.set(true);
         io(self.original.workspace.lock.try_clone())
     }
 }
@@ -461,6 +472,7 @@ impl SqmAliasConfig for FrozenSqmAlias {
     }
     fn retain_alias_lease(&self) -> Result<File> {
         self.sqm_runner_alias()?;
+        self.workspace.lent.set(true);
         io(self.workspace.lock.try_clone())
     }
 }
@@ -1413,9 +1425,23 @@ mod tests {
         );
         let (directory, name) = frozen.sqm_runner_alias().unwrap();
         assert!(!directory.join("sqm").exists());
+        // The copy lent to an SQM process tree keeps the workspace locked
+        // after the frozen view is gone: a live helper keeps its alias.
+        let lease = frozen.retain_alias_lease().unwrap();
         fs::write(directory.join(name), b"changed alias").unwrap();
         assert!(frozen.sqm_runner_alias().is_err());
         drop(frozen);
+        assert_eq!(
+            fixture.capture().err().unwrap(),
+            "committed-uci-workspace-busy"
+        );
+        drop(lease);
+        // Free again: the next capture takes the lock and stops only at the
+        // changed alias above, which is never unlinked.
+        assert_eq!(
+            fixture.capture().err().unwrap(),
+            "committed-uci-unowned-copy"
+        );
         for dir in [&global, &rpcd] {
             assert_eq!(
                 fs::read_to_string(dir.join("cake-autorate")).unwrap(),

@@ -116,7 +116,7 @@ fn inventory(directory: &Directory) -> Result<(usize, u64)> {
     directory.attest()?;
     Ok((count, bytes))
 }
-fn lock_store(root: &Path) -> Result<(Directory, File)> {
+fn lock_store(root: &Path) -> Result<(Directory, sys::LockedFile)> {
     let directory = Directory::open(root, true, true)?;
     let lock = io(OpenOptions::new()
         .read(true)
@@ -129,9 +129,8 @@ fn lock_store(root: &Path) -> Result<(Directory, File)> {
     if super::committed_uci::file_identity(&root.join("lock"), &lock, true)?.len != 0 {
         return Err("controller-input-lock-invalid".into());
     }
-    if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-        return Err("controller-input-store-busy".into());
-    }
+    let lock = sys::LockedFile::lock(lock, libc::LOCK_EX | libc::LOCK_NB)
+        .map_err(|_| "controller-input-store-busy")?;
     inventory(&directory)?;
     Ok((directory, lock))
 }

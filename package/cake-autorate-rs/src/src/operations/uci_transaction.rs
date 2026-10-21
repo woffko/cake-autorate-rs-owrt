@@ -211,7 +211,7 @@ fn read_receipt(directory: &Directory, name: &str) -> Result<Value> {
 struct Root {
     config: Directory,
     root: Directory,
-    lock: File,
+    lock: sys::LockedFile,
 }
 impl Root {
     fn open(config: &Path) -> Result<Self> {
@@ -228,9 +228,8 @@ impl Root {
         if file_identity(&root.path.join("lock"), &lock, true)?.len != 0 {
             return Err("uci-transaction-lock-invalid".into());
         }
-        if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-            return Err("uci-transaction-busy".into());
-        }
+        let lock = sys::LockedFile::lock(lock, libc::LOCK_EX | libc::LOCK_NB)
+            .map_err(|_| "uci-transaction-busy")?;
         let result = Self { config, root, lock };
         result.attest()?;
         result.clean_retired()?;
@@ -446,7 +445,7 @@ impl Journal {
             changed,
         })
     }
-    fn lock_sources(&self) -> Result<Vec<File>> {
+    fn lock_sources(&self) -> Result<Vec<sys::LockedFile>> {
         self.root.attest()?;
         let deadline = std::time::Instant::now() + SOURCE_LOCK_WAIT;
         let mut files = Vec::new();
@@ -464,7 +463,7 @@ impl Journal {
                     Err(_) => return Err("uci-transaction-source-busy".into()),
                 }
             }
-            files.push(file);
+            files.push(sys::LockedFile::held(file));
         }
         Ok(files)
     }

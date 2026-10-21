@@ -4458,7 +4458,7 @@ impl BootstrapRuntimeOwnerClaim {
 }
 
 struct BootstrapRuntimeOwnerLock {
-    _file: File,
+    _file: sys::LockedFile,
 }
 
 impl BootstrapRuntimeOwnerLock {
@@ -4484,7 +4484,9 @@ impl BootstrapRuntimeOwnerLock {
         }
         loop {
             let Err(error) = sys::flock(&file, libc::LOCK_EX) else {
-                return Ok(Self { _file: file });
+                return Ok(Self {
+                    _file: sys::LockedFile::held(file),
+                });
             };
             if error.kind() == std::io::ErrorKind::Interrupted {
                 if terminate.load(Ordering::SeqCst) {

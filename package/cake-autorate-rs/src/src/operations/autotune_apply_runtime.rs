@@ -57,14 +57,17 @@ impl NativeApplyGlobalLockAcquireError {
     }
 }
 
+/// Not a `sys::LockedFile`: its open file description is lent to one direct
+/// init-script command as FD 8 (`configure_borrowed_restart`), and anything
+/// that command leaves holding it must keep the lock, not lose it on drop.
 #[derive(Debug)]
 pub(crate) struct NativeApplyGlobalLock {
     file: File,
 }
 
 pub(super) struct NativeApplyConfigPairLock {
-    _cake: File,
-    _sqm: File,
+    _cake: sys::LockedFile,
+    _sqm: sys::LockedFile,
 }
 
 impl NativeApplyConfigPairLock {
@@ -78,7 +81,7 @@ impl NativeApplyConfigPairLock {
     }
 }
 
-fn lock_config_file(path: &Path, label: &str) -> Result<File, String> {
+fn lock_config_file(path: &Path, label: &str) -> Result<sys::LockedFile, String> {
     let before = strict_regular_metadata(path, label)?;
     let file = OpenOptions::new()
         .read(true)
@@ -109,6 +112,7 @@ fn lock_config_file(path: &Path, label: &str) -> Result<File, String> {
             ))
         };
     }
+    let file = sys::LockedFile::held(file);
     let live = strict_regular_metadata(path, label)?;
     if live.dev() != opened.dev() || live.ino() != opened.ino() {
         return Err(format!(

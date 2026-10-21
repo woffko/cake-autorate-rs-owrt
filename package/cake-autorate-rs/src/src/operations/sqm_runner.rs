@@ -176,6 +176,7 @@ impl Profile {
             parent,
             workspace,
             lock,
+            lent: std::cell::Cell::new(false),
             file,
             identity,
             sha256: digest(&bytes),
@@ -229,9 +230,7 @@ pub(crate) fn ensure_idle(runtime_root: &Path) -> Result<()> {
         return Ok(());
     }
     let (_, lock, _) = read_file(&path.join("lock"), 0, true)?;
-    if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-        return Err(BUSY.into());
-    }
+    let _lock = sys::LockedFile::lock(lock, libc::LOCK_EX | libc::LOCK_NB).map_err(|_| BUSY)?;
     if directory.names()?.iter().any(|name| name == "current") {
         let (bytes, _, _) =
             read_file(&path.join("current"), MAX_SCRIPT + MAGIC.len() as u64, true)?;
@@ -248,6 +247,9 @@ pub(crate) struct Runner<'a> {
     parent: Directory,
     workspace: Directory,
     lock: File,
+    /// Copies of the lock went to an SQM process tree that keeps the
+    /// namespace locked after this runner is gone.
+    lent: std::cell::Cell<bool>,
     file: File,
     identity: Identity,
     sha256: String,
@@ -326,6 +328,7 @@ impl Runner<'_> {
                 .map_err(|_| "isolated-sqm-runner-lease-dup-failed".into())
         }
         let alias_lock = high_fd(&alias_lock)?;
+        self.lent.set(true);
         let runner_lock = high_fd(&self.lock)?;
         let result = run_bounded_command_output_with_input(
             &command,
@@ -372,6 +375,12 @@ impl Drop for Runner<'_> {
             && file_identity(&path, &self.file, true).ok().as_ref() == Some(&self.identity)
         {
             let _ = fs::remove_file(path);
+        }
+        // Unlock before the close, unless a lent copy must keep the lock: a
+        // child that got a copy between fork and exec would otherwise keep
+        // it until it execs.
+        if !self.lent.get() {
+            let _ = sys::flock(&self.lock, libc::LOCK_UN);
         }
     }
 }

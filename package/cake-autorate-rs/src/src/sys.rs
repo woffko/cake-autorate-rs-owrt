@@ -94,6 +94,40 @@ pub(crate) fn flock(file: impl AsFd, operation: libc::c_int) -> io::Result<()> {
     check(unsafe { libc::flock(file.as_fd().as_raw_fd(), operation) })
 }
 
+/// A file whose `flock(2)` lock this value holds. Drop unlocks the open file
+/// description before the file is closed: a child process that got a copy of
+/// the descriptor between fork and exec would otherwise keep the lock until it
+/// execs or exits, and the next owner would find it busy.
+#[derive(Debug)]
+pub(crate) struct LockedFile(std::fs::File);
+
+impl LockedFile {
+    /// Takes `operation` (`LOCK_EX` or `LOCK_SH`, with or without `LOCK_NB`).
+    pub(crate) fn lock(file: std::fs::File, operation: libc::c_int) -> io::Result<Self> {
+        flock(&file, operation)?;
+        Ok(Self(file))
+    }
+
+    /// Takes over the lock the caller has just taken on `file`.
+    pub(crate) fn held(file: std::fs::File) -> Self {
+        Self(file)
+    }
+}
+
+impl std::ops::Deref for LockedFile {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &std::fs::File {
+        &self.0
+    }
+}
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        let _ = flock(&self.0, libc::LOCK_UN);
+    }
+}
+
 /// Milliseconds on the kernel boot clock (`CLOCK_BOOTTIME`): the clock behind
 /// `/proc/uptime`, which keeps counting through a suspend and which a step of
 /// the wall clock never moves. One system call, no file to open or parse.
@@ -520,6 +554,36 @@ mod tests {
         flock(&second, libc::LOCK_SH | libc::LOCK_NB).unwrap();
         flock(&first, libc::LOCK_SH | libc::LOCK_NB).unwrap();
         assert!(flock(&first, libc::LOCK_EX | libc::LOCK_NB).is_err());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A copy of the descriptor (what a child holds between fork and exec)
+    /// keeps a lock held after a plain close, but not after LockedFile drops.
+    #[test]
+    fn a_locked_file_releases_its_lock_while_a_copy_of_the_descriptor_lives() {
+        let directory = scratch("locked-file");
+        let path = directory.join("lock");
+        let open = || {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        let plain = open();
+        flock(&plain, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let copy = plain.try_clone().unwrap();
+        drop(plain);
+        assert!(flock(open(), libc::LOCK_EX | libc::LOCK_NB).is_err());
+        drop(copy);
+
+        let locked = LockedFile::lock(open(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let copy = locked.try_clone().unwrap();
+        assert!(LockedFile::lock(open(), libc::LOCK_EX | libc::LOCK_NB).is_err());
+        drop(locked);
+        drop(LockedFile::lock(open(), libc::LOCK_EX | libc::LOCK_NB).unwrap());
+        drop(copy);
         fs::remove_dir_all(&directory).unwrap();
     }
 

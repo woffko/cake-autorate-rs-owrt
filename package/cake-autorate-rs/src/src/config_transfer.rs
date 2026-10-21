@@ -122,7 +122,7 @@ impl Record {
 
 struct Store {
     root: PathBuf,
-    _lock: File,
+    _lock: sys::LockedFile,
     now: u64,
 }
 impl Store {
@@ -161,9 +161,8 @@ impl Store {
         if io(lock.metadata())?.len() != 0 {
             return Err("candidate-storage-lock-unsafe");
         }
-        if sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-            return Err("candidate-storage-busy");
-        }
+        let lock = sys::LockedFile::lock(lock, libc::LOCK_EX | libc::LOCK_NB)
+            .map_err(|_| "candidate-storage-busy")?;
         attest(&lock_path, &lock)?;
         Ok(Self {
             root,

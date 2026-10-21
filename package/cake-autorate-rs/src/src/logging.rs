@@ -179,7 +179,7 @@ pub(crate) struct LogFile {
     path: PathBuf,
     previous: PathBuf,
     temporary: PathBuf,
-    _namespace_lock: File,
+    _namespace_lock: sys::LockedFile,
     legacy_entries: Option<fs::ReadDir>,
     file: BufWriter<File>,
     active_missing_after_rotation: bool,
@@ -219,7 +219,7 @@ impl LogFile {
         if lock.metadata()?.len() != 0 {
             return Err(invalid("nonempty file occupies log lock path"));
         }
-        sys::flock(&lock, libc::LOCK_EX | libc::LOCK_NB)?;
+        let lock = sys::LockedFile::lock(lock, libc::LOCK_EX | libc::LOCK_NB)?;
         lock.set_permissions(fs::Permissions::from_mode(0o600))?;
         let previous = sibling(&path, ".old")?;
         let temporary = sibling(&path, ".tmp")?;

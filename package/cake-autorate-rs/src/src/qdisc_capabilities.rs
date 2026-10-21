@@ -81,7 +81,7 @@ fn small(path: &Path, maximum: usize) -> Result<String> {
 struct Files {
     root: PathBuf,
     directory: File,
-    guard: File,
+    guard: sys::LockedFile,
 }
 impl Files {
     fn open(path: &Path, create: bool) -> Result<Self> {
@@ -130,9 +130,8 @@ impl Files {
         {
             return Err("qdisc-capability-lock-unsafe".into());
         }
-        if sys::flock(&guard, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-            return Err("qdisc-capability-busy".into());
-        }
+        let guard = sys::LockedFile::lock(guard, libc::LOCK_EX | libc::LOCK_NB)
+            .map_err(|_| "qdisc-capability-busy")?;
         let files = Self {
             root,
             directory,

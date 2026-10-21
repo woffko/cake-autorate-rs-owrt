@@ -152,6 +152,14 @@ pub(crate) struct ProbeGroupLease {
     owner_uid: u32,
 }
 
+impl Drop for ProbeGroupLease {
+    /// Unlock before the close: a child that got a copy of the descriptor
+    /// between fork and exec would otherwise keep the fence until it execs.
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 fn valid_generation(generation: &str) -> bool {
     generation.len() == 64
         && generation
