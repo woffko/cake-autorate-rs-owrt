@@ -38,7 +38,7 @@ no build used was removed, and helpers only tests use are under `cfg(test)`;
 the Full build has no warnings, clippy `--all-targets` went from 285 to 231
 (Lite still warns about code only Full uses).
 
-**Not changed (owner decision).** The daemon's UCI reads were to be isolated
+**Not changed (owner decision, kept as is).** The daemon's UCI reads were to be isolated
 from changes staged with `uci set`. The proposed flags do not do that: the
 `uci` command line has no option that drops /tmp/.uci from the change search
 path (`-t` and `-P` only add or move the save directory; checked with the SDK
