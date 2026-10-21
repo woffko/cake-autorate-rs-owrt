@@ -559,6 +559,21 @@ mod tests {
             &root.join("sys"),
         )
         .unwrap();
+        // A child forked by a parallel test can hold a copy of a file just
+        // written until it execs, which delays that file's IN_CLOSE_WRITE:
+        // let an owned write's events settle before asserting silence.
+        let settle = |events: &mut SqmStartEvents| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut quiet = 0;
+            while quiet < 3 && std::time::Instant::now() < deadline {
+                quiet = if events.drain().unwrap() {
+                    0
+                } else {
+                    quiet + 1
+                };
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
         assert!(!events.drain().unwrap());
         fs::write(root.join("unrelated"), b"foreign").unwrap();
         assert!(!events.drain().unwrap());
@@ -569,9 +584,10 @@ mod tests {
         assert!(!events.drain().unwrap());
         fs::write(&file, b"owned").unwrap();
         assert!(events.drain().unwrap());
-        assert!(!events.drain().unwrap());
+        settle(&mut events);
         fs::write(config.join("sqm"), b"source change").unwrap();
         assert!(events.drain().unwrap());
+        settle(&mut events);
         fs::write(state.join("temporary"), b"replacement").unwrap();
         assert!(!events.drain().unwrap());
         fs::rename(state.join("temporary"), &file).unwrap();

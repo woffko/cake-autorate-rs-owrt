@@ -17960,8 +17960,9 @@ esac\n",
             let _resource = resource;
             let _requests = request_rx;
             let _results = result_tx;
-            // A bounded stand-in for an already-running network operation.
-            let _ = wait_for_release.recv_timeout(Duration::from_secs(2));
+            // A bounded stand-in for an already-running network operation,
+            // released explicitly below; the bound outlasts a slow machine.
+            let _ = wait_for_release.recv_timeout(Duration::from_secs(30));
         });
         let runtime = TransportProbeRuntime::from_worker(
             &Config::defaults("fixture".into()),
@@ -17988,7 +17989,7 @@ esac\n",
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
         ));
         release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !runtime.finish_stop() {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
@@ -18025,9 +18026,11 @@ esac\n",
         let (requests, request_rx) = mpsc::sync_channel(1);
         let (result_tx, results) = mpsc::channel();
         let (release, wait) = mpsc::sync_channel(1);
+        // Released explicitly below; the timeout only bounds a failed test
+        // and must outlast a slow machine running the tests in parallel.
         let worker = std::thread::spawn(move || {
             let _owned = (request_rx, result_tx);
-            let _ = wait.recv_timeout(Duration::from_secs(2));
+            let _ = wait.recv_timeout(Duration::from_secs(30));
         });
         let mut active = Some(TransportProbeRuntime::from_worker(
             &Config::defaults("fixture".into()),
@@ -18048,7 +18051,7 @@ esac\n",
         assert!(fence.blocks_capture(&capture));
         assert!(!store.request_probe_retirement(&record).unwrap());
         release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while fence.blocks_probes() {
             assert!(Instant::now() < deadline);
             fence.poll(&store, &mut active, &mut stopping).unwrap();

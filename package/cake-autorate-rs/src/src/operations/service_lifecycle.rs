@@ -8588,12 +8588,20 @@ fi
     }
 
     /// Controller readiness stops on the process-wide TERMINATE flag, which
-    /// some controller tests in main.rs raise for a moment while they hold
-    /// this lock.
-    fn terminate_flag_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::tests::HELPER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// some controller tests in main.rs (Full only) raise for a moment while
+    /// they hold this lock.
+    #[cfg(feature = "calibration")]
+    fn terminate_flag_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+        Some(
+            crate::tests::HELPER_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    #[cfg(not(feature = "calibration"))]
+    fn terminate_flag_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+        None
     }
 
     #[test]

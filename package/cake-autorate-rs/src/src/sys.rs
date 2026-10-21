@@ -576,6 +576,9 @@ mod tests {
         let copy = plain.try_clone().unwrap();
         drop(plain);
         assert!(flock(open(), libc::LOCK_EX | libc::LOCK_NB).is_err());
+        // Explicitly: a copy of it in a child forked by a parallel test
+        // would otherwise keep it busy, as above.
+        flock(&copy, libc::LOCK_UN).unwrap();
         drop(copy);
 
         let locked = LockedFile::lock(open(), libc::LOCK_EX | libc::LOCK_NB).unwrap();

@@ -6964,7 +6964,8 @@ mod tests {
         let worker = thread::spawn(move || {
             let _guard = BootstrapTransportWakeGuard(worker_wake);
             ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            // Released explicitly; the bound outlasts a slow machine.
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
         });
         ready_rx.recv().unwrap();
         let transport = BootstrapTransportRuntime {
