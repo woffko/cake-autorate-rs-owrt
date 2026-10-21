@@ -748,43 +748,11 @@ fn uci_scalar<'a>(text: &'a str, key: &str) -> Result<&'a str, String> {
     Ok(value)
 }
 
+/// Lowercase hex SHA-256 of `input`, the text `sha256sum` printed when it
+/// computed this (the digests are kept in fingerprints and manifests).
 pub(crate) fn sha256sum(input: &[u8]) -> Result<String, String> {
-    let mut child = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("failed to execute sha256sum: {error}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "sha256sum stdin is unavailable".to_string())?
-        .write_all(input)
-        .map_err(|error| format!("failed to write SQM identity to sha256sum: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to reap sha256sum: {error}"))?;
-    if !output.status.success() || output.stdout.len() > 256 {
-        return Err("sha256sum failed while computing SQM identity".to_string());
-    }
-    parse_sha256sum(&output.stdout)
-}
-
-fn parse_sha256sum(output: &[u8]) -> Result<String, String> {
-    let text = std::str::from_utf8(output)
-        .map_err(|_| "sha256sum output is not valid UTF-8".to_string())?;
-    let digest = text
-        .split_ascii_whitespace()
-        .next()
-        .ok_or_else(|| "sha256sum output is empty".to_string())?;
-    if digest.len() != 64
-        || digest
-            .bytes()
-            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
-    {
-        return Err("sha256sum returned an invalid digest".to_string());
-    }
-    Ok(digest.to_string())
+    use sha2::{Digest, Sha256};
+    Ok(format!("{:x}", Sha256::digest(input)))
 }
 
 #[cfg(test)]
@@ -816,14 +784,15 @@ mod tests {
         assert!(validate_uci_section("wan.sqm").is_err());
         assert!(canonicalize_uci_show(b"").is_err());
         assert!(canonicalize_uci_show(b"sqm.wan=x\0bad\n").is_err());
+        // The text sha256sum printed: lowercase hex of the standard vectors.
         assert_eq!(
-            parse_sha256sum(
-                b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  -\n"
-            )
-            .unwrap(),
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            sha256sum(b"").unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-        assert!(parse_sha256sum(b"ABC\n").is_err());
+        assert_eq!(
+            sha256sum(b"abc").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
