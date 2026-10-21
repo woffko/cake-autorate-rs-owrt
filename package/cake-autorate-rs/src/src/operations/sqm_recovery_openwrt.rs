@@ -662,30 +662,6 @@ pub(crate) fn attest_managed_sqm(
     attest_managed_sqm_with_paths(spec, &OpenWrtPaths::from_environment())
 }
 
-/// Attest a just-started managed SQM runtime while the caller already owns the
-/// global lifecycle mutation lock.  Acquiring that lock again would deadlock;
-/// every other proof performed by the ordinary attestor remains mandatory.
-#[cfg(feature = "calibration")]
-pub(crate) fn attest_managed_sqm_after_service_action(
-    spec: &ManagedSqmAttestationSpec,
-) -> Result<(), NativeSqmAttestationError> {
-    attest_managed_sqm_after_service_action_with_paths(spec, &OpenWrtPaths::from_environment())
-}
-
-/// Attest the ordinary service-start postcondition. A configured controller
-/// whose exact upload/target interface is currently absent may be deferred to
-/// hotplug, but only after its surviving download IFB/state is proven exact or
-/// the entire managed runtime is proven absent. The strict online attestor
-/// above remains unchanged for every caller that requires a live SQM runtime.
-pub(crate) fn attest_managed_sqm_after_service_action_or_offline(
-    spec: &ManagedSqmAttestationSpec,
-) -> Result<bool, NativeSqmAttestationError> {
-    attest_managed_sqm_after_service_action_or_offline_with_paths(
-        spec,
-        &OpenWrtPaths::from_environment(),
-    )
-}
-
 fn published_sections(
     spec: &ManagedSqmAttestationSpec,
     published: &PublishedConfig,
@@ -1095,6 +1071,7 @@ fn attest_managed_sqm_with_paths(
     attest_prepared_managed_sqm(spec, paths, &prepared)
 }
 
+#[cfg(test)]
 fn attest_managed_sqm_after_service_action_with_paths(
     spec: &ManagedSqmAttestationSpec,
     paths: &OpenWrtPaths,
@@ -1122,6 +1099,7 @@ fn attest_managed_sqm_after_service_action_with_paths(
     validate_configuration_unchanged(spec, paths, &snapshot)
 }
 
+#[cfg(test)]
 fn attest_managed_sqm_after_service_action_or_offline_with_paths(
     spec: &ManagedSqmAttestationSpec,
     paths: &OpenWrtPaths,

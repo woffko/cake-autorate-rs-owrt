@@ -1830,6 +1830,7 @@ impl Loaded {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn store(
     published: &PublishedConfig,
     instance: &str,

@@ -15,14 +15,16 @@ use super::autotune_apply::{
     NativeRawFallbackApplyManifestInput, NativeShapedCapacityFallbackApplyManifestInput,
     NativeSqmDirectionMode, MAX_NATIVE_APPLY_MANIFEST_BYTES,
 };
+#[cfg(test)]
 use super::autotune_apply_openwrt::validate_bootstrap_request_baseline;
 use super::autotune_public::{
     canonical_native_public_result_bytes, NativeArtifactKind, NativePublicApplyConfirmation,
     NativePublicResultInput, VerifiedNativeArtifact,
 };
+#[cfg(test)]
+use super::autotune_runtime::RuntimeQdiscKind;
 use super::autotune_runtime::{
-    AutotuneRuntimePermit, RuntimeBaseline, RuntimeQdiscKind, RuntimeRateBounds,
-    TemporaryTopologyStage,
+    AutotuneRuntimePermit, RuntimeBaseline, RuntimeRateBounds, TemporaryTopologyStage,
 };
 use super::autotune_runtime_store::{RuntimeOverrideCheckpoint, RuntimeOverrideStore};
 use super::deadline::{self, OperationDeadline};

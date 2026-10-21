@@ -32,7 +32,9 @@ use crate::sys;
 use crate::Config;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
@@ -279,6 +281,8 @@ impl SpeedtestQualificationRejection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CakeCounterKind {
     Cake,
+    /// Auto-Tune counts its own temporary qdiscs, which are plain cake.
+    #[cfg(test)]
     CakeMq,
 }
 
@@ -286,6 +290,7 @@ impl CakeCounterKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Cake => "cake",
+            #[cfg(test)]
             Self::CakeMq => "cake_mq",
         }
     }

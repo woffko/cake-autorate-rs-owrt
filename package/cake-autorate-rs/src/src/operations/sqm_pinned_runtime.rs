@@ -236,12 +236,7 @@ impl PinnedSqm {
             Inspection::Lifecycle(lease),
         )
     }
-    pub(crate) fn capture(
-        source: &ManagedSqmStopSpec,
-        input: &super::super::controller_input::Loaded,
-    ) -> Result<Self, NativeSqmAttestationError> {
-        Self::capture_with_paths(source, input, &OpenWrtPaths::from_environment())
-    }
+    #[cfg(test)]
     pub(super) fn capture_with_paths(
         source: &ManagedSqmStopSpec,
         input: &super::super::controller_input::Loaded,

@@ -6,7 +6,7 @@
 //! never construct a shell command.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::process::{Command, Stdio};
 
 const MAX_UCI_SHOW_BYTES: usize = 64 * 1024;

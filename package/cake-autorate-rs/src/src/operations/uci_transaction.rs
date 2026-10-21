@@ -828,6 +828,7 @@ pub(crate) struct PublishedConfig {
     journal: Option<Journal>,
     source: SourceReceipt,
 }
+#[cfg(test)]
 pub(crate) struct CommittedConfig {
     config: PreparedConfig,
     versions: [Version; 2],
@@ -922,6 +923,7 @@ impl SourceReceipt {
         directory.attest()
     }
 }
+#[cfg(test)]
 impl CommittedConfig {
     pub(crate) fn config(&self) -> &PreparedConfig {
         &self.config
@@ -970,6 +972,7 @@ impl PublishedConfig {
             None => self.config.attest(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn accept(self) -> Result<CommittedConfig> {
         self.attest()?;
         if let Some(journal) = self.journal {
@@ -1084,6 +1087,7 @@ pub(crate) fn recover(config_dir: &Path) -> Result<()> {
 /// Return the original verified source authority after rollback, never a new
 /// capture of arbitrary current files. The caller retains the batch until all
 /// source/runtime checks and registry retirement have completed.
+#[cfg(test)]
 pub(crate) fn recover_fenced(
     config_dir: &Path,
     expected: Option<&SourceReceipt>,
@@ -1118,6 +1122,7 @@ pub(crate) fn recovery_pending(config_dir: &Path) -> Result<bool> {
     exists(&root, "pending")
 }
 
+#[cfg(test)]
 pub(crate) fn recover_checked(
     config_dir: &Path,
     expected: Option<&SourceReceipt>,

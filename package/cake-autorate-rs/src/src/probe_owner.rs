@@ -655,6 +655,7 @@ impl ProbeGroupPool {
         Ok(Self { gids })
     }
 
+    #[cfg(test)]
     pub(crate) fn gid(&self, slot: usize) -> Option<u32> {
         self.gids.get(slot).copied()
     }
