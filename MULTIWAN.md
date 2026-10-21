@@ -98,6 +98,8 @@ operations are refused, never retried with the system resolver. Scheduled
 calibration reads the same route fields and passes the same launch authority;
 an incomplete route or missing `route_dns_ipv4` is reported as a scheduler
 configuration issue for that instance and no run starts.
+Get rating runs on main or mwan3 routing only; for an instance with an
+explicit route its dialog says so and offers no Start.
 These checks do not implement a general device/PBR mode or IPv6-only support.
 
 For `mwan3`, route discovery requires an unambiguous pair of unconditional
