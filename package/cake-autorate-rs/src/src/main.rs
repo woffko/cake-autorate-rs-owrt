@@ -15466,7 +15466,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    pub(super) static HELPER_TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static HELPER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn scheduler_status_usage_is_an_exact_zero_argument_batch_contract() {

@@ -366,6 +366,9 @@ mod timer_ownership_tests {
             }
             "process" => vec![
                 "thread::sleep(WAIT_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));",
+                // Polling: a forked child's exec drops its copy of a just
+                // written program without an event (bounded, ETXTBSY only).
+                "thread::sleep(TEXT_BUSY_RETRY);",
             ],
             "sqm_recovery_openwrt" => vec![
                 "thread::sleep(PROCESS_WAIT_INTERVAL.min(deadline.saturating_duration_since(now)));",

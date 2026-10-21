@@ -5416,6 +5416,7 @@ mod tests {
     #[test]
     #[ignore = "requires explicit inspected SDK UCI and loader paths"]
     fn r4_start_candidate_real_uci_presets_projection_and_transaction_rollback() {
+        let _terminate = terminate_flag_guard();
         let root = test_root("start-candidate-real");
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
@@ -6404,6 +6405,7 @@ mod tests {
 
     #[test]
     fn r4_source_handoff_environment_is_bounded_and_non_secret() {
+        let _terminate = terminate_flag_guard();
         use std::ffi::OsStr;
         assert!(source_id_value(OsStr::new("")).unwrap().is_none());
         assert_eq!(
@@ -8585,6 +8587,15 @@ fi
         assert_eq!(error, "owner busy");
     }
 
+    /// Controller readiness stops on the process-wide TERMINATE flag, which
+    /// some controller tests in main.rs raise for a moment while they hold
+    /// this lock.
+    fn terminate_flag_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::tests::HELPER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn controller_scan_ignores_a_helper_between_fork_and_exec() {
         let root = test_root("controller-helper");
@@ -8798,6 +8809,7 @@ fi
 
     #[test]
     fn controller_readiness_resumes_acceptance_after_a_controller_leaves_readiness() {
+        let _terminate = terminate_flag_guard();
         // 2026-10-18 VM: the SQM hotplug restarted the queue while readiness
         // accepted the batch; the controller briefly reported WAITING_OPERATION
         // and the start failed with controller-batch-readiness-changed.
@@ -8839,6 +8851,7 @@ fi
 
     #[test]
     fn controller_readiness_waits_for_a_lock_held_by_a_controller_sqm_check() {
+        let _terminate = terminate_flag_guard();
         let fixture = ReadinessFixture::new("readiness-lock");
         let lock_root = &fixture.context.paths.runtime_lock_root;
         fs::create_dir(lock_root).unwrap();
@@ -8926,6 +8939,7 @@ fi
 
     #[test]
     fn start_stops_only_the_remains_of_an_unconfirmed_start() {
+        let _terminate = terminate_flag_guard();
         let fixture = ReadinessFixture::new("unconfirmed-start");
         let paths = &fixture.context.paths;
         let mut stops = 0;
@@ -9518,6 +9532,7 @@ esac
 
     #[test]
     fn controller_readiness_binds_process_status_state_and_freshness() {
+        let _terminate = terminate_flag_guard();
         let root = test_root("controller-readiness");
         let proc_root = root.join("proc");
         let runtime_root = root.join("run");

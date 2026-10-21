@@ -14,6 +14,29 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// A program that another thread of this process has just written is still
+/// open for writing in a child forked meanwhile, until that child execs, and
+/// exec of it fails with "text file busy" for that moment.
+const TEXT_BUSY_RETRY: Duration = Duration::from_millis(2);
+const TEXT_BUSY_ATTEMPTS: u32 = 50;
+
+/// `Command::spawn`, retried briefly (at most ~0.1 s) on `ETXTBSY` only.
+pub(crate) fn spawn_command(command: &mut Command) -> io::Result<Child> {
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY) && attempt < TEXT_BUSY_ATTEMPTS =>
+            {
+                attempt += 1;
+                // Polling: the forked child's exec drops its copy without an event (bounded).
+                thread::sleep(TEXT_BUSY_RETRY);
+            }
+            result => return result,
+        }
+    }
+}
+
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 4 * 1024;
 const MAX_TOTAL_ARGUMENT_BYTES: usize = 16 * 1024;
@@ -203,8 +226,7 @@ impl ManagedChild {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         sys::lead_new_session(&mut command);
-        let mut child = command
-            .spawn()
+        let mut child = spawn_command(&mut command)
             .map_err(|error| format!("unable to launch operation worker: {error}"))?;
         let pid = child.id();
         let identity = match ProcessIdentity::inspect(proc_root, pid) {
@@ -353,8 +375,7 @@ where
         .stderr(Stdio::piped());
     configure(&mut command);
     sys::lead_new_session(&mut command);
-    let child = command
-        .spawn()
+    let child = spawn_command(&mut command)
         .map_err(|error| format!("unable to launch bounded command: {error}"))?;
     let mut child = OwnedProcessGroupChild {
         process_group: child.id(),

@@ -283,13 +283,14 @@ pub(crate) fn safe_interface(value: &str) -> bool {
 }
 
 fn run_bounded(command: &str, args: &[&str]) -> Result<(bool, String), String> {
-    let mut child = Command::new(command)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("failed to execute {command}: {error}"))?;
+    let mut child = super::process::spawn_command(
+        Command::new(command)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .map_err(|error| format!("failed to execute {command}: {error}"))?;
     let mut stdout = child
         .stdout
         .take()

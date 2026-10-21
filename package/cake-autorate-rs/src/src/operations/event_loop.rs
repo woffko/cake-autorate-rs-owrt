@@ -44,6 +44,18 @@ pub struct CalibrationEventLoop {
     wake: OwnedFd,
     watch_descriptors: BTreeMap<i32, WatchInterest>,
     processes: BTreeMap<u32, WatchedProcess>,
+    /// Tests run as threads of one process, where only one loop at a time
+    /// may own the signal wakeup: a test's loop waits for the previous one.
+    #[cfg(test)]
+    _test_owner: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+fn test_owner() -> std::sync::MutexGuard<'static, ()> {
+    static OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 struct WatchInterest {
@@ -62,6 +74,8 @@ impl CalibrationEventLoop {
             .map_err(|error| format!("unable to create calibration inotify descriptor: {error}"))?;
         let wake = sys::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
             .map_err(|error| format!("unable to create calibration wake descriptor: {error}"))?;
+        #[cfg(test)]
+        let test_owner = test_owner();
         ACTIVE_WAKE_FD
             .compare_exchange(
                 NO_WAKE_FD,
@@ -75,6 +89,8 @@ impl CalibrationEventLoop {
             wake,
             watch_descriptors: BTreeMap::new(),
             processes: BTreeMap::new(),
+            #[cfg(test)]
+            _test_owner: test_owner,
         })
     }
 
