@@ -128,9 +128,9 @@ Evidence:
   storm 0 of 5; reload during a hotplug restart 0 of 26; a reload that failed
   after its publication recovered by the same reload, the old setting, stop and
   start, a reboot and a power cut; power loss after a killed reload recovered
-  at boot 4 of 4 (a first series stopped after two trials when the VM came up
-  without its init script once and could not be explained; it was not seen
-  again); ten reboots with an SQM restart in each start: running 10 of 10;
+  at boot 4 of 4 (in a first series, 2 of 4: after the third power cut the VM
+  came up once without its init script, which could not be explained and was
+  not seen again; those boots also started three years ahead, see below); ten reboots with an SQM restart in each start: running 10 of 10;
   ten reboots with a back-to-back SQM restart storm during the start: running
   10 of 10; two reboots with the global lock held at the first start: started
   by the boot retry 2 of 2; service checks 33 of 33; Speed Test
