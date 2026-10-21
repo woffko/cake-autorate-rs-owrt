@@ -451,6 +451,9 @@ function qualityReadiness(section, status, mode, calibrationSummary) {
 		return { ready: false, reason: _('Autorate instance is disabled.') };
 	if (String(section.sqm_enabled || '0') !== '1')
 		return { ready: false, reason: _('Managed SQM must be enabled.') };
+	// The Rating request carries only main or mwan3 routing.
+	if (String(section.route_mode || '') === 'explicit')
+		return { ready: false, reason: _('Get rating is not available over an explicit policy route. Speed Test and Full Auto-Tune are.') };
 	if (status && status.sqm_runtime_managed && !status.sqm_runtime_healthy)
 		return {
 			ready: false,

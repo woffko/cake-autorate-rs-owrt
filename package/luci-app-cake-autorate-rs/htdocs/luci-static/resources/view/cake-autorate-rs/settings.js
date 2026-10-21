@@ -2340,8 +2340,8 @@ function nativeAutotunePublicResultValidated(result) {
 	    !canonicalAutotuneProfile(result.profile) ||
 	    [ 'shaped_only', 'full_raw', 'reuse_trusted' ].indexOf(result.calibration_strategy) < 0 ||
 	    !Number.isSafeInteger(result.consumed_traffic_bytes) || result.consumed_traffic_bytes < 0 ||
-	    (result.route_mode !== 'main' && result.route_mode !== 'mwan3') ||
-	    (result.route_mode === 'main' && result.mwan3_member !== null) ||
+	    !nativeRouteModeSupported(result.route_mode) ||
+	    (result.route_mode !== 'mwan3' && result.mwan3_member !== null) ||
 	    (result.route_mode === 'mwan3' && !safeName.test(result.mwan3_member || '')) ||
 	    (result.source_ip !== null && typeof result.source_ip !== 'string') ||
 	    !artifacts || typeof artifacts !== 'object' || Array.isArray(artifacts) ||
@@ -3476,10 +3476,21 @@ function nativeSpeedtestCapabilityValidated(summary, configuredBackend, existing
 		summary.native_public_result_version === NATIVE_AUTOTUNE_PUBLIC_SCHEMA_VERSION);
 }
 
+// The route a measurement runs on. Probe routing 'auto', the form default
+// that is saved as such, is the main table unless an mwan3 member is selected.
+function effectiveRouteMode(routeMode, mwan3Member) {
+	return (!routeMode || routeMode === 'auto') ?
+		(mwan3Member ? 'mwan3' : 'main') : routeMode;
+}
+
+// main, mwan3 and an explicit policy route (MULTIWAN.md).
+function nativeRouteModeSupported(routeMode) {
+	return [ 'main', 'mwan3', 'explicit' ].indexOf(routeMode) >= 0;
+}
+
 function nativeSpeedtestIntentSupported(backend, routeMode, existingInstance, topology,
 		plannedSqmSection) {
-	if (nativeEffectiveSpeedtestBackend(backend) == null ||
-	    (routeMode !== 'main' && routeMode !== 'mwan3'))
+	if (nativeEffectiveSpeedtestBackend(backend) == null || !nativeRouteModeSupported(routeMode))
 		return false;
 	if (existingInstance === true)
 		return true;
@@ -3768,7 +3779,8 @@ function runNativeSpeedtestJob(section_id, wan, onProgress, routeMode, mwan3Memb
 
 function runSpeedtestJob(section_id, wan, backend, onProgress, routeMode, mwan3Member,
 		serverId, existingInstance, topology, plannedSqmSection, chooseTrafficPolicy) {
-	var mode = routeMode || 'main';
+	var mode = effectiveRouteMode(routeMode, mwan3Member);
+	mwan3Member = mode === 'mwan3' ? mwan3Member : '';
 	topology = topology || 'current';
 	if (!nativeSpeedtestIntentSupported(backend, mode, existingInstance === true, topology,
 			plannedSqmSection))
@@ -3824,7 +3836,7 @@ function nativeAutotuneSummary() {
 
 function nativeAutotuneIntentSupported(backend, routeMode, existingInstance,
 		calibrationStrategy, accessRequest) {
-	var routeSupported = !routeMode || routeMode === 'main' || routeMode === 'mwan3';
+	var routeSupported = !routeMode || nativeRouteModeSupported(routeMode);
 	if (nativeEffectiveSpeedtestBackend(backend) == null || !routeSupported)
 		return false;
 	if (existingInstance === true)
@@ -4696,9 +4708,11 @@ function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode
 	calibrationStrategy = [ 'shaped_only', 'full_raw', 'reuse_trusted' ].indexOf(calibrationStrategy) >= 0 ?
 		calibrationStrategy : 'shaped_only';
 	accessRequest = accessRequest || autotuneAccessRequest({ autotune_profile: profile });
+	routeMode = effectiveRouteMode(routeMode, mwan3Member);
+	mwan3Member = routeMode === 'mwan3' ? mwan3Member : '';
 
 	if (existingInstance !== true && nativeEffectiveSpeedtestBackend(backend) != null &&
-		(!routeMode || routeMode === 'main' || routeMode === 'mwan3') &&
+		nativeRouteModeSupported(routeMode) &&
 		!nativeAutotuneIntentSupported(backend, routeMode, existingInstance,
 			calibrationStrategy, accessRequest)) {
 		return Promise.reject(autotuneNotStartedError(_('New-instance calibration requires Full raw capacity and explicit download/upload service caps.')));
@@ -5231,14 +5245,13 @@ function writeWizardConfig(section_id, state, allowUncalibrated) {
 	var sqmSection = state.sqm_section || managedSqmSectionName(section_id);
 	var pingExtraArgs = state.ping_extra_args;
 	var selectedAutotuneProfile = storedAutotuneProfile(state.autotune_profile);
-	var effectiveRouteMode = state.route_mode === 'auto' ?
-		(state.mwan3_member ? 'mwan3' : 'main') : (state.route_mode || 'main');
-	var effectiveMwan3Member = effectiveRouteMode === 'mwan3' ?
+	var wizardRouteMode = effectiveRouteMode(state.route_mode, state.mwan3_member);
+	var effectiveMwan3Member = wizardRouteMode === 'mwan3' ?
 		(state.mwan3_member || '') : '';
 
 	uci.set('cake-autorate', section_id, 'enabled', state.enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'wan_if', wan);
-	uci.set('cake-autorate', section_id, 'route_mode', effectiveRouteMode);
+	uci.set('cake-autorate', section_id, 'route_mode', wizardRouteMode);
 	if (effectiveMwan3Member)
 		uci.set('cake-autorate', section_id, 'mwan3_member', effectiveMwan3Member);
 	else

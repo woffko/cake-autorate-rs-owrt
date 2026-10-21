@@ -429,6 +429,19 @@ const ready = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	quality_grade_baseline_ready: true,
 });
 assert.equal(ready.ready, true);
+// The Rating request carries only main or mwan3 routing: an explicit policy
+// route says so instead of failing in the daemon after Start.
+const explicitRoute = helpers.qualityReadiness(
+	{ enabled: '1', sqm_enabled: '1', route_mode: 'explicit' }, {
+		uplink_state: 'ACTIVE',
+		transport_latency_enabled: true,
+		route_active: true,
+		route_test_ready: true,
+		transport_probe_trusted: true,
+		quality_grade_baseline_ready: true,
+	});
+assert.equal(explicitRoute.ready, false);
+assert.match(explicitRoute.reason, /not available over an explicit policy route/);
 const nativeRatingUnavailable = helpers.qualityReadiness(
 	{ enabled: '1', sqm_enabled: '1' },
 	{

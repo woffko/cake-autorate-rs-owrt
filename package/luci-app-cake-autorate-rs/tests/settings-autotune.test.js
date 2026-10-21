@@ -173,7 +173,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`autotuneRetryableInconclusive, autotuneMeasurementTimeout, recordAutotuneRetryableInconclusive, ` +
 			`manualSqmDirectionMode, validateManualSqmDirectionMode, writeManualSqmDirectionMode, ` +
 			`positiveRateValue, shouldImportInterfaceRates, applyRatePreset, ` +
-			`runSpeedtestJob, nativeEffectiveSpeedtestBackend, nativeSpeedtestCapabilityValidated, nativeSpeedtestIntentSupported, nativeSpeedtestLaunchArgs, validateExplicitRoute, explicitRouteNumber, explicitRouteLaunchArgs, validatedSpeedtestTrafficPolicy, speedtestTrafficPolicyFromInput, nativeSpeedtestResultValidated, nativeOperationWorkerRunId, nativeSpeedtestStatusMatchesRequest, ` +
+			`runSpeedtestJob, effectiveRouteMode, nativeRouteModeSupported, nativeEffectiveSpeedtestBackend, nativeSpeedtestCapabilityValidated, nativeSpeedtestIntentSupported, nativeSpeedtestLaunchArgs, validateExplicitRoute, explicitRouteNumber, explicitRouteLaunchArgs, validatedSpeedtestTrafficPolicy, speedtestTrafficPolicyFromInput, nativeSpeedtestResultValidated, nativeOperationWorkerRunId, nativeSpeedtestStatusMatchesRequest, ` +
 			`nativeAutotuneCapabilityValidated, nativeBootstrapAutotuneCapabilityValidated, ` +
 			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, validatedAutotuneTrafficPolicy, autotuneTrafficPolicyFromInput, autotuneTrafficPlanningEstimate, nativeAutotuneResultMatchesRequest, nativeAutotuneStatusMatchesRequest, ` +
 			`nativeAutotuneProgressStepLabel, nativeAutotuneProgress, nativeAutotuneTrafficSummary, ` +
@@ -749,6 +749,16 @@ const nativePublic = nativePublicFixture();
 Object.defineProperty(nativePublic, '_native_target_state', {
 	value: 'existing_managed', enumerable: false,
 });
+// A completed calibration over an explicit policy route passes verification.
+assert.equal(helpers.nativeAutotunePublicResultValidated(Object.assign(nativePublicFixture(), {
+	route_mode: 'explicit', mwan3_member: null, source_ip: '192.0.2.10',
+})), true);
+assert.equal(helpers.nativeAutotunePublicResultValidated(Object.assign(nativePublicFixture(), {
+	route_mode: 'explicit', mwan3_member: 'wanb',
+})), false);
+assert.equal(helpers.nativeAutotunePublicResultValidated(Object.assign(nativePublicFixture(), {
+	route_mode: 'auto',
+})), false);
 assert.equal(helpers.nativeAutotunePublicResultValidated(nativePublic), true,
 	'a digest-bound diagnostic native Review must pass its isolated public contract');
 const sourceComparison = {
@@ -2126,6 +2136,9 @@ async function testNativeAutotuneTransport() {
 		}, 'auto'), false, 'automatic backend selection requires an explicit daemon capability');
 		assert.equal(helpers.nativeAutotuneIntentSupported(
 			'auto', 'main', true, 'full_raw', access), true);
+		assert.equal(helpers.nativeAutotuneIntentSupported(
+			'auto', 'explicit', true, 'full_raw', access), true,
+			'Full Auto-Tune over an explicit policy route is admitted as MULTIWAN.md documents');
 		assert.equal(helpers.nativeAutotuneCapabilityValidated({
 			...capability,
 			admission_enabled: false,
@@ -2626,6 +2639,36 @@ async function testNativeAutotuneTransport() {
 		], 'advertised native capability must route the whole authenticated lifecycle through Rust');
 		assert(!nativeCalls.some(call => call.command.endsWith('/autotune')),
 			'a native start must never be followed by a legacy helper launch');
+		{
+			// Re-run Auto-Tune of an instance saved with probe routing 'auto'
+			// starts on the resolved route instead of refusing the request.
+			const rerunCalls = [];
+			const rerunPayloads = [
+				capability,
+				{ state: 'idle', instance: 'wan_sqm' },
+				{ state: 'queued', job_id: publicJobId,
+					...statusIdentity('wan_sqm', 'pppoe-wan', 'main', '',
+						'variable_link', 'full_raw') },
+				{ state: 'review_ready', job_id: publicJobId,
+					...statusIdentity('wan_sqm', 'pppoe-wan', 'main', '',
+						'variable_link', 'full_raw'),
+					runtime_mutated: false, recovery_required: false },
+				nativePublic,
+			];
+			const rerunHelpers = compileHelpers({
+				exec(command, args) {
+					rerunCalls.push({ command, args });
+					assert(rerunPayloads.length, 'unexpected native transport request');
+					return Promise.resolve({ stdout: JSON.stringify(rerunPayloads.shift()) });
+				},
+			});
+			assert.deepEqual(await rerunHelpers.runPreferredAutotuneJob(
+				'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'auto', '',
+				'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy),
+			nativePublic);
+			const rerunStart = rerunCalls.find(call => call.args[1] === 'autotune-start').args;
+			assert.equal(rerunStart[rerunStart.indexOf('--route-mode') + 1], 'main');
+		}
 		for (const supported of [false, true]) {
 			const calls = [];
 			const noStartHelpers = compileHelpers({ exec(command, args) {
@@ -3127,6 +3170,39 @@ async function testNativeSpeedtestTransport() {
 		const autoStart = autoCalls.find(call => call.args[1] === 'speedtest-start');
 		assert(autoStart, 'automatic backend policy must stay on the native lifecycle');
 		assert.equal(autoStart.args[autoStart.args.indexOf('--backend') + 1], 'speedtest-go');
+
+		// Probe routing 'auto' is the form default and is saved as such: Run
+		// speed test resolves it (main, or mwan3 with a selected member)
+		// instead of refusing it as an unsupported request.
+		assert.equal(helpers.effectiveRouteMode('auto', ''), 'main');
+		assert.equal(helpers.effectiveRouteMode('auto', 'wanb'), 'mwan3');
+		assert.equal(helpers.effectiveRouteMode('', ''), 'main');
+		assert.equal(helpers.effectiveRouteMode('mwan3', 'wanb'), 'mwan3');
+		assert.equal(helpers.effectiveRouteMode('explicit', ''), 'explicit');
+		for (const [ member, mode ] of [ [ '', 'main' ], [ 'wanb', 'mwan3' ] ]) {
+			const routeCalls = [];
+			const routePayloads = [ capability, { state: 'idle', instance: 'wan_sqm' },
+				{ state: 'queued', job_id: publicJobId,
+					...speedtestIdentity('wan_sqm', 'pppoe-wan', mode, member, null, 'unshaped') },
+				{ state: 'completed', job_id: publicJobId,
+					...speedtestIdentity('wan_sqm', 'pppoe-wan', mode, member, null, 'unshaped') }, result ];
+			const routeHelpers = compileHelpers({
+				exec(command, args) {
+					routeCalls.push({ command, args });
+					return Promise.resolve({ stdout: JSON.stringify(routePayloads.shift()) });
+				},
+			});
+			assert.deepEqual(JSON.parse((await routeHelpers.runSpeedtestJob(
+				'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'auto', member, '', true,
+				'unshaped')).stdout), result);
+			const routeStart = routeCalls.find(call => call.args[1] === 'speedtest-start').args;
+			assert.equal(routeStart[routeStart.indexOf('--route-mode') + 1], mode);
+			assert.equal(routeStart.includes('--mwan3-member'), mode === 'mwan3');
+		}
+		// An explicit policy route is admitted as MULTIWAN.md documents.
+		assert.equal(helpers.nativeSpeedtestIntentSupported('auto', 'explicit', true), true);
+		assert.equal(helpers.nativeSpeedtestIntentSupported('auto', 'auto', true), false,
+			'an unresolved auto never reaches the native request');
 
 		const bootstrapCalls = [];
 		const bootstrapPayloads = [ capability,
