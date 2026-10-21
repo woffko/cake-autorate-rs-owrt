@@ -265,10 +265,12 @@ pub fn monotonic_boot_ms() -> Result<u64, String> {
 #[cfg(test)]
 pub(crate) mod test_clock {
     use std::cell::Cell;
+    use std::time::Instant;
 
     thread_local! {
         static BOOT_MS: Cell<Option<u64>> = const { Cell::new(None) };
         static WALL_MS: Cell<Option<u64>> = const { Cell::new(None) };
+        static INSTANT: Cell<Option<Instant>> = const { Cell::new(None) };
     }
 
     pub(crate) fn boot_ms() -> Option<u64> {
@@ -277,6 +279,32 @@ pub(crate) mod test_clock {
 
     pub(crate) fn wall_ms() -> Option<u64> {
         WALL_MS.with(Cell::get)
+    }
+
+    pub(crate) fn instant() -> Option<Instant> {
+        INSTANT.with(Cell::get)
+    }
+
+    /// Holds the scripted monotonic clock of this thread for the code that
+    /// reads it through this module; the real clock comes back when it is
+    /// dropped.
+    pub(crate) struct ScriptedInstant;
+
+    impl ScriptedInstant {
+        pub(crate) fn install(now: Instant) -> Self {
+            INSTANT.with(|value| value.set(Some(now)));
+            Self
+        }
+
+        pub(crate) fn set(&self, now: Instant) {
+            INSTANT.with(|value| value.set(Some(now)));
+        }
+    }
+
+    impl Drop for ScriptedInstant {
+        fn drop(&mut self) {
+            INSTANT.with(|value| value.set(None));
+        }
     }
 
     /// Holds the scripted boot and wall clocks of this thread; the real clocks

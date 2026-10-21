@@ -903,6 +903,17 @@ impl LoadedTopologyAttestation {
     }
 }
 
+/// The clock of a transport dispatch decision. Tests script it per thread, so
+/// the freshness walls are checked on their own timeline and not on how fast
+/// the test host writes files.
+fn dispatch_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = super::identity::test_clock::instant() {
+        return now;
+    }
+    Instant::now()
+}
+
 fn loaded_reactor_deadline(rate: Duration, cpu: Duration, pending_counter_fence: bool) -> Duration {
     if pending_counter_fence {
         // The controlled-counter completion writes the shared eventfd.  A
@@ -3479,7 +3490,7 @@ impl BootstrapCaptureRuntime {
         {
             return Ok(());
         }
-        let now = Instant::now();
+        let now = dispatch_now();
         let readiness = self
             .transport
             .as_ref()
@@ -3509,7 +3520,7 @@ impl BootstrapCaptureRuntime {
             }
             // Either attestation can consume some of the immutable freshness
             // budget.  Always decide with its completion time.
-            Instant::now()
+            dispatch_now()
         } else {
             now
         };
@@ -8096,9 +8107,13 @@ mod tests {
         capture.reset_counter_identity(&request);
         capture.counter_epoch = 7;
 
-        let pre_end = Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .unwrap();
+        // The reads below are one millisecond apart on the test's own
+        // timeline, and dispatch decides on the scripted clock: the 600 ms
+        // freshness walls hold however long the host takes to write the
+        // published snapshots in between.
+        let later = |instant: Instant| instant + Duration::from_millis(1);
+        let pre_end = Instant::now();
+        let clock = super::super::identity::test_clock::ScriptedInstant::install(pre_end);
         let pre_start = pre_end.checked_sub(Duration::from_millis(200)).unwrap();
         let pre_delta = LoadedPhysicalDelta {
             delta: super::super::autotune_counter::AutotuneCounterDelta {
@@ -8136,11 +8151,11 @@ mod tests {
                         upload_kbps: None,
                     },
                 },
-                Instant::now(),
+                pre_end,
             )
             .unwrap();
 
-        let initial_rebase = Instant::now();
+        let initial_rebase = later(pre_end);
         capture
             .apply_loaded_counter_update(
                 &request,
@@ -8166,12 +8181,7 @@ mod tests {
             )
             .unwrap();
 
-        let initial_flight_evidence_end = loop {
-            let now = Instant::now();
-            if now > initial_rebase {
-                break now;
-            }
-        };
+        let initial_flight_evidence_end = later(initial_rebase);
         let initial_flight_evidence = LoadedPhysicalDelta {
             delta: super::super::autotune_counter::AutotuneCounterDelta {
                 download_bytes: 20_000_000,
@@ -8224,6 +8234,7 @@ mod tests {
 
         let mut authority = FakeCaptureAuthority::default();
         capture.loaded_counter_burst = LoadedCounterBurstState::begin();
+        clock.set(later(initial_flight_evidence_end));
         capture
             .try_schedule_transport(&directory, &store, &mut authority)
             .unwrap();
@@ -8246,12 +8257,7 @@ mod tests {
                 .and_then(|transport| transport.in_flight.as_ref())
                 .expect("scheduled request has no in-flight authority")
                 .submitted_at;
-            let completed_at = loop {
-                let now = Instant::now();
-                if now > submitted_at {
-                    break now;
-                }
-            };
+            let completed_at = later(submitted_at);
             result_tx
                 .send(BootstrapTransportCompletion {
                     probe_id: work.probe_id,
@@ -8271,12 +8277,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let post_end = loop {
-                let now = Instant::now();
-                if now > completed_at {
-                    break now;
-                }
-            };
+            let post_end = later(completed_at);
             let post_delta = LoadedPhysicalDelta {
                 delta: super::super::autotune_counter::AutotuneCounterDelta {
                     download_bytes: 20_000_000,
@@ -8349,7 +8350,7 @@ mod tests {
                 );
                 assert!(!capture.loaded_transport_work_active());
 
-                let rebase_end = Instant::now();
+                let rebase_end = later(post_end);
                 capture
                     .apply_loaded_counter_update(
                         &request,
@@ -8390,12 +8391,7 @@ mod tests {
                 );
                 assert!(!capture.loaded_transport_work_active());
 
-                let flight_evidence_end = loop {
-                    let now = Instant::now();
-                    if now > rebase_end {
-                        break now;
-                    }
-                };
+                let flight_evidence_end = later(rebase_end);
                 let flight_evidence = LoadedPhysicalDelta {
                     delta: super::super::autotune_counter::AutotuneCounterDelta {
                         download_bytes: 20_000_000,
@@ -8446,6 +8442,7 @@ mod tests {
                     )
                     .unwrap();
                 let flight_evidence_burst = capture.loaded_counter_burst;
+                clock.set(later(flight_evidence_end));
                 capture
                     .advance_loaded_counter_burst_after_poll(
                         &directory,
@@ -10092,6 +10089,9 @@ mod tests {
         assert_eq!(readiness.reason, "loaded-physical-delta-ready");
         assert!(readiness.ready);
 
+        // Dispatch decides at the end of the fence, not after the host has
+        // created the directories below.
+        let _clock = super::super::identity::test_clock::ScriptedInstant::install(completed_at);
         let directory = private_dir("flight-evidence-event-bounded");
         let store = RuntimeOverrideStore::open(&directory).unwrap();
         let burst_before = LoadedCounterBurstState::Priming {
