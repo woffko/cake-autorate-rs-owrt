@@ -8628,8 +8628,7 @@ impl Controller {
             self.history_budget.used_instance_kib = fs::metadata(&path)
                 .map(|metadata| metadata.len().div_ceil(1024))
                 .unwrap_or(0);
-            self.history_budget.used_total_kib =
-                history_usage_bytes(&run_root()).div_ceil(1024);
+            self.history_budget.used_total_kib = history_usage_bytes(&run_root()).div_ceil(1024);
         }
     }
 

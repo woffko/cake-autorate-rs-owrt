@@ -9,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const RECORD_LIMIT: u64 = 4096;
 const MAGIC: &[u8] = b"cake-qdisc-capability-v1\n";
@@ -19,10 +19,12 @@ type Result<T> = std::result::Result<T, String>;
 fn io<T>(value: std::io::Result<T>) -> Result<T> {
     value.map_err(|_| "qdisc-capability-io".into())
 }
+/// Seconds on the boot clock: a proof is never dated ahead of it after a step
+/// of the wall clock. A proof from before an upgrade (a wall-clock stamp) is
+/// probed again once.
 fn now() -> Result<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|v| v.as_secs())
+    crate::operations::identity::monotonic_boot_ms()
+        .map(|ms| ms / 1000)
         .map_err(|_| "qdisc-capability-clock".into())
 }
 fn root() -> PathBuf {
@@ -722,6 +724,17 @@ mod tests {
             self.link = None;
             Ok(())
         }
+    }
+
+    /// Proofs are dated on the boot clock, which a step of the wall clock
+    /// does not move.
+    #[test]
+    fn proofs_are_dated_on_the_boot_clock() {
+        let _clocks = crate::operations::identity::test_clock::ScriptedClocks::install(
+            42_000,
+            1_790_000_000_000,
+        );
+        assert_eq!(now().unwrap(), 42);
     }
 
     #[test]

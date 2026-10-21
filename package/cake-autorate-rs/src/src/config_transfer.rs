@@ -209,8 +209,15 @@ impl Store {
                 if !MAGIC.starts_with(&prefix) {
                     return Err("candidate-storage-unrecognized");
                 }
-                if metadata.mtime() >= 0 && self.now.saturating_sub(metadata.mtime() as u64) > TTL_S
-                {
+                // The file time is a wall-clock stamp, unlike `now`. Under this
+                // store's lock no writer is live, so a stamp ahead of the clock
+                // (the clock stepped back) is an orphan as well.
+                let wall = io(SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(std::io::Error::other))?
+                .as_secs();
+                let written = u64::try_from(metadata.mtime()).ok();
+                if written.is_none_or(|written| written > wall || wall - written > TTL_S) {
                     self.remove(&path, &file)?;
                 } else {
                     return Err("candidate-storage-partial-header");
@@ -221,9 +228,8 @@ impl Store {
             if metadata.len() > (HEADER + record.length) as u64 {
                 return Err("candidate-storage-length-invalid");
             }
-            if record.created > self.now {
-                return Err("candidate-clock-regressed");
-            }
+            // `now` is the boot clock: a stamp ahead of it was written before
+            // an upgrade, on the wall clock, and cannot be live.
             if !record.live(self.now) {
                 self.remove(&path, &file)?;
             } else {
@@ -279,9 +285,7 @@ impl Store {
             return Err("candidate-request-mismatch");
         }
         if !record.live(self.now) {
-            if record.created <= self.now {
-                self.remove(&path, &file)?;
-            }
+            self.remove(&path, &file)?;
             return Err("candidate-expired");
         }
         if attest(&path, &file)?.len() > (HEADER + record.length) as u64 {
@@ -379,6 +383,14 @@ impl Store {
         }
         Ok(json!({"cancelled": true}))
     }
+}
+
+/// Seconds on the boot clock: a step of the wall clock neither expires a
+/// candidate early nor keeps an old one alive.
+fn boot_seconds() -> Result<u64> {
+    crate::operations::identity::monotonic_boot_ms()
+        .map(|ms| ms / 1000)
+        .map_err(|_| "candidate-clock-invalid")
 }
 
 fn dispatch(root: &Path, now: u64, method: &str, request: &Value) -> Result<Value> {
@@ -496,11 +508,7 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>, input: impl Read) -> V
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/run/cake-autorate"))
             .join(".candidate-checks");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "candidate-clock-invalid")?
-            .as_secs();
-        dispatch(&root, now, method, &request)
+        dispatch(&root, boot_seconds()?, method, &request)
     })();
     result.unwrap_or_else(|code| json!({"schema_version": 1, "ok": false, "code": code}))
 }
@@ -736,6 +744,31 @@ mod tests {
             true
         );
         assert!(store.records().unwrap().is_empty());
+    }
+
+    /// An older daemon stamped candidates on the wall clock, which is far
+    /// ahead of the boot clock: such a candidate is retired, and the store
+    /// keeps working instead of refusing every request until the clock
+    /// catches up.
+    #[test]
+    fn a_candidate_stamped_ahead_of_the_clock_is_retired_not_a_wedge() {
+        let fixture = Fixture::new();
+        drop(
+            Store::open(&fixture.root(), 1_790_000_000)
+                .unwrap()
+                .begin(ID, 1, &config_candidate::digest(b"x"))
+                .unwrap(),
+        );
+        let store = Store::open(&fixture.root(), 100).unwrap();
+        assert!(store.records().unwrap().is_empty());
+        store.begin(ID, 1, &config_candidate::digest(b"x")).unwrap();
+        assert_eq!(store.records().unwrap().len(), 1);
+        drop(store);
+        let _clocks = crate::operations::identity::test_clock::ScriptedClocks::install(
+            42_000,
+            1_790_000_000_000,
+        );
+        assert_eq!(boot_seconds().unwrap(), 42);
     }
 
     #[test]
