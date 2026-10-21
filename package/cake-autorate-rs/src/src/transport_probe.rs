@@ -11,7 +11,7 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{client_tls_with_config, Message, WebSocket};
+use tungstenite::{client_tls_with_config, Connector, Message, WebSocket};
 
 const DEFAULT_STREAMS: usize = 4;
 pub(crate) const LOADED_AUTOTUNE_WS_STREAMS: usize = 5;
@@ -592,6 +592,8 @@ struct WebSocketProbe {
     endpoint: String,
     parsed: ParsedEndpoint,
     binding: RouteBinding,
+    /// Trust anchors for wss://: the bundled set the HTTPS probe uses.
+    roots: RootCertStore,
     stream: Option<WsStream>,
     deadline: DeadlineControl,
     sequence: u64,
@@ -610,6 +612,7 @@ impl WebSocketProbe {
             endpoint,
             parsed,
             binding,
+            roots: bundled_roots(),
             stream: None,
             deadline: DeadlineControl::new(initial_deadline),
             sequence: 1,
@@ -660,7 +663,13 @@ impl WebSocketProbe {
             .max_write_buffer_size(MAX_WS_FRAME_BYTES * 2)
             .max_message_size(Some(MAX_WS_FRAME_BYTES))
             .max_frame_size(Some(MAX_WS_FRAME_BYTES));
-        let (mut stream, _) = client_tls_with_config(request, tcp, Some(config), None)
+        // A new client configuration for every connection, as tungstenite
+        // builds by default: no session is resumed across reconnects.
+        let tls = ClientConfig::builder()
+            .with_root_certificates(self.roots.clone())
+            .with_no_client_auth();
+        let connector = Connector::Rustls(Arc::new(tls));
+        let (mut stream, _) = client_tls_with_config(request, tcp, Some(config), Some(connector))
             .map_err(|error| format!("WebSocket handshake failed: {error}"))?;
         deadline.ensure("WebSocket handshake")?;
         Self::raw_batch_on(&mut stream, &mut self.sequence, 1, deadline)?;
@@ -820,9 +829,8 @@ impl HttpProbe {
         timeout: Duration,
     ) -> Self {
         install_crypto_provider();
-        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut config = ClientConfig::builder()
-            .with_root_certificates(roots)
+            .with_root_certificates(bundled_roots())
             .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let initial_deadline = ProbeDeadline::after(timeout)
@@ -957,6 +965,11 @@ impl HttpProbe {
         }
         Ok((rtt_ms, processing_ms))
     }
+}
+
+/// The Mozilla root set bundled into the daemon (webpki-roots).
+fn bundled_roots() -> RootCertStore {
+    RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
 }
 
 fn install_crypto_provider() {
@@ -2025,6 +2038,90 @@ mod tests {
         assert!(sample.rtt_ms < 80.0, "RTT included handshake: {sample:?}");
         assert_eq!(sample.raw_samples_ms.len(), 4);
         server.join().unwrap();
+    }
+
+    /// wss:// verifies the server against the probe's own trust anchors: the
+    /// bundled set refuses a certificate of an unknown authority, and that
+    /// authority's root is enough for the same server.
+    #[test]
+    fn websocket_tls_verifies_the_server_against_the_probe_roots() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose, SanType,
+        };
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use rustls::{ServerConfig, ServerConnection};
+
+        install_crypto_provider();
+        let authority_key = KeyPair::generate().unwrap();
+        let mut authority = CertificateParams::new(Vec::new()).unwrap();
+        authority.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        authority.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let authority = authority.self_signed(&authority_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let mut server = CertificateParams::new(Vec::new()).unwrap();
+        server
+            .subject_alt_names
+            .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        server.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server = server
+            .signed_by(&server_key, &authority, &authority_key)
+            .unwrap();
+        let config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![server.der().clone()],
+                    PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+                )
+                .unwrap(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut answered = 0;
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().unwrap();
+                let tls = StreamOwned::new(ServerConnection::new(config.clone()).unwrap(), tcp);
+                // The first client refuses the certificate during the handshake.
+                let Ok(mut websocket) = tungstenite::accept(tls) else {
+                    continue;
+                };
+                for _ in 0..5 {
+                    let Ok(Message::Text(text)) = websocket.read() else {
+                        break;
+                    };
+                    let token = json_number(&text, "timestamp").unwrap() as u64;
+                    websocket
+                        .send(Message::Text(
+                            format!(
+                                "{{\"type\":\"pong\",\"clientTime\":{token},\"serverProcessingTime\":0}}"
+                            )
+                            .into(),
+                        ))
+                        .unwrap();
+                    answered += 1;
+                }
+            }
+            answered
+        });
+        let mut engine = TransportProbeEngine::new(
+            TransportProbeBackend::WebSocket,
+            format!("wss://{address}/ws"),
+            RouteBinding::default(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let refused = engine.probe().unwrap_err();
+        assert!(refused.contains("UnknownIssuer"), "{refused}");
+
+        let mut roots = RootCertStore::empty();
+        roots.add(authority.der().clone()).unwrap();
+        engine.websocket.as_mut().unwrap().roots = roots;
+        let sample = engine.probe().unwrap();
+        assert_eq!(sample.raw_samples_ms.len(), 4);
+        assert_eq!(server.join().unwrap(), 5);
     }
 
     #[test]
