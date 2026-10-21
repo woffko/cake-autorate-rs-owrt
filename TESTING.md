@@ -36,7 +36,11 @@ retired.
 `sha256sum` process (same text, checked against the standard vectors). Code
 no build used was removed, and helpers only tests use are under `cfg(test)`;
 the Full build has no warnings, clippy `--all-targets` went from 285 to 231
-(Lite still warns about code only Full uses).
+(Lite still warns about code only Full uses). Then the rewrites `clippy --fix`
+makes without a change in behaviour (needless borrows, redundant closures,
+collapsible conditions whose second part still runs only when the first
+holds, and the like) took it to 63; the rest needs a restructure (too many
+arguments, large enum variants, type complexity).
 
 **Not changed (owner decision, kept as is).** The daemon's UCI reads were to be isolated
 from changes staged with `uci set`. The proposed flags do not do that: the
@@ -48,9 +52,18 @@ pending changes.
 
 Evidence:
 
-- Source gates 208 (LuCI, history, boot clock) and 209 (cleanup), 59 commands
-  each; packages built and verified for x86_64, aarch64_cortex-a76 and
-  aarch64_generic from both.
+- Source gates 208 (LuCI, history, boot clock), 209 (cleanup) and 211 (clippy
+  rewrites), 59 commands each; packages built and verified for x86_64,
+  aarch64_cortex-a76 and aarch64_generic from each.
+- Gate 210 of the clippy rewrites failed once in the parallel test run, on a
+  timing test. A probe must be dispatched within 600 ms of the post-flight
+  counter attestation; the test read the real clock while the code in between
+  wrote the capture snapshot with two fsyncs, which took longer under 64 test
+  threads (a 700 ms pause there failed it every time). The dispatch decision
+  now reads a clock that tests can script (the daemon still reads
+  `Instant::now()`), and this test and one with the same exposure run on
+  their own timeline: both pass with the pause, and fail when either clock
+  read goes back to the real clock or the attestation wall is tightened.
 - LuCI tests reproduce each routing case (Run speed test with 'auto', and with
   a member; Speed Test and Auto-Tune admission over an explicit route; a
   completed explicit Auto-Tune result; Re-run Auto-Tune with 'auto'; Get rating
@@ -71,6 +84,9 @@ Evidence:
   Service checks 33 of 33;
   Speed Test completed in 24.4 s. The x86_64 daemon is 4,096 bytes smaller
   after the cleanup.
+- VM after the clippy rewrites (daemon e6b0e823, the same size as ef7c89a2):
+  service checks 33 of 33; Speed Test completed in 26.6 s; start race 0 of 11
+  failed; reload during a hotplug restart 0 of 11 failed.
 - Found on the way and not changed (owner decision): the calibration
   coordinator runs `uci changes` twice and `uci show` once on every tick of
   its loop, which every controller status publication wakes: 1,506 `uci`
