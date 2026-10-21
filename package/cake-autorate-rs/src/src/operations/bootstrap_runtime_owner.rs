@@ -3745,7 +3745,7 @@ impl BootstrapCaptureRuntime {
                     .map(|sample| sample.backend.as_str())
                     .unwrap_or("websocket")
                     .to_string(),
-                trusted: sample.as_ref().map_or(true, |sample| sample.trusted),
+                trusted: sample.as_ref().is_none_or(|sample| sample.trusted),
                 raw_samples_ms: sample
                     .as_ref()
                     .map(|sample| sample.raw_samples_ms.clone())
@@ -7380,24 +7380,16 @@ mod tests {
 
     #[test]
     fn loaded_counter_reactor_barrier_requires_the_exact_in_flight_fence_pair() {
-        assert_eq!(
-            loaded_counter_barrier_required(true, true, true, true).unwrap(),
-            true
-        );
-        assert_eq!(
-            loaded_counter_barrier_required(true, true, false, false).unwrap(),
-            false
-        );
+        assert!(loaded_counter_barrier_required(true, true, true, true).unwrap());
+        assert!(!loaded_counter_barrier_required(true, true, false, false).unwrap());
         assert!(loaded_counter_barrier_required(true, true, true, false).is_err());
         assert!(loaded_counter_barrier_required(true, true, false, true).is_err());
-        assert_eq!(
-            loaded_counter_barrier_required(false, true, true, true).unwrap(),
-            false,
+        assert!(
+            !loaded_counter_barrier_required(false, true, true, true).unwrap(),
             "a rejected/stopping capture must never be held in the barrier"
         );
-        assert_eq!(
-            loaded_counter_barrier_required(true, false, true, false).unwrap(),
-            false,
+        assert!(
+            !loaded_counter_barrier_required(true, false, true, false).unwrap(),
             "an invalidated previous loaded read cannot block a new idle capture"
         );
     }

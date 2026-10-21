@@ -62,7 +62,7 @@ impl UciPackage {
                     return Err(format!("UCI package {package} contains a duplicate option"));
                 }
             } else {
-                if value.is_empty() || entry.section_type.len() > 0 {
+                if value.is_empty() || !entry.section_type.is_empty() {
                     return Err(format!(
                         "UCI package {package} contains a duplicate section"
                     ));

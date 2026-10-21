@@ -602,17 +602,17 @@ impl Config {
     ) -> Result<Self, String> {
         let mut cfg = Self::defaults(instance.to_string());
 
-        set_bool(&single, "enabled", &mut cfg.enabled)?;
-        set_bool(&single, "manage_sqm", &mut cfg.manage_sqm)?;
+        set_bool(single, "enabled", &mut cfg.enabled)?;
+        set_bool(single, "manage_sqm", &mut cfg.manage_sqm)?;
         cfg.sqm_enabled = cfg.enabled;
-        set_bool(&single, "sqm_enabled", &mut cfg.sqm_enabled)?;
-        set_string(&single, "sqm_direction_mode", &mut cfg.sqm_direction_mode);
-        set_string(&single, "sqm_section", &mut cfg.sqm_section);
-        set_string(&single, "sqm_interface", &mut cfg.sqm_interface);
-        set_string(&single, "dl_if", &mut cfg.dl_if);
-        set_string(&single, "ul_if", &mut cfg.ul_if);
-        set_string(&single, "route_mode", &mut cfg.route_mode);
-        set_string(&single, "mwan3_member", &mut cfg.mwan3_member);
+        set_bool(single, "sqm_enabled", &mut cfg.sqm_enabled)?;
+        set_string(single, "sqm_direction_mode", &mut cfg.sqm_direction_mode);
+        set_string(single, "sqm_section", &mut cfg.sqm_section);
+        set_string(single, "sqm_interface", &mut cfg.sqm_interface);
+        set_string(single, "dl_if", &mut cfg.dl_if);
+        set_string(single, "ul_if", &mut cfg.ul_if);
+        set_string(single, "route_mode", &mut cfg.route_mode);
+        set_string(single, "mwan3_member", &mut cfg.mwan3_member);
         cfg.explicit_dns_server = routing::explicit_dns_server(
             &cfg.route_mode,
             single
@@ -631,24 +631,24 @@ impl Config {
             .map(|name| single.get(name).map(String::as_str).unwrap_or_default()),
         )?;
         #[cfg(feature = "calibration")]
-        set_string(&single, "speedtest_backend", &mut cfg.speedtest_backend);
+        set_string(single, "speedtest_backend", &mut cfg.speedtest_backend);
         set_f64(
-            &single,
+            single,
             "route_check_interval_s",
             &mut cfg.route_check_interval_s,
         )?;
         set_bool(
-            &single,
+            single,
             "external_ip_check_enabled",
             &mut cfg.external_ip_check_enabled,
         )?;
         set_u64(
-            &single,
+            single,
             "external_ip_check_interval_s",
             &mut cfg.external_ip_check_interval_s,
         )?;
         set_string(
-            &single,
+            single,
             "external_ip_check_url",
             &mut cfg.external_ip_check_url,
         );
@@ -674,15 +674,15 @@ impl Config {
         if cfg.sqm_interface.is_empty() {
             cfg.sqm_interface = cfg.ul_if.clone();
         }
-        set_string(&single, "rx_bytes_path", &mut cfg.rx_bytes_path);
-        set_string(&single, "tx_bytes_path", &mut cfg.tx_bytes_path);
+        set_string(single, "rx_bytes_path", &mut cfg.rx_bytes_path);
+        set_string(single, "tx_bytes_path", &mut cfg.tx_bytes_path);
         set_bool(
-            &single,
+            single,
             "adjust_dl_shaper_rate",
             &mut cfg.adjust_dl_shaper_rate,
         )?;
         set_bool(
-            &single,
+            single,
             "adjust_ul_shaper_rate",
             &mut cfg.adjust_ul_shaper_rate,
         )?;
@@ -693,277 +693,277 @@ impl Config {
             cfg.adjust_ul_shaper_rate = false;
         }
         set_f64(
-            &single,
+            single,
             "min_dl_shaper_rate_kbps",
             &mut cfg.min_dl_shaper_rate_kbps,
         )?;
         set_f64(
-            &single,
+            single,
             "base_dl_shaper_rate_kbps",
             &mut cfg.base_dl_shaper_rate_kbps,
         )?;
         set_f64(
-            &single,
+            single,
             "max_dl_shaper_rate_kbps",
             &mut cfg.max_dl_shaper_rate_kbps,
         )?;
         set_f64(
-            &single,
+            single,
             "min_ul_shaper_rate_kbps",
             &mut cfg.min_ul_shaper_rate_kbps,
         )?;
         set_f64(
-            &single,
+            single,
             "base_ul_shaper_rate_kbps",
             &mut cfg.base_ul_shaper_rate_kbps,
         )?;
         set_f64(
-            &single,
+            single,
             "max_ul_shaper_rate_kbps",
             &mut cfg.max_ul_shaper_rate_kbps,
         )?;
         set_bool(
-            &single,
+            single,
             "adaptive_ceiling_enabled",
             &mut cfg.adaptive_ceiling_enabled,
         )?;
         let adaptive_dl_cap_configured = single.contains_key("adaptive_ceiling_dl_cap_kbps");
         let adaptive_ul_cap_configured = single.contains_key("adaptive_ceiling_ul_cap_kbps");
         set_f64(
-            &single,
+            single,
             "adaptive_ceiling_dl_cap_kbps",
             &mut cfg.adaptive_ceiling_dl_cap_kbps,
         )?;
         set_f64(
-            &single,
+            single,
             "adaptive_ceiling_ul_cap_kbps",
             &mut cfg.adaptive_ceiling_ul_cap_kbps,
         )?;
         set_f64(
-            &single,
+            single,
             "adaptive_ceiling_dl_safe_kbps",
             &mut cfg.adaptive_ceiling_dl_safe_kbps,
         )?;
         set_f64(
-            &single,
+            single,
             "adaptive_ceiling_ul_safe_kbps",
             &mut cfg.adaptive_ceiling_ul_safe_kbps,
         )?;
         set_string(
-            &single,
+            single,
             "adaptive_ceiling_dl_evidence",
             &mut cfg.adaptive_ceiling_dl_evidence,
         );
         set_string(
-            &single,
+            single,
             "adaptive_ceiling_ul_evidence",
             &mut cfg.adaptive_ceiling_ul_evidence,
         );
         set_f64(
-            &single,
+            single,
             "adaptive_ceiling_hold_time_s",
             &mut cfg.adaptive_ceiling_hold_time_s,
         )?;
         set_f64(
-            &single,
+            single,
             "adaptive_ceiling_growth_percent",
             &mut cfg.adaptive_ceiling_growth_percent,
         )?;
         set_f64(
-            &single,
+            single,
             "adaptive_ceiling_probe_duration_s",
             &mut cfg.adaptive_ceiling_probe_duration_s,
         )?;
         set_f64(
-            &single,
+            single,
             "adaptive_ceiling_cooldown_s",
             &mut cfg.adaptive_ceiling_cooldown_s,
         )?;
         set_f64(
-            &single,
+            single,
             "adaptive_ceiling_failed_bound_ttl_s",
             &mut cfg.adaptive_ceiling_failed_bound_ttl_s,
         )?;
         #[cfg(feature = "transport-probes")]
         {
             set_bool(
-                &single,
+                single,
                 "transport_latency_enabled",
                 &mut cfg.transport_latency_enabled,
             )?;
             set_bool(
-                &single,
+                single,
                 "transport_controller_enabled",
                 &mut cfg.transport_controller_enabled,
             )?;
             set_string(
-                &single,
+                single,
                 "transport_probe_backend",
                 &mut cfg.transport_probe_backend,
             );
             set_string(
-                &single,
+                single,
                 "transport_probe_endpoint",
                 &mut cfg.transport_probe_endpoint,
             );
             set_f64(
-                &single,
+                single,
                 "transport_probe_idle_interval_s",
                 &mut cfg.transport_probe_idle_interval_s,
             )?;
             set_f64(
-                &single,
+                single,
                 "transport_probe_loaded_interval_s",
                 &mut cfg.transport_probe_loaded_interval_s,
             )?;
             set_u64(
-                &single,
+                single,
                 "transport_probe_timeout_s",
                 &mut cfg.transport_probe_timeout_s,
             )?;
             set_f64(
-                &single,
+                single,
                 "transport_load_hold_s",
                 &mut cfg.transport_load_hold_s,
             )?;
             set_f64(
-                &single,
+                single,
                 "transport_cpu_max_percent",
                 &mut cfg.transport_cpu_max_percent,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_load_window_s",
                 &mut cfg.rating_load_window_s,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_load_enter_ratio",
                 &mut cfg.rating_load_enter_ratio,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_load_exit_ratio",
                 &mut cfg.rating_load_exit_ratio,
             )?;
-            set_f64(&single, "rating_load_hold_s", &mut cfg.rating_load_hold_s)?;
+            set_f64(single, "rating_load_hold_s", &mut cfg.rating_load_hold_s)?;
             set_f64(
-                &single,
+                single,
                 "rating_load_dropout_s",
                 &mut cfg.rating_load_dropout_s,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_load_min_kbps",
                 &mut cfg.rating_load_min_kbps,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_load_dominance_ratio",
                 &mut cfg.rating_load_dominance_ratio,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_capture_min_enter_ratio",
                 &mut cfg.rating_capture_min_enter_ratio,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_capture_peak_factor",
                 &mut cfg.rating_capture_peak_factor,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_capture_contamination_ratio",
                 &mut cfg.rating_capture_contamination_ratio,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_capture_ack_ratio",
                 &mut cfg.rating_capture_ack_ratio,
             )?;
             set_usize(
-                &single,
+                single,
                 "rating_capture_quiet_s",
                 &mut cfg.rating_capture_quiet_s,
             )?;
             set_usize(
-                &single,
+                single,
                 "rating_capture_quiet_timeout_s",
                 &mut cfg.rating_capture_quiet_timeout_s,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_capture_quiet_ratio",
                 &mut cfg.rating_capture_quiet_ratio,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_capture_quiet_min_kbps",
                 &mut cfg.rating_capture_quiet_min_kbps,
             )?;
             set_f64(
-                &single,
+                single,
                 "rating_episode_gap_s",
                 &mut cfg.rating_episode_gap_s,
             )?;
             set_f64(
-                &single,
+                single,
                 "quality_target_delay_ms",
                 &mut cfg.quality_target_delay_ms,
             )?;
             set_usize(
-                &single,
+                single,
                 "quality_search_max_steps",
                 &mut cfg.quality_search_max_steps,
             )?;
             set_f64(
-                &single,
+                single,
                 "quality_search_observe_s",
                 &mut cfg.quality_search_observe_s,
             )?;
             set_f64(
-                &single,
+                single,
                 "quality_search_cooldown_s",
                 &mut cfg.quality_search_cooldown_s,
             )?;
             set_bool(
-                &single,
+                single,
                 "throughput_guard_enabled",
                 &mut cfg.throughput_guard_enabled,
             )?;
             set_f64(
-                &single,
+                single,
                 "throughput_guard_retention_percent",
                 &mut cfg.throughput_guard_retention_percent,
             )?;
             set_f64(
-                &single,
+                single,
                 "throughput_guard_dl_floor_kbps",
                 &mut cfg.throughput_guard_dl_floor_kbps,
             )?;
             set_f64(
-                &single,
+                single,
                 "throughput_guard_ul_floor_kbps",
                 &mut cfg.throughput_guard_ul_floor_kbps,
             )?;
             set_f64(
-                &single,
+                single,
                 "throughput_reference_dl_p20_kbps",
                 &mut cfg.throughput_reference_dl_p20_kbps,
             )?;
             set_f64(
-                &single,
+                single,
                 "throughput_reference_dl_p50_kbps",
                 &mut cfg.throughput_reference_dl_p50_kbps,
             )?;
             set_f64(
-                &single,
+                single,
                 "throughput_reference_ul_p20_kbps",
                 &mut cfg.throughput_reference_ul_p20_kbps,
             )?;
             set_f64(
-                &single,
+                single,
                 "throughput_reference_ul_p50_kbps",
                 &mut cfg.throughput_reference_ul_p50_kbps,
             )?;
@@ -975,282 +975,282 @@ impl Config {
             cfg.adaptive_ceiling_ul_cap_kbps = cfg.max_ul_shaper_rate_kbps;
         }
         set_f64(
-            &single,
+            single,
             "connection_active_thr_kbps",
             &mut cfg.connection_active_thr_kbps,
         )?;
         set_bool(
-            &single,
+            single,
             "enable_sleep_function",
             &mut cfg.enable_sleep_function,
         )?;
         set_f64(
-            &single,
+            single,
             "sustained_idle_sleep_thr_s",
             &mut cfg.sustained_idle_sleep_thr_s,
         )?;
         set_bool(
-            &single,
+            single,
             "min_shaper_rates_enforcement",
             &mut cfg.min_shaper_rates_enforcement,
         )?;
-        set_usize(&single, "stall_detection_thr", &mut cfg.stall_detection_thr)?;
+        set_usize(single, "stall_detection_thr", &mut cfg.stall_detection_thr)?;
         set_f64(
-            &single,
+            single,
             "connection_stall_thr_kbps",
             &mut cfg.connection_stall_thr_kbps,
         )?;
         set_f64(
-            &single,
+            single,
             "global_ping_response_timeout_s",
             &mut cfg.global_ping_response_timeout_s,
         )?;
-        set_string(&single, "pinger_method", &mut cfg.pinger_method);
-        set_string(&single, "ping_extra_args", &mut cfg.ping_extra_args);
-        set_string(&single, "ping_prefix_string", &mut cfg.ping_prefix_string);
+        set_string(single, "pinger_method", &mut cfg.pinger_method);
+        set_string(single, "ping_extra_args", &mut cfg.ping_extra_args);
+        set_string(single, "ping_prefix_string", &mut cfg.ping_prefix_string);
         #[cfg(feature = "calibration")]
         set_f64(
-            &single,
+            single,
             "irtt_session_duration_m",
             &mut cfg.irtt_session_duration_m,
         )?;
-        set_string(&single, "reflectors_url", &mut cfg.reflectors_url);
+        set_string(single, "reflectors_url", &mut cfg.reflectors_url);
         set_usize(
-            &single,
+            single,
             "reflectors_url_skip_lines",
             &mut cfg.reflectors_url_skip_lines,
         )?;
         set_bool(
-            &single,
+            single,
             "randomize_reflectors",
             &mut cfg.randomize_reflectors,
         )?;
         set_bool(
-            &single,
+            single,
             "retain_reflector_stats",
             &mut cfg.retain_reflector_stats,
         )?;
-        set_usize(&single, "no_pingers", &mut cfg.no_pingers)?;
+        set_usize(single, "no_pingers", &mut cfg.no_pingers)?;
         set_f64(
-            &single,
+            single,
             "reflector_ping_interval_s",
             &mut cfg.reflector_ping_interval_s,
         )?;
         set_f64(
-            &single,
+            single,
             "reflector_health_check_interval_s",
             &mut cfg.reflector_health_check_interval_s,
         )?;
         set_f64(
-            &single,
+            single,
             "reflector_response_deadline_s",
             &mut cfg.reflector_response_deadline_s,
         )?;
         set_usize(
-            &single,
+            single,
             "reflector_misbehaving_detection_window",
             &mut cfg.reflector_misbehaving_detection_window,
         )?;
         set_usize(
-            &single,
+            single,
             "reflector_misbehaving_detection_thr",
             &mut cfg.reflector_misbehaving_detection_thr,
         )?;
         set_f64(
-            &single,
+            single,
             "reflector_replacement_interval_mins",
             &mut cfg.reflector_replacement_interval_mins,
         )?;
         set_f64(
-            &single,
+            single,
             "reflector_comparison_interval_mins",
             &mut cfg.reflector_comparison_interval_mins,
         )?;
         set_f64(
-            &single,
+            single,
             "reflector_sum_owd_baselines_delta_thr_ms",
             &mut cfg.reflector_sum_owd_baselines_delta_thr_ms,
         )?;
         set_f64(
-            &single,
+            single,
             "reflector_owd_delta_ewma_delta_thr_ms",
             &mut cfg.reflector_owd_delta_ewma_delta_thr_ms,
         )?;
         set_u64(
-            &single,
+            single,
             "monitor_achieved_rates_interval_ms",
             &mut cfg.monitor_achieved_rates_interval_ms,
         )?;
         set_usize(
-            &single,
+            single,
             "bufferbloat_detection_window",
             &mut cfg.bufferbloat_detection_window,
         )?;
         set_usize(
-            &single,
+            single,
             "bufferbloat_detection_thr",
             &mut cfg.bufferbloat_detection_thr,
         )?;
-        set_f64(&single, "high_load_thr", &mut cfg.high_load_thr)?;
+        set_f64(single, "high_load_thr", &mut cfg.high_load_thr)?;
         set_f64(
-            &single,
+            single,
             "dl_owd_delta_delay_thr_ms",
             &mut cfg.dl_owd_delta_delay_thr_ms,
         )?;
         set_f64(
-            &single,
+            single,
             "ul_owd_delta_delay_thr_ms",
             &mut cfg.ul_owd_delta_delay_thr_ms,
         )?;
         set_f64(
-            &single,
+            single,
             "dl_avg_owd_delta_max_adjust_up_thr_ms",
             &mut cfg.dl_avg_owd_delta_max_adjust_up_thr_ms,
         )?;
         set_f64(
-            &single,
+            single,
             "ul_avg_owd_delta_max_adjust_up_thr_ms",
             &mut cfg.ul_avg_owd_delta_max_adjust_up_thr_ms,
         )?;
         set_f64(
-            &single,
+            single,
             "dl_avg_owd_delta_max_adjust_down_thr_ms",
             &mut cfg.dl_avg_owd_delta_max_adjust_down_thr_ms,
         )?;
         set_f64(
-            &single,
+            single,
             "ul_avg_owd_delta_max_adjust_down_thr_ms",
             &mut cfg.ul_avg_owd_delta_max_adjust_down_thr_ms,
         )?;
         set_f64(
-            &single,
+            single,
             "alpha_baseline_increase",
             &mut cfg.alpha_baseline_increase,
         )?;
         set_f64(
-            &single,
+            single,
             "alpha_baseline_decrease",
             &mut cfg.alpha_baseline_decrease,
         )?;
-        set_f64(&single, "alpha_delta_ewma", &mut cfg.alpha_delta_ewma)?;
+        set_f64(single, "alpha_delta_ewma", &mut cfg.alpha_delta_ewma)?;
         set_f64(
-            &single,
+            single,
             "shaper_rate_min_adjust_down_bufferbloat",
             &mut cfg.shaper_rate_min_adjust_down_bufferbloat,
         )?;
         set_f64(
-            &single,
+            single,
             "shaper_rate_max_adjust_down_bufferbloat",
             &mut cfg.shaper_rate_max_adjust_down_bufferbloat,
         )?;
         set_f64(
-            &single,
+            single,
             "shaper_rate_min_adjust_up_load_high",
             &mut cfg.shaper_rate_min_adjust_up_load_high,
         )?;
         set_f64(
-            &single,
+            single,
             "shaper_rate_max_adjust_up_load_high",
             &mut cfg.shaper_rate_max_adjust_up_load_high,
         )?;
         set_f64(
-            &single,
+            single,
             "shaper_rate_adjust_down_load_low",
             &mut cfg.shaper_rate_adjust_down_load_low,
         )?;
         set_f64(
-            &single,
+            single,
             "shaper_rate_adjust_up_load_low",
             &mut cfg.shaper_rate_adjust_up_load_low,
         )?;
         set_u64(
-            &single,
+            single,
             "bufferbloat_refractory_period_ms",
             &mut cfg.bufferbloat_refractory_period_ms,
         )?;
         set_u64(
-            &single,
+            single,
             "decay_refractory_period_ms",
             &mut cfg.decay_refractory_period_ms,
         )?;
         set_bool(
-            &single,
+            single,
             "output_processing_stats",
             &mut cfg.output_processing_stats,
         )?;
         set_bool(
-            &single,
+            single,
             "output_summary_stats",
             &mut cfg.output_summary_stats,
         )?;
-        set_bool(&single, "output_load_stats", &mut cfg.output_load_stats)?;
+        set_bool(single, "output_load_stats", &mut cfg.output_load_stats)?;
         set_bool(
-            &single,
+            single,
             "output_reflector_stats",
             &mut cfg.output_reflector_stats,
         )?;
-        set_bool(&single, "output_cake_changes", &mut cfg.output_cake_changes)?;
-        set_bool(&single, "output_cpu_stats", &mut cfg.output_cpu_stats)?;
+        set_bool(single, "output_cake_changes", &mut cfg.output_cake_changes)?;
+        set_bool(single, "output_cpu_stats", &mut cfg.output_cpu_stats)?;
         set_bool(
-            &single,
+            single,
             "output_cpu_raw_stats",
             &mut cfg.output_cpu_raw_stats,
         )?;
         set_bool(
-            &single,
+            single,
             "graph_history_enabled",
             &mut cfg.graph_history_enabled,
         )?;
         set_u64(
-            &single,
+            single,
             "graph_history_interval_s",
             &mut cfg.graph_history_interval_s,
         )?;
-        set_bool(&single, "log_to_file", &mut cfg.log_to_file)?;
-        set_bool(&single, "debug", &mut cfg.debug)?;
+        set_bool(single, "log_to_file", &mut cfg.log_to_file)?;
+        set_bool(single, "debug", &mut cfg.debug)?;
         set_bool(
-            &single,
+            single,
             "log_DEBUG_messages_to_syslog",
             &mut cfg.log_debug_messages_to_syslog,
         )?;
         set_u64(
-            &single,
+            single,
             "log_file_max_time_mins",
             &mut cfg.log_file_max_time_mins,
         )?;
         set_u64(
-            &single,
+            single,
             "log_file_max_size_KB",
             &mut cfg.log_file_max_size_kb,
         )?;
         set_string(
-            &single,
+            single,
             "log_file_path_override",
             &mut cfg.log_file_path_override,
         );
         set_u64(
-            &single,
+            single,
             "log_file_buffer_size_B",
             &mut cfg.log_file_buffer_size_b,
         )?;
         set_u64(
-            &single,
+            single,
             "log_file_buffer_timeout_ms",
             &mut cfg.log_file_buffer_timeout_ms,
         )?;
         set_bool(
-            &single,
+            single,
             "log_file_export_compress",
             &mut cfg.log_file_export_compress,
         )?;
-        set_f64(&single, "startup_wait_s", &mut cfg.startup_wait_s)?;
+        set_f64(single, "startup_wait_s", &mut cfg.startup_wait_s)?;
         set_f64(
-            &single,
+            single,
             "if_up_check_interval_s",
             &mut cfg.if_up_check_interval_s,
         )?;
         set_u64(
-            &single,
+            single,
             "monitor_cpu_usage_interval_ms",
             &mut cfg.monitor_cpu_usage_interval_ms,
         )?;
@@ -2733,7 +2733,7 @@ fn change_cake_rate(
     rate_kbps: u64,
     qdisc_kind: CakeQdiscKind,
 ) -> Result<(), String> {
-    if interface.is_empty() || rate_kbps < 100 || rate_kbps > rate_limits::MAX_RATE_KBPS {
+    if interface.is_empty() || !(100..=rate_limits::MAX_RATE_KBPS).contains(&rate_kbps) {
         return Err("requested CAKE rate is outside the supported range".to_string());
     }
     let output = tc_output(&["qdisc", "show", "dev", interface])?;
@@ -3749,7 +3749,7 @@ impl AutotuneTransportControl {
             let dropout_exceeded = self
                 .last_candidate_seen
                 .and_then(|seen| now.checked_duration_since(seen))
-                .map_or(true, |elapsed| elapsed > dropout);
+                .is_none_or(|elapsed| elapsed > dropout);
             if dropout_exceeded {
                 self.candidate_phase = (false, false);
                 self.candidate_since = None;
@@ -11228,10 +11228,9 @@ fn run_with_service_input(
         return Ok(());
     }
 
-    if cfg.startup_wait_s > 0.0 {
-        if !interruptible_wait(Duration::from_secs_f64(cfg.startup_wait_s)) {
-            return Ok(());
-        }
+    if cfg.startup_wait_s > 0.0 && !interruptible_wait(Duration::from_secs_f64(cfg.startup_wait_s))
+    {
+        return Ok(());
     }
     if let Some(input) = &input {
         input.guard.attest()?;
@@ -12721,10 +12720,9 @@ fn parse_irtt_duration_us(value: &str) -> Option<f64> {
         (number, 1.0)
     } else if let Some(number) = value.strip_suffix("ns") {
         (number, 0.001)
-    } else if let Some(number) = value.strip_suffix('s') {
-        (number, 1_000_000.0)
     } else {
-        return None;
+        let number = value.strip_suffix('s')?;
+        (number, 1_000_000.0)
     };
 
     Some(number.parse::<f64>().ok()? * multiplier)
@@ -14478,8 +14476,8 @@ where
     let upload = validated_conservative_samples(&upload, conservative_background_ul_kbps)?;
 
     let mut proposal = build_proposal_for_profile_with_context(
-        &download,
-        &upload,
+        download,
+        upload,
         LatencyBaseline {
             median_ms: idle_median_ms.ok_or_else(|| "--idle-median-ms is required".to_string())?,
             p95_ms: idle_p95_ms.ok_or_else(|| "--idle-p95-ms is required".to_string())?,
@@ -17014,10 +17012,7 @@ esac\n",
             "FAKE_SYS",
             "FAKE_TC_STATE",
         ];
-        let previous_values: Vec<_> = variable_names
-            .iter()
-            .map(|name| env::var_os(name))
-            .collect();
+        let previous_values: Vec<_> = variable_names.iter().map(env::var_os).collect();
         env::set_var("CAKE_AUTORATE_IP", &fake_ip);
         env::set_var("CAKE_AUTORATE_TC", &fake_tc);
         env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
@@ -17227,10 +17222,7 @@ esac\n",
             "CAKE_AUTORATE_SYS_CLASS_NET",
             "FAKE_TC_LOG",
         ];
-        let previous_values: Vec<_> = variable_names
-            .iter()
-            .map(|name| env::var_os(name))
-            .collect();
+        let previous_values: Vec<_> = variable_names.iter().map(env::var_os).collect();
         env::set_var("CAKE_AUTORATE_TC", &tc);
         env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
         env::set_var("FAKE_TC_LOG", &tc_log);
@@ -17524,10 +17516,7 @@ esac\n",
             "CAKE_AUTORATE_TC",
             "CAKE_AUTORATE_SQM_RECOVER",
         ];
-        let previous_values: Vec<_> = variable_names
-            .iter()
-            .map(|name| env::var_os(name))
-            .collect();
+        let previous_values: Vec<_> = variable_names.iter().map(env::var_os).collect();
         env::set_var("CAKE_AUTORATE_RUN_ROOT", root.join("run"));
         env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
         env::set_var("CAKE_AUTORATE_TC", &tc);
@@ -17616,10 +17605,7 @@ esac\n",
             "CAKE_AUTORATE_TC",
             "CAKE_AUTORATE_SQM_RECOVER",
         ];
-        let previous_values: Vec<_> = variable_names
-            .iter()
-            .map(|name| env::var_os(name))
-            .collect();
+        let previous_values: Vec<_> = variable_names.iter().map(env::var_os).collect();
         env::set_var("CAKE_AUTORATE_RUN_ROOT", root.join("run"));
         env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
         env::set_var("CAKE_AUTORATE_TC", &tc);
@@ -17768,10 +17754,7 @@ esac\n",
             "CAKE_AUTORATE_TC",
             "CAKE_AUTORATE_SQM_RECOVER",
         ];
-        let previous_values: Vec<_> = variable_names
-            .iter()
-            .map(|name| env::var_os(name))
-            .collect();
+        let previous_values: Vec<_> = variable_names.iter().map(env::var_os).collect();
         env::set_var("CAKE_AUTORATE_RUN_ROOT", root.join("run"));
         env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
         env::set_var("CAKE_AUTORATE_TC", &tc);
@@ -19613,9 +19596,8 @@ esac\n",
                 AutotuneCapturePhase::LoadedMeasurement,
                 topology,
             );
-            assert_eq!(
+            assert!(
                 autotune_capture_uses_identity_bound_speedtest_counters(&request),
-                true,
                 "{} loaded counter policy",
                 topology.as_str()
             );

@@ -1820,16 +1820,11 @@ fn controller_start_authority(
     let cake = snapshot.package(CAKE_PACKAGE)?;
     let sqm = snapshot.package(SQM_PACKAGE)?;
     let mut projected_sqm = sqm.clone();
-    let projection = plan_projection(
-        &cake,
-        &mut projected_sqm,
-        environment,
-        &ProjectionScope::All,
-    )?;
+    let projection = plan_projection(cake, &mut projected_sqm, environment, &ProjectionScope::All)?;
     if &projected_sqm != sqm {
         return Err("controller readiness found a pending SQM projection".to_string());
     }
-    let plan = plan_start(&cake, &sqm, environment, &projection)?;
+    let plan = plan_start(cake, sqm, environment, &projection)?;
     Ok(ControllerStartAuthority {
         source,
         instances: plan.instances,
@@ -4828,7 +4823,7 @@ fn inspect_controller_process(
     let fields = stat[close + 1..]
         .split_ascii_whitespace()
         .collect::<Vec<_>>();
-    if fields.len() <= 19 || fields[0].as_bytes().len() != 1 {
+    if fields.len() <= 19 || fields[0].len() != 1 {
         return Err("controller process identity has too few fields".to_string());
     }
     if matches!(fields[0], "Z" | "X" | "x") {
@@ -5796,7 +5791,7 @@ mod tests {
         assert!(
             StartCandidate::prepare_with_mq_refresh(snapshot, &mq_resolver, &wrapper, |_| {
                 mq_resolver.proof.set(true);
-                fs::write(config.join(CAKE_PACKAGE), &source).unwrap();
+                fs::write(config.join(CAKE_PACKAGE), source).unwrap();
                 Ok(())
             })
             .is_err(),
@@ -6564,7 +6559,7 @@ mod tests {
                 drop(published);
             }
             let input_root = paths.runtime_root.join(".controller-input");
-            if matches!(case, 2 | 3 | 4) {
+            if matches!(case, 2..=4) {
                 fs::create_dir(&input_root).unwrap();
                 fs::set_permissions(&input_root, fs::Permissions::from_mode(0o700)).unwrap();
                 let draft = if case == 4 {

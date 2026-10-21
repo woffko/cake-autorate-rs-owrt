@@ -1740,9 +1740,7 @@ impl NativeApplyRecoveryStore {
             sync_directory(&self.root)?;
             Ok::<(), String>(())
         })();
-        if let Err(error) = publish {
-            return Err(error);
-        }
+        publish?;
 
         let stored = self
             .read_record()?
@@ -1817,9 +1815,7 @@ impl NativeApplyRecoveryStore {
             sync_directory(&self.root)?;
             Ok::<(), String>(())
         })();
-        if let Err(error) = publish {
-            return Err(error);
-        }
+        publish?;
 
         let stored = self
             .read_record()?

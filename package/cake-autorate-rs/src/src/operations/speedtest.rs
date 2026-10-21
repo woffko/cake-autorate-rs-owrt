@@ -113,9 +113,7 @@ fn minimum_attempt_budget(direction: SpeedtestDirection, safety_reserve_bytes: u
         SpeedtestDirection::Both => 2 * MIN_ROUTE_PROOF_BYTES,
         SpeedtestDirection::Download | SpeedtestDirection::Upload => MIN_ROUTE_PROOF_BYTES,
     };
-    safety_reserve_bytes
-        .checked_add(route_proof)
-        .unwrap_or(u64::MAX)
+    safety_reserve_bytes.saturating_add(route_proof)
 }
 
 pub(crate) fn minimum_speedtest_traffic_budget_bytes(
@@ -2225,9 +2223,7 @@ pub(crate) fn qualify_embedded_speedtest_server_in_session(
         session,
         request,
         remaining_traffic_budget,
-        traffic_safety_reserve_bytes
-            .checked_add(1)
-            .unwrap_or(u64::MAX),
+        traffic_safety_reserve_bytes.saturating_add(1),
         || session.owned_traffic_snapshot(),
         |budget| {
             let mut bounded_request = request.clone();
@@ -4633,16 +4629,15 @@ where
         arguments: arguments.iter().map(OsString::from).collect(),
         environment: Vec::new(),
     };
-    let output =
-        run_bounded_command_output(&spec, timeout, COMMAND_OUTPUT_LIMIT, || should_cancel())
-            .map_err(|error| match error.as_str() {
-                "bounded-command-timeout" => "speedtest-accounting-timeout".to_string(),
-                "bounded-command-cancelled" => "speedtest-accounting-cancelled".to_string(),
-                "bounded-command-output-too-large" => {
-                    "speedtest-accounting-output-too-large".to_string()
-                }
-                _ => format!("speedtest-accounting-command-failed: {error}"),
-            })?;
+    let output = run_bounded_command_output(&spec, timeout, COMMAND_OUTPUT_LIMIT, should_cancel)
+        .map_err(|error| match error.as_str() {
+            "bounded-command-timeout" => "speedtest-accounting-timeout".to_string(),
+            "bounded-command-cancelled" => "speedtest-accounting-cancelled".to_string(),
+            "bounded-command-output-too-large" => {
+                "speedtest-accounting-output-too-large".to_string()
+            }
+            _ => format!("speedtest-accounting-command-failed: {error}"),
+        })?;
     Ok((output.status.success(), output.stdout))
 }
 
@@ -5456,12 +5451,14 @@ fn hex_encode(value: &str) -> String {
 }
 
 fn hex_decode(value: &str) -> Result<String, String> {
-    if value.len() > 512 || value.len() % 2 != 0 {
+    if value.len() > 512 || !value.len().is_multiple_of(2) {
         return Err("speedtest-terminal-text-invalid".to_string());
     }
     let bytes = value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let text = std::str::from_utf8(pair)
                 .map_err(|_| "speedtest-terminal-text-invalid".to_string())?;
@@ -9352,7 +9349,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
                 attempts.set(attempt);
                 let current = counters.get();
                 counters.set((current.0 + 10, current.1 + 20));
-                if attempt % 2 == 0 {
+                if attempt.is_multiple_of(2) {
                     Err("speedtest-route-not-ready".to_string())
                 } else {
                     Err("speedtest-route-traffic-unproved".to_string())

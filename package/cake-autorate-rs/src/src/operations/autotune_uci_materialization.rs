@@ -1920,7 +1920,7 @@ mod tests {
         assert!(UciConfigParser::new(&vec![b'x'; MAX_UCI_FILE_BYTES + 1], b"wan_sqm").is_err());
 
         let mut oversized_token = b"config cake_autorate 'wan_sqm'\n\toption note '".to_vec();
-        oversized_token.extend(std::iter::repeat(b'x').take(MAX_UCI_TOKEN_BYTES + 1));
+        oversized_token.extend(std::iter::repeat_n(b'x', MAX_UCI_TOKEN_BYTES + 1));
         oversized_token.extend_from_slice(b"'\n");
         assert!(UciConfigParser::new(&oversized_token, b"wan_sqm")
             .unwrap()

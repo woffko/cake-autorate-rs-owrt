@@ -10366,7 +10366,7 @@ impl NativeShapedCapacityFallbackResult {
             self.boundary.kind(),
             self.boundary
                 .candidate_kbps()
-                .unwrap_or_else(|| match self.failed_direction {
+                .unwrap_or(match self.failed_direction {
                     EvidenceDirection::Download => self.selected_dl_kbps,
                     EvidenceDirection::Upload => self.selected_ul_kbps,
                 }),
@@ -12856,7 +12856,7 @@ fn native_apply_execution_plans_transaction(
             auto_apply_evidence_pass,
             manual_review_required,
             required_acknowledgements: &required_acknowledgements,
-            artifacts: artifacts.clone(),
+            artifacts: artifacts,
         })
     };
     let selected_topology_option = topology.selected_topology != MeasurementTopology::ShapedBoth;
@@ -16566,7 +16566,7 @@ fn run_directional_measurement_with_recovery(
                 )?;
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         }
         let load_result = {
             let (accounting, expected_ack, expected_checkpoint) =
@@ -16615,7 +16615,7 @@ fn run_directional_measurement_with_recovery(
                 )?;
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         };
         return measurement_evidence_from_capture(&snapshot, &load).map_err(CaptureWaitError::from);
     }
@@ -17729,7 +17729,7 @@ fn run_native_topology_comparison(
             // Before any traffic: a repeat at another rate would only be
             // refused by the replay after it had been measured.
             if !topology_repeat_follows_pair(
-                &pair,
+                pair,
                 control.topology,
                 control.download_kbps,
                 control.upload_kbps,
@@ -31987,7 +31987,7 @@ mod tests {
         ];
         let mut state = AutotuneReplayState::new(&request, &"66".repeat(16)).unwrap();
         for event in &base {
-            state.apply(&event).unwrap();
+            state.apply(event).unwrap();
         }
 
         state

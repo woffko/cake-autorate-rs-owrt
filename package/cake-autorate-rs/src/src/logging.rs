@@ -784,7 +784,7 @@ mod tests {
     fn records_and_stderr_stay_bounded_and_preserve_utf8() {
         for cap in [1, 2, 12, 24, 48, 16384] {
             let record = bounded_record(&"ж".repeat(20000), cap);
-            assert!(record.len() + 1 <= cap as usize);
+            assert!(record.len() < cap as usize);
             assert!(std::str::from_utf8(record.as_bytes()).is_ok());
         }
         let text = stderr_line(&format!("ERROR\n\x1b{}", "ж".repeat(10000)));

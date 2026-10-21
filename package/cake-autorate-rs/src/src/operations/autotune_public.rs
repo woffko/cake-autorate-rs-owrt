@@ -594,12 +594,10 @@ fn validate_single_json_object(value: &str, label: &str) -> Result<(), String> {
                     ));
                 }
             }
-            b']' => {
-                if stack.pop() != Some(b'[') {
-                    return Err(format!(
-                        "native public {label} artifact is structurally invalid"
-                    ));
-                }
+            b']' if stack.pop() != Some(b'[') => {
+                return Err(format!(
+                    "native public {label} artifact is structurally invalid"
+                ));
             }
             _ => {}
         }

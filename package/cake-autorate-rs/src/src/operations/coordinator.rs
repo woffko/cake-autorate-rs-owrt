@@ -676,8 +676,8 @@ where
                 "{}",
                 send_operation_control(&state_dir, ControlCommand::Status, operation)?
             ),
-            None => print!(
-                "{{\"state\":\"idle\",\"instance\":\"{}\"}}\n",
+            None => println!(
+                "{{\"state\":\"idle\",\"instance\":\"{}\"}}",
                 json_escape(&instance)
             ),
         }
@@ -695,8 +695,8 @@ where
                 "{}",
                 send_operation_control(&state_dir, ControlCommand::Status, operation)?
             ),
-            None => print!(
-                "{{\"state\":\"idle\",\"instance\":\"{}\"}}\n",
+            None => println!(
+                "{{\"state\":\"idle\",\"instance\":\"{}\"}}",
                 json_escape(&instance)
             ),
         }
@@ -714,8 +714,8 @@ where
                 "{}",
                 send_operation_control(&state_dir, ControlCommand::Status, operation)?
             ),
-            None => print!(
-                "{{\"state\":\"idle\",\"instance\":\"{}\"}}\n",
+            None => println!(
+                "{{\"state\":\"idle\",\"instance\":\"{}\"}}",
                 json_escape(&instance)
             ),
         }
@@ -1671,7 +1671,7 @@ pub(crate) fn exercise_history_publication_from_canonical_fixture(
     );
     assert!(require_prior_raw_apply_admission(
         &state_dir,
-        &[job.clone()],
+        std::slice::from_ref(&job),
         &request.identity.job_id
     )
     .is_err());
@@ -8917,7 +8917,6 @@ fn private_log_file(path: &Path) -> Result<fs::File, String> {
 
 fn private_append_log_file(path: &Path, label: &str) -> Result<fs::File, String> {
     let file = OpenOptions::new()
-        .write(true)
         .append(true)
         .create(true)
         .mode(0o600)
@@ -8939,7 +8938,6 @@ fn private_append_log_file(path: &Path, label: &str) -> Result<fs::File, String>
 
 fn private_runtime_owner_log_file(path: &Path) -> Result<fs::File, String> {
     let file = OpenOptions::new()
-        .write(true)
         .append(true)
         .create(true)
         .mode(0o600)

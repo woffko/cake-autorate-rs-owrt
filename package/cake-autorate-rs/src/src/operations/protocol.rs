@@ -1849,9 +1849,9 @@ fn require_safe_identifier(
     punctuation: &[u8],
 ) -> Result<(), String> {
     if !(minimum..=maximum).contains(&value.len())
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || punctuation.iter().any(|allowed| *allowed == byte)
-        })
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte))
     {
         return Err(format!("{name} contains unsupported characters or length"));
     }

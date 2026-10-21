@@ -283,7 +283,7 @@ impl ManagedChild {
         proc_root: &Path,
         grace: Duration,
     ) -> Result<TerminationOutcome, String> {
-        if let Some(_) = self.try_wait()? {
+        if self.try_wait()?.is_some() {
             return Ok(TerminationOutcome::Exited);
         }
         if !self.identity.still_matches(proc_root)? {

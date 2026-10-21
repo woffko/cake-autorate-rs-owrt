@@ -257,11 +257,9 @@ impl Guard {
             .sources
             .attest(&self.config_root)
             .and_then(|_| attest_runtime_generation(&self.instance, &self.id));
-        if proof.is_err() {
-            if super::committed_uci::file_identity(&path, &file, true)? == written {
-                io(fs::remove_file(path))?;
-                io(directory.file.sync_all())?;
-            }
+        if proof.is_err() && super::committed_uci::file_identity(&path, &file, true)? == written {
+            io(fs::remove_file(path))?;
+            io(directory.file.sync_all())?;
         }
         proof?;
         self.attest()

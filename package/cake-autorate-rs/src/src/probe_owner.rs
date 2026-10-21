@@ -40,7 +40,7 @@ pub(crate) fn attest_system_probe_namespace() -> Result<(), &'static str> {
         }
     }
     if fs::read_link("/proc/self").map_err(|_| "probe-owner-namespace-unavailable")?
-        != PathBuf::from(std::process::id().to_string())
+        != std::process::id().to_string()
     {
         return Err("probe-owner-proc-pid-namespace-mismatch");
     }

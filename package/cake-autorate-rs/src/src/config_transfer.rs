@@ -294,7 +294,11 @@ impl Store {
         Ok((path, file, record))
     }
     fn append(&self, token: &str, request_id: &str, offset: usize, hex: &str) -> Result<Value> {
-        if hex.is_empty() || hex.len() > CHUNK_BYTES * 2 || hex.len() % 2 != 0 || !hex.is_ascii() {
+        if hex.is_empty()
+            || hex.len() > CHUNK_BYTES * 2
+            || !hex.len().is_multiple_of(2)
+            || !hex.is_ascii()
+        {
             return Err("candidate-chunk-invalid");
         }
         let bytes = (0..hex.len())

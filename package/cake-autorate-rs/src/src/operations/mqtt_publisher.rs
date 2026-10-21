@@ -491,7 +491,7 @@ fn connect_with_retry<T>(
             Ok(client) => return Ok(Some((client, failures > 0))),
             Err(error) => {
                 failures = failures.saturating_add(1);
-                if failures == 1 || error != last || failures % CONNECT_ERROR_REPEAT == 0 {
+                if failures == 1 || error != last || failures.is_multiple_of(CONNECT_ERROR_REPEAT) {
                     report(&error);
                 }
                 last = error;
@@ -940,11 +940,11 @@ fn read_service_plan(root: &Path, instance: &str) -> Result<MqttPublisherConfig,
 }
 
 fn read_plan_file(path: &Path, instance: &str) -> Result<MqttPublisherConfig, String> {
-    inspect_plan_file(&path)?.ok_or_else(|| format!("MQTT plan for {instance} is missing"))?;
+    inspect_plan_file(path)?.ok_or_else(|| format!("MQTT plan for {instance} is missing"))?;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
+        .open(path)
         .map_err(|error| format!("unable to open MQTT plan: {error}"))?;
     let before = file
         .metadata()
@@ -957,7 +957,7 @@ fn read_plan_file(path: &Path, instance: &str) -> Result<MqttPublisherConfig, St
     let after = file
         .metadata()
         .map_err(|error| format!("unable to reinspect MQTT plan: {error}"))?;
-    let current = inspect_plan_file(&path)?
+    let current = inspect_plan_file(path)?
         .ok_or_else(|| "MQTT plan disappeared while it was read".to_string())?;
     if bytes.len() > MAX_PLAN_BYTES
         || before.dev() != after.dev()
@@ -1782,8 +1782,7 @@ impl AsRawFd for MonotonicTimer {
 fn duration_timespec(value: Duration) -> libc::timespec {
     libc::timespec {
         tv_sec: value.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
-        tv_nsec: libc::c_long::try_from(value.subsec_nanos())
-            .expect("a normalized Duration nanosecond field fits in c_long"),
+        tv_nsec: libc::c_long::from(value.subsec_nanos()),
     }
 }
 

@@ -1453,12 +1453,14 @@ fn parse_qdisc_handle(value: &str) -> Result<u32, String> {
 }
 
 fn decode_lower_hex(value: &str) -> Result<Vec<u8>, String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err("lower-hex byte string has an odd length".to_string());
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let text = std::str::from_utf8(pair)
                 .map_err(|_| "lower-hex byte string is not ASCII".to_string())?;

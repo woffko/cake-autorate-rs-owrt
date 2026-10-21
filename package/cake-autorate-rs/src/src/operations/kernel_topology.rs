@@ -1477,9 +1477,9 @@ fn validate_identifier(
 ) -> Result<(), KernelTopologyError> {
     if value.is_empty()
         || value.len() > maximum
-        || value.bytes().any(|byte| {
-            !byte.is_ascii_alphanumeric() && !punctuation.iter().any(|allowed| *allowed == byte)
-        })
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !punctuation.contains(&byte))
     {
         return invalid(format!("{label} is invalid"));
     }

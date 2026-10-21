@@ -658,7 +658,7 @@ impl<I: NetlinkIo> NetlinkTopologyReader<I> {
         budget: &mut ReadBudget,
         parse_payload: &mut impl FnMut(&[u8], &mut ReadBudget) -> Result<(), KernelTopologyError>,
     ) -> Result<(), KernelTopologyError> {
-        self.io.send_request(&request, deadline)?;
+        self.io.send_request(request, deadline)?;
         let mut done = false;
         while !done {
             let received = self.io.receive_datagram(buffer, deadline)?;

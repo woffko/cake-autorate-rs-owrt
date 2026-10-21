@@ -233,7 +233,7 @@ fn read_uci_query(query: &str, label: &str) -> Result<Vec<u8>, String> {
         return Err(format!("{label} UCI query is invalid"));
     }
     let mut child = Command::new("uci")
-        .args(["-q", "show", &query])
+        .args(["-q", "show", query])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -459,7 +459,7 @@ fn bootstrap_uci_scalar<'a>(
     Ok(Some(value))
 }
 
-fn effective_cake_target<'a>(section: &'a ParsedUciSection) -> Result<&'a str, String> {
+fn effective_cake_target(section: &ParsedUciSection) -> Result<&str, String> {
     let sqm_interface = bootstrap_uci_scalar(section, "sqm_interface", "SQM target")?
         .filter(|value| !value.is_empty());
     let wan_interface =
