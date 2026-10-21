@@ -1897,10 +1897,7 @@ impl Config {
     }
 
     fn run_dir(&self) -> PathBuf {
-        env::var_os("CAKE_AUTORATE_RUN_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/var/run/cake-autorate"))
-            .join(&self.instance)
+        run_root().join(&self.instance)
     }
 
     fn log_path(&self) -> PathBuf {
@@ -5466,20 +5463,25 @@ fn compute_history_budget(
     }
 }
 
+/// The runtime root of the instances (`CAKE_AUTORATE_RUN_ROOT` for tests).
+fn run_root() -> PathBuf {
+    env::var_os("CAKE_AUTORATE_RUN_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/run/cake-autorate"))
+}
+
+/// Free memory and the history files are measured again; the configured
+/// budget and the instance count are the ones this controller was started
+/// with (its frozen input). A change of them reloads the controllers.
 fn history_budget_snapshot(cfg: &Config) -> HistoryBudgetSnapshot {
     let memory = read_memory_info().unwrap_or_default();
-    let root = Path::new("/var/run/cake-autorate");
-    let used_total_kib = history_usage_bytes(root).div_ceil(1024);
+    let used_total_kib = history_usage_bytes(&run_root()).div_ceil(1024);
     let used_instance_kib = fs::metadata(cfg.graph_history_path())
         .map(|metadata| metadata.len().div_ceil(1024))
         .unwrap_or(0);
-    let (configured_kib, instances) = load_global_history_config().unwrap_or((
+    compute_history_budget(
         cfg.graph_history_ram_budget_kib,
         cfg.graph_history_instance_count,
-    ));
-    compute_history_budget(
-        configured_kib,
-        instances,
         memory,
         used_total_kib,
         used_instance_kib,
@@ -8627,7 +8629,7 @@ impl Controller {
                 .map(|metadata| metadata.len().div_ceil(1024))
                 .unwrap_or(0);
             self.history_budget.used_total_kib =
-                history_usage_bytes(Path::new("/var/run/cake-autorate")).div_ceil(1024);
+                history_usage_bytes(&run_root()).div_ceil(1024);
         }
     }
 
@@ -16214,6 +16216,25 @@ mod tests {
         );
         assert!(critical.paused_low_memory);
         assert_eq!(critical.effective_total_kib, 0);
+    }
+
+    /// The periodic refresh measures memory and files again but keeps the
+    /// budget this controller was started with: the controller loop starts
+    /// no `uci` process for it.
+    #[test]
+    fn graph_history_refresh_keeps_the_frozen_budget_and_reads_no_configuration() {
+        let mut cfg = Config::defaults("frozen_history".to_string());
+        cfg.graph_history_ram_budget_kib = Some(777);
+        cfg.graph_history_instance_count = 3;
+        let snapshot = super::history_budget_snapshot(&cfg);
+        assert_eq!(snapshot.configured_kib, Some(777));
+        let source = include_str!("main.rs");
+        let start = source
+            .find("\nfn history_budget_snapshot(")
+            .expect("history budget refresh exists");
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        assert!(!body.contains("load_global_history_config"));
+        assert!(!body.contains("Command::new"));
     }
 
     #[test]
