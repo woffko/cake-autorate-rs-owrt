@@ -4686,12 +4686,13 @@ fn discover_controllers_with_policy(
         let Some((kind, instance)) = controller_instance(&entry.path().join("cmdline"))? else {
             continue;
         };
-        let (identity, parent) =
-            match inspect_controller_process(&entry.path().join("stat"), pid, kind, &instance) {
-                Ok(found) => found,
-                Err(error) if error == "controller process is a zombie" => continue,
-                Err(error) => return Err(error),
-            };
+        // A controller that exits now, or a helper of one that execs or exits
+        // (it carries the controller's command line until exec), is gone.
+        let Some((identity, parent)) =
+            inspect_controller_process(&entry.path().join("stat"), pid, kind, &instance)?
+        else {
+            continue;
+        };
         if identity.process_group == 0 || identity.starttime_ticks == 0 {
             return Err("controller process identity contains a zero field".to_string());
         }
@@ -4792,21 +4793,26 @@ fn inspect_controller_identity(
     pid: u32,
     kind: ServiceProcessKind,
     instance: &str,
-) -> Result<ControllerIdentity, String> {
-    inspect_controller_process(path, pid, kind, instance).map(|(identity, _)| identity)
+) -> Result<Option<ControllerIdentity>, String> {
+    inspect_controller_process(path, pid, kind, instance)
+        .map(|found| found.map(|(identity, _)| identity))
 }
 
-/// The identity and the parent PID from one read of /proc/<pid>/stat.
+/// The identity and the parent PID from one read of /proc/<pid>/stat. None
+/// when the process is gone or exiting (Z or X): absent, not an error.
 fn inspect_controller_process(
     path: &Path,
     pid: u32,
     kind: ServiceProcessKind,
     instance: &str,
-) -> Result<(ControllerIdentity, u32), String> {
+) -> Result<Option<(ControllerIdentity, u32)>, String> {
     let stat = match fs::read_to_string(path) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err("controller disappeared during process snapshot".to_string())
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None)
         }
         Err(error) => {
             return Err(format!(
@@ -4826,8 +4832,8 @@ fn inspect_controller_process(
     if fields.len() <= 19 || fields[0].as_bytes().len() != 1 {
         return Err("controller process identity has too few fields".to_string());
     }
-    if fields[0] == "Z" {
-        return Err("controller process is a zombie".to_string());
+    if matches!(fields[0], "Z" | "X" | "x") {
+        return Ok(None);
     }
     let parent = fields[1]
         .parse::<u32>()
@@ -4838,7 +4844,7 @@ fn inspect_controller_process(
     let starttime_ticks = fields[19]
         .parse::<u64>()
         .map_err(|_| "controller process start time is invalid".to_string())?;
-    Ok((
+    Ok(Some((
         ControllerIdentity {
             kind,
             instance: instance.to_string(),
@@ -4847,7 +4853,7 @@ fn inspect_controller_process(
             starttime_ticks,
         },
         parent,
-    ))
+    )))
 }
 
 fn controller_identity_matches(
@@ -4860,16 +4866,13 @@ fn controller_identity_matches(
     {
         return Ok(false);
     }
-    match inspect_controller_identity(
+    Ok(inspect_controller_identity(
         &root.join("stat"),
         expected.pid,
         expected.kind,
         &expected.instance,
-    ) {
-        Ok(actual) => Ok(actual == *expected),
-        Err(error) if error.contains("disappeared") || error.contains("zombie") => Ok(false),
-        Err(error) => Err(error),
-    }
+    )?
+    .is_some_and(|actual| actual == *expected))
 }
 
 fn controller_generation(
@@ -8613,6 +8616,44 @@ fi
                 .len(),
             2
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A process that exits between the read of its command line and of its
+    /// stat (a stopping controller, or a helper of one that execs) is gone,
+    /// as is one in the exit states Z and X: a scan never fails on them.
+    #[test]
+    fn controller_scan_treats_a_process_that_just_exited_as_absent() {
+        let root = test_root("controller-exited");
+        let process = |pid: u32, state: Option<&str>| {
+            let dir = root.join(pid.to_string());
+            fs::create_dir(&dir).unwrap();
+            fs::write(
+                dir.join("cmdline"),
+                b"/usr/sbin/cake-autorated\0--instance\0wan\0",
+            )
+            .unwrap();
+            if let Some(state) = state {
+                fs::write(
+                    dir.join("stat"),
+                    format!("{pid} (cake-autorated) {state} 1 100 100 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 {pid}0\n"),
+                )
+                .unwrap();
+            }
+        };
+        process(100, Some("S"));
+        // Reaped after its command line was read: no stat any more.
+        process(101, None);
+        process(102, Some("X"));
+        process(103, Some("Z"));
+        let found = discover_controllers(&root).unwrap();
+        assert_eq!(found.iter().map(|c| c.pid).collect::<Vec<_>>(), [100]);
+        assert!(controller_identity_matches(&root, &found[0]).unwrap());
+        let mut gone = found[0].clone();
+        gone.pid = 101;
+        assert!(!controller_identity_matches(&root, &gone).unwrap());
+        gone.pid = 102;
+        assert!(!controller_identity_matches(&root, &gone).unwrap());
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -832,7 +832,10 @@ fn find_controller(proc_root: &Path, instance: &str) -> Result<Option<ProcessIde
         if pid <= 1 || !controller_cmdline_matches(&entry.path().join("cmdline"), instance)? {
             continue;
         }
-        let identity = ProcessIdentity::inspect(proc_root, pid)?;
+        // Gone or exiting since its command line was read: not a controller.
+        let Some(identity) = ProcessIdentity::inspect_live(proc_root, pid)? else {
+            continue;
+        };
         if found.replace(identity).is_some() {
             return Err(format!(
                 "multiple exact controllers are running for native Apply instance {instance}"
@@ -1501,6 +1504,37 @@ mod tests {
                 fail_attestation_at == 5
             );
         }
+    }
+
+    /// A controller that exits between the read of its command line and of
+    /// its stat, or one already in Z or X, is not found and fails nothing.
+    #[test]
+    fn controller_lookup_treats_a_process_that_just_exited_as_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "cake-selected-lifecycle-exited-{}-{}",
+            std::process::id(),
+            NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let process = |pid: u32, state: Option<&str>| {
+            let dir = root.join(pid.to_string());
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("cmdline"), b"/usr/sbin/cake-autorated\0--instance\0wan_sqm\0").unwrap();
+            if let Some(state) = state {
+                fs::write(
+                    dir.join("stat"),
+                    format!("{pid} (cake-autorated) {state} 1 100 100 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 {pid}0\n"),
+                )
+                .unwrap();
+            }
+        };
+        process(101, None);
+        process(102, Some("X"));
+        process(103, Some("Z"));
+        assert_eq!(find_controller(&root, "wan_sqm").unwrap(), None);
+        process(100, Some("S"));
+        assert_eq!(find_controller(&root, "wan_sqm").unwrap().unwrap().pid, 100);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
