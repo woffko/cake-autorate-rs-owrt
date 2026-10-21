@@ -764,6 +764,9 @@ impl ReloadPublication {
         else {
             return Ok(None);
         };
+        // run.sh must not read the files while they are rolled back, during
+        // a reload as during a stop.
+        let _sqm_run = super::sqm_recovery_openwrt::SqmRunLock::acquire(&paths.sqm_state_root)?;
         let expected = recovery.expected_source.clone();
         // A file committed after the failed reload is kept (owner decision M2).
         let original = super::uci_transaction::recover_checked_with(
@@ -4348,11 +4351,7 @@ impl ServiceStopBackend for OpenWrtServiceStop {
             // consumer is already stopped, so its file transaction can be
             // rolled back on the proof that nothing runs at all.
             eprintln!("WARNING: rolling back the files of a reload that did not complete");
-            {
-                let _sqm_run =
-                    super::sqm_recovery_openwrt::SqmRunLock::acquire(&self.paths.sqm_state_root)?;
-                ReloadPublication::recover_preparation(&self.paths, |_| absent(&[]))?;
-            }
+            ReloadPublication::recover_preparation(&self.paths, |_| absent(&[]))?;
             // Release the private workspace of the old view before the new one.
             self.committed = None;
             self.committed = Some(CommittedSnapshot::capture(
@@ -6166,12 +6165,16 @@ mod tests {
                 assert_eq!(fs::read(config.join(name)).unwrap(), bytes);
             }
             assert!(super::super::uci_transaction::recovery_pending(&config).unwrap());
+            let run_lock = paths.sqm_state_root.join("sqm-run.lock");
             let original = ReloadPublication::recover_preparation(&paths, |old| {
                 assert_eq!(old, applied.generations());
+                // run.sh must not read the files while they are rolled back.
+                assert!(run_lock.is_dir());
                 Ok(())
             })
             .unwrap()
             .unwrap();
+            assert!(!run_lock.exists());
             original.attest(&config).unwrap();
             assert!(!draft.exists());
             assert!(!super::super::uci_transaction::recovery_pending(&config).unwrap());
