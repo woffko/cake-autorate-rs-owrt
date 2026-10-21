@@ -371,12 +371,18 @@ impl SqmRunLock {
             fs::create_dir_all(state_root).map_err(|_| "sqm-run-lock-io".to_string())?;
             match fs::create_dir(&directory) {
                 Ok(()) => {
-                    let lock = Self { directory, pid };
-                    // The marker first: run.sh reads only the PID.
-                    fs::write(lock.directory.join(SQM_RUN_LOCK_OWNER), b"")
-                        .and_then(|()| fs::write(lock.directory.join("pid"), format!("{pid}\n")))
-                        .map_err(|_| "sqm-run-lock-io".to_string())?;
-                    return Ok(lock);
+                    if write_sqm_run_lock_files(&directory, pid).is_err() {
+                        // Without our marker the directory reads as run.sh's
+                        // own lock, which nobody removes: SQM would wait until
+                        // a reboot. Remove what we wrote; a foreign file keeps
+                        // the directory. A kill inside this window still
+                        // leaves it.
+                        let _ = fs::remove_file(directory.join("pid"));
+                        let _ = fs::remove_file(directory.join(SQM_RUN_LOCK_OWNER));
+                        let _ = fs::remove_dir(&directory);
+                        return Err("sqm-run-lock-io".into());
+                    }
+                    return Ok(Self { directory, pid });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     if stale_own_sqm_run_lock(&directory) {
@@ -392,6 +398,34 @@ impl SqmRunLock {
                 Err(_) => return Err("sqm-run-lock-io".into()),
             }
         }
+    }
+}
+
+/// The marker first: run.sh reads only the PID.
+fn write_sqm_run_lock_files(directory: &Path, pid: u32) -> std::io::Result<()> {
+    #[cfg(test)]
+    if sqm_run_lock_test::fail_files() {
+        fs::write(directory.join(SQM_RUN_LOCK_OWNER), b"")?;
+        return Err(std::io::Error::other("injected PID write failure"));
+    }
+    fs::write(directory.join(SQM_RUN_LOCK_OWNER), b"")?;
+    fs::write(directory.join("pid"), format!("{pid}\n"))
+}
+
+#[cfg(test)]
+mod sqm_run_lock_test {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_FILES: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn fail_files() -> bool {
+        FAIL_FILES.with(Cell::get)
+    }
+
+    pub(super) fn set_fail_files(fail: bool) {
+        FAIL_FILES.with(|cell| cell.set(fail));
     }
 }
 
@@ -3119,6 +3153,17 @@ mod tests {
         fs::create_dir(&lock_dir).unwrap();
         fs::write(lock_dir.join(SQM_RUN_LOCK_OWNER), b"").unwrap();
         fs::write(lock_dir.join("pid"), b"999999999\n").unwrap();
+        drop(SqmRunLock::acquire_within(&root, short).unwrap());
+        assert!(!lock_dir.exists());
+        // A failed write of our files leaves no directory that would read as
+        // run.sh's lock, and the next acquisition succeeds.
+        sqm_run_lock_test::set_fail_files(true);
+        assert_eq!(
+            SqmRunLock::acquire_within(&root, short).err().unwrap(),
+            "sqm-run-lock-io"
+        );
+        sqm_run_lock_test::set_fail_files(false);
+        assert!(!lock_dir.exists());
         drop(SqmRunLock::acquire_within(&root, short).unwrap());
         assert!(!lock_dir.exists());
         fs::remove_dir_all(root).unwrap();
