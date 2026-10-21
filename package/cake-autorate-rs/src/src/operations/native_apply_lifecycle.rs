@@ -1519,7 +1519,11 @@ mod tests {
         let process = |pid: u32, state: Option<&str>| {
             let dir = root.join(pid.to_string());
             fs::create_dir(&dir).unwrap();
-            fs::write(dir.join("cmdline"), b"/usr/sbin/cake-autorated\0--instance\0wan_sqm\0").unwrap();
+            fs::write(
+                dir.join("cmdline"),
+                b"/usr/sbin/cake-autorated\0--instance\0wan_sqm\0",
+            )
+            .unwrap();
             if let Some(state) = state {
                 fs::write(
                     dir.join("stat"),

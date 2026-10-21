@@ -36,7 +36,7 @@ use super::protocol::{
 use crate::sys;
 use ring::digest::{digest, SHA256};
 use std::collections::VecDeque;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
