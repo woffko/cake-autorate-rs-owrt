@@ -6,6 +6,142 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
+## Changes after RC27 r321/r129: probe routing in LuCI, frozen history budget, boot clock, cleanup (unreleased)
+
+From the audit of 2026-10-21.
+
+**Probe routing in LuCI.** Probe routing 'auto' is the form default and is
+saved as such. Run speed test passed it on unresolved, and the Speed Test
+admission check knew only main and mwan3, so an instance with the default
+could not run a Speed Test from its editor; re-running Full Auto-Tune of such
+an instance met the same check. 'auto' is now resolved in one place (mwan3
+with a selected member, else main). An explicit policy route was refused by
+the same checks and by the verification of a completed Auto-Tune result,
+although the daemon and MULTIWAN.md admit Speed Test and Full Auto-Tune over
+it; it is accepted now. Get rating carries only main or mwan3 routing, so its
+dialog says so for an explicit route instead of failing after Start.
+
+**Frozen history budget.** With graph history enabled the controller ran
+`uci show cake-autorate` in its loop every 30 s to re-read the history budget,
+which is part of the frozen service input it was started with. It no longer
+does.
+
+**Boot clock.** Config-import candidates and the qdisc capability proof were
+dated on the wall clock: after a step back the import refused every request
+with `candidate-clock-regressed` until the clock caught up. Both use the boot
+clock now; a candidate stamped ahead of it (from before the upgrade) is
+retired.
+
+**Cleanup.** The SQM identity digest is computed with sha2 instead of a
+`sha256sum` process (same text, checked against the standard vectors). Code
+no build used was removed, and helpers only tests use are under `cfg(test)`;
+the Full build has no warnings, clippy `--all-targets` went from 285 to 231
+(Lite still warns about code only Full uses).
+
+**Not changed (owner decision).** The daemon's UCI reads were to be isolated
+from changes staged with `uci set`. The proposed flags do not do that: the
+`uci` command line has no option that drops /tmp/.uci from the change search
+path (`-t` and `-P` only add or move the save directory; checked with the SDK
+`uci`). LuCI stages its changes per session under /var/run/rpcd, which these
+reads never see, and Apply and the scheduler already refuse to run with
+pending changes.
+
+Evidence:
+
+- Source gates 208 (LuCI, history, boot clock) and 209 (cleanup), 59 commands
+  each; packages built and verified for x86_64, aarch64_cortex-a76 and
+  aarch64_generic from both.
+- LuCI tests reproduce each routing case (Run speed test with 'auto', and with
+  a member; Speed Test and Auto-Tune admission over an explicit route; a
+  completed explicit Auto-Tune result; Re-run Auto-Tune with 'auto'; Get rating
+  readiness over an explicit route); undoing any of the five fixes fails them.
+- Tests for the history budget and for both boot clocks fail when the old code
+  is put back.
+- VM, before (daemon 96c88220): the controller ran `uci -q show
+  cake-autorate` 4 times in 130 s; with the wall clock an hour back the import
+  answered `candidate-clock-regressed`.
+- VM, after (daemon ef7c89a2): no `uci` from the controller in 130 s; begin,
+  append and finish of a candidate across one hour back and one hour ahead.
+  In a real browser: Run speed test from the editor with 'auto' started and
+  finished on the main table; with an explicit route (fwmark rule and table
+  101) Run speed test finished on it and Re-run Auto-Tune (shaped only)
+  reached Review on it; Get rating offered no Start and named the explicit
+  route; with the original routing Run speed test worked as before. The
+  configuration, the rule and the route were put back.
+  Service checks 33 of 33;
+  Speed Test completed in 24.4 s. The x86_64 daemon is 4,096 bytes smaller
+  after the cleanup.
+- Found on the way and not changed (owner decision): the calibration
+  coordinator runs `uci changes` twice and `uci show` once on every tick of
+  its loop, which every controller status publication wakes: 1,506 `uci`
+  processes in 130 s on the VM, and about 8% of one core on the owner's
+  router.
+
+## Changes after RC27 r321/r129: process scans, locks and parallel tests (unreleased)
+
+The audit of 2026-10-21 found races between our scans and processes that exit,
+locks that outlive their owner for a moment, and a test suite that failed 44
+tests when run with the default threads.
+
+- **Controller scan.** A process whose command line matched a controller and
+  that exited before its stat was read (a stopping controller, or a helper of
+  one that carries the controller's command line until it execs) made the
+  scan fail with "controller disappeared during process snapshot", and with it
+  the stop, reload or readiness check that ran it; the scan runs in the waits
+  for controllers to exit. Such a process, and one in the exit states Z or X
+  (only Z was handled), is now absent. Native Apply's controller lookup does
+  the same through `ProcessIdentity::inspect_live`.
+- **SQM run lock.** If our owner marker or PID could not be written, run.sh's
+  lock directory stayed without our marker, read as run.sh's own lock and held
+  SQM until a reboot. A failed write now removes what was written and the
+  directory.
+- **Reload preparation.** Its rollback now holds run.sh's run lock in reload as
+  it did in stop, inside `ReloadPublication::recover_preparation`.
+- **Locks released explicitly.** A flock belongs to the open file
+  description; a child forked by another thread kept it until it execed.
+  `sys::LockedFile` unlocks before closing and holds the exclusive locks that
+  are never lent. Locks lent on purpose keep their behaviour: the committed
+  UCI workspace and the isolated SQM runner give copies to the SQM process
+  tree and unlock only when nothing was lent; the native Apply global lock,
+  lent to one init-script command as FD 8, is unchanged. The probe group lease
+  unlocks in Drop, and the MQTT start socket refuses late receipts once
+  dropped.
+- **Tests in parallel.** Event loops of parallel tests wait for each other (a
+  test-only mutex), readiness tests share the lock of the tests that raise
+  TERMINATE, a spawn that meets ETXTBSY (a program another thread has just
+  written, still open in a child that has not execed) is retried for at most
+  ~0.1 s, and a few tests got longer bounds or wait for events to settle.
+
+Evidence:
+
+- Source gate 207 with a new command: the Full tests with the default threads
+  as well as one thread (59 commands). `cargo test` with the default threads:
+  Full 10 of 10 runs and Lite 5 of 5 without a failure (before: 44 failures).
+- Tests that fail without each fix: a process gone between command line and
+  stat, Z and X; the SQM run lock after a failed write (injected); the lock
+  held during the reload-preparation rollback (real UCI); a LockedFile that
+  frees its lock while a copy of the descriptor lives; a lent workspace lock
+  that stays held after its snapshot is dropped.
+- Packages built and verified for x86_64, aarch64_cortex-a76 and
+  aarch64_generic.
+- VM (daemon 96c88220): start race 0 of 29 failed, start during an SQM restart
+  storm 0 of 5; reload during a hotplug restart 0 of 26; a reload that failed
+  after its publication recovered by the same reload, the old setting, stop and
+  start, a reboot and a power cut; power loss after a killed reload recovered
+  at boot 4 of 4 (a first series stopped after two trials when the VM came up
+  without its init script once and could not be explained; it was not seen
+  again); ten reboots with an SQM restart in each start: running 10 of 10;
+  ten reboots with a back-to-back SQM restart storm during the start: running
+  10 of 10; two reboots with the global lock held at the first start: started
+  by the boot retry 2 of 2; service checks 33 of 33; Speed Test
+  completed in 24.4 s.
+- Found on the way and not changed (owner decision): after the wall clock
+  steps back by years (the VM booted at a sysfixtime date three years ahead and
+  NTP corrected it), the first reload fails with "controller status clock is
+  invalid" because the controller's start stamp is on the wall clock; the
+  next reload completes it (3 of 3). The test VM also had future file times in
+  /etc from an earlier clock test; they were reset.
+
 ## Changes after RC27 r321/r129: TLS dependencies (unreleased)
 
 `cargo audit` reported advisories for rustls 0.23.45 (RUSTSEC-2026-0346 to
