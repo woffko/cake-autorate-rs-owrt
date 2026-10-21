@@ -6,6 +6,36 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
+## Changes after RC27 r321/r129: TLS dependencies (unreleased)
+
+`cargo audit` reported advisories for rustls 0.23.45 (RUSTSEC-2026-0346 to
+-0349, among them a ServerHello that downgrades later connections to classical
+key exchange), rustls-webpki 0.103.15 (RUSTSEC-2026-0382, distrusted
+intermediates) and webpki-roots (RUSTSEC-2026-0381, distrusted emSign
+intermediates). TLS carries the MQTT publisher and the transport probes.
+rustls is now pinned at 0.23.46, rustls-webpki is 0.103.16 and webpki-roots is
+one direct 1.0.10 dependency: the WebSocket probe passes its own client
+configuration with the bundled roots, built anew for every connection as
+tungstenite did, so the old 0.26 shim is gone. `cargo audit` reports nothing.
+The stripped x86_64 Full binary grew by 10,776 bytes; Lite has no TLS and is
+unchanged.
+
+- Source gate 204 (58 commands); packages built and verified for x86_64,
+  aarch64_cortex-a76 and aarch64_generic.
+- A `wss://` test: the bundled roots refuse a server of an unknown authority,
+  and that authority's root is enough for the same server. Passing no
+  connector to tungstenite makes it fail.
+- VM (daemon 4f92a504 over the r321 release): the MQTT acceptance of the TLS
+  work passed 208 of 210 checks. The two others are not regressions: one
+  expects the old daemon to predate TLS (it is r321 now), and the browser
+  check of the disabled-publisher form could not create its output directory;
+  run again on its own it passed. Verified broker certificate, own CA, wrong
+  CA, wrong name, TLS 1.2 only, self-signed certificates, unusable CA files,
+  reload, broker loss and return, clock behind and ahead of the certificate.
+- The WebSocket transport probe to `wss://ping-bufferbloat.libreqos.com/ws`
+  stayed trusted (56 samples, none failed); service checks 33 of 33; Speed
+  Test completed in 25.9 s.
+
 ## Changes after RC27 r321/r129: refused readiness confirmations are logged (unreleased)
 
 After `procd` starts the controllers or the calibration coordinator, the init
