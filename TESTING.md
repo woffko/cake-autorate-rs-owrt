@@ -6,6 +6,57 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
+## Changes after RC27 r321/r129: the scheduler reads its policy only after a change (unreleased)
+
+From the audit of 2026-10-21 (second plan, goal U).
+
+The calibration daemon's scheduler ticks on every event it watches, and
+controller status publications alone wake it several times a second. Every
+tick ran `uci -q changes cake-autorate`, `uci -q changes sqm` and
+`uci -q show cake-autorate`. It now keeps the policy and the "nothing staged"
+answer it last read, with the identity (device, inode, size, mtime, ctime) of
+the four files they come from: /etc/config/cake-autorate, /etc/config/sqm and
+their staged changes in /tmp/.uci. While the four are unchanged, a tick takes
+the kept answer; any change, or a file that cannot be inspected, is read
+through uci as before. The uci of OpenWrt 25.12 replaces the committed file
+on commit and empties the staged one in place; `uci set` appends to the
+staged file and `uci revert` empties it (checked on the test VM). The
+calendar and the other gates of a tick are unchanged.
+
+Evidence:
+
+- Source gate 213 (59 commands); packages built and verified for x86_64,
+  aarch64_cortex-a76 and aarch64_generic.
+- Tests: five ticks of an unchanged policy run uci 3 times (15 before); a
+  commit, a rewrite in place and new file times are read again; staged
+  changes (a set, a second set, a commit, a revert) hold the scheduler until
+  they are committed or reverted; a change made during a read is seen on the
+  next pass; an uninspectable file and a failed read go through uci on every
+  pass. Each of five mutations (the kept answer always reused, the staged
+  files or the file times left out, an inspection error taken for an absent
+  file, the files inspected after the read) fails at least one test.
+- VM, before (daemon e6b0e823): with nothing changing, the calibration daemon
+  ran uci 960 times in 130 s (320 ticks of three; 1,506 in an earlier 130 s).
+  Scheduled calibration turned off in LuCI (Save & Apply): the scheduler
+  status showed it 1.28 s after the click.
+- VM, after (daemon e7e1d87a, 8,192 bytes larger): no uci from the daemon in
+  130 s. With scheduled calibration due in its window, `uci set` without a
+  commit was shown as "UCI configuration has uncommitted changes." after
+  0.27 s and held the run for 90 s; `uci revert` released it, and the
+  scheduler started the run at once (its quiet window had passed meanwhile)
+  and completed it. Each of these changes cost one read (two or three uci
+  runs); the admission checks of the run ran uci 23 times, once. LuCI Save &
+  Apply: shown after 1.29 s, with six uci runs from the daemon (384 before).
+  Service checks 33 of 33; Speed Test completed in 24.5 s.
+- Found on the way and not changed: LuCI never shows the options of scheduled
+  calibration (interval, quiet time, window hours, daily and monthly budgets,
+  Auto-Apply). They depend on `runtime_learning_mode`, which is not a field of
+  the form, and LuCI takes a dependency's value only from a field, so they
+  stay hidden even when that option is `periodic_active`. Scheduled
+  calibration can be switched on in LuCI (Runtime capacity learning, with the
+  Variable link profile), but its schedule keeps the defaults unless it is
+  set with uci.
+
 ## Changes after RC27 r321/r129: probe routing in LuCI, frozen history budget, boot clock, cleanup (unreleased)
 
 From the audit of 2026-10-21.
