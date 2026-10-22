@@ -5597,7 +5597,7 @@ struct Controller {
     cpu_core_percentages: Vec<f64>,
     #[cfg(feature = "calibration")]
     runtime_generation: u64,
-    started_at: f64,
+    started: StartStamp,
     run_state: String,
     uplink_state: UplinkState,
     uplink_reason: String,
@@ -6055,7 +6055,7 @@ impl Controller {
             ul_delays: filled_bool_window(cfg.bufferbloat_detection_window),
             dl_delta_us: filled_f64_window(cfg.bufferbloat_detection_window),
             ul_delta_us: filled_f64_window(cfg.bufferbloat_detection_window),
-            started_at: epoch_secs(),
+            started: StartStamp::now(),
             cfg,
             log,
             log_failure: LogFailureThrottle::default(),
@@ -9138,6 +9138,8 @@ impl Controller {
             published_applied_cake_rate_kbps(self.cfg.download_shaping_enabled(), self.last_set_dl);
         let reported_cake_ul =
             published_applied_cake_rate_kbps(self.cfg.upload_shaping_enabled(), self.last_set_ul);
+        let (updated_at, boot_ms) = status_clocks();
+        let started_at = self.started.on_wall_clock(updated_at, boot_ms);
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
@@ -9152,8 +9154,8 @@ impl Controller {
             json_escape(&self.sqm_runtime_reason),
             self.sqm_recovery_attempts,
             json_f64_or_null(self.sqm_last_recovery_at, 3),
-            self.started_at,
-            epoch_secs(),
+            started_at,
+            updated_at,
             json_escape(&self.cfg.dl_if),
             json_escape(&self.cfg.ul_if),
             json_escape(&sample.reflector),
@@ -13013,7 +13015,7 @@ fn write_bootstrap_status(
     sqm_state: &str,
     reason: &str,
     attempts: u64,
-    started_at: f64,
+    started: StartStamp,
 ) -> io::Result<()> {
     ensure_run_dir(&cfg.run_dir())?;
     let path = cfg.run_dir().join("status.json");
@@ -13023,6 +13025,7 @@ fn write_bootstrap_status(
     } else {
         "LEARNING"
     };
+    let (updated_at, boot_ms) = status_clocks();
     let mut file = File::create(&tmp)?;
     writeln!(
         file,
@@ -13036,8 +13039,8 @@ fn write_bootstrap_status(
         json_escape(sqm_state),
         json_escape(reason),
         attempts,
-        started_at,
-        epoch_secs(),
+        started.on_wall_clock(updated_at, boot_ms),
+        updated_at,
         json_escape(&cfg.dl_if),
         json_escape(&cfg.ul_if),
         cfg.base_dl_shaper_rate_kbps,
@@ -13071,7 +13074,7 @@ fn wait_for_runtime_topology_attested(
 ) -> Result<(), RuntimeTopologyWaitError> {
     use operations::sqm_recovery::{SqmRecoveryAdmission, SqmRecoveryGate};
 
-    let started_at = epoch_secs();
+    let started = StartStamp::now();
     let poll_interval = Duration::from_secs_f64(cfg.if_up_check_interval_s.clamp(1.0, 10.0));
     let mut recovery_attempts = 0_u64;
     let mut last_report = (String::new(), String::new());
@@ -13096,7 +13099,7 @@ fn wait_for_runtime_topology_attested(
                 eprintln!("{state}: {reason}");
                 last_report = (state.to_string(), reason.clone());
             }
-            write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started_at)
+            write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started)
                 .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
             if !interruptible_wait(poll_interval) {
                 return Err(RuntimeTopologyWaitError::Terminated);
@@ -13127,7 +13130,7 @@ fn wait_for_runtime_topology_attested(
                 state,
                 &initial_reason,
                 recovery_attempts,
-                started_at,
+                started,
             )
             .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
             if !interruptible_wait(poll_interval) {
@@ -13155,15 +13158,8 @@ fn wait_for_runtime_topology_attested(
                         eprintln!("{state}: {reason}");
                         last_report = (state.to_string(), reason.clone());
                     }
-                    write_bootstrap_status(
-                        cfg,
-                        state,
-                        state,
-                        &reason,
-                        recovery_attempts,
-                        started_at,
-                    )
-                    .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+                    write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started)
+                        .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
                     if !interruptible_wait(poll_interval) {
                         return Err(RuntimeTopologyWaitError::Terminated);
                     }
@@ -13176,7 +13172,7 @@ fn wait_for_runtime_topology_attested(
                     eprintln!("{state}: {reason}");
                     last_report = (state.to_string(), reason.clone());
                 }
-                write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started_at)
+                write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started)
                     .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
                 if !interruptible_wait(poll_interval) {
                     return Err(RuntimeTopologyWaitError::Terminated);
@@ -13199,7 +13195,7 @@ fn wait_for_runtime_topology_attested(
                 eprintln!("{state}: {reason}");
                 last_report = (state.to_string(), reason.clone());
             }
-            write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started_at)
+            write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started)
                 .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
             if !interruptible_wait(poll_interval) {
                 return Err(RuntimeTopologyWaitError::Terminated);
@@ -13217,7 +13213,7 @@ fn wait_for_runtime_topology_attested(
             "RECOVERING",
             &recovering_reason,
             recovery_attempts,
-            started_at,
+            started,
         )
         .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
         attest_input()?;
@@ -13233,7 +13229,7 @@ fn wait_for_runtime_topology_attested(
                     eprintln!("{state}: {detail}");
                     last_report = (state.to_string(), detail.clone());
                 }
-                write_bootstrap_status(cfg, state, state, &detail, recovery_attempts, started_at)
+                write_bootstrap_status(cfg, state, state, &detail, recovery_attempts, started)
                     .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
             }
             Err(SqmRecoveryError::Failed(reason)) => {
@@ -13247,7 +13243,7 @@ fn wait_for_runtime_topology_attested(
                     eprintln!("{state}: {detail}");
                     last_report = (state.to_string(), detail.clone());
                 }
-                write_bootstrap_status(cfg, state, state, &detail, recovery_attempts, started_at)
+                write_bootstrap_status(cfg, state, state, &detail, recovery_attempts, started)
                     .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
             }
             Err(SqmRecoveryError::Terminated) => {
@@ -13666,6 +13662,46 @@ fn epoch_secs() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// When a phase of this controller process started, kept on the boot clock.
+/// Each status publication states it on the wall clock of that moment, as the
+/// service readiness check derives the process start from btime and
+/// starttime, so a step of the wall clock moves both alike.
+#[derive(Clone, Copy, Debug)]
+struct StartStamp {
+    wall_s: f64,
+    boot_ms: Option<u64>,
+}
+
+impl StartStamp {
+    fn now() -> Self {
+        let (wall_s, boot_ms) = status_clocks();
+        Self { wall_s, boot_ms }
+    }
+
+    /// The start on the wall clock `wall_s`, read together with `boot_ms`.
+    /// Without a boot clock it stays the wall time it was taken at.
+    fn on_wall_clock(self, wall_s: f64, boot_ms: Option<u64>) -> f64 {
+        match (self.boot_ms, boot_ms) {
+            (Some(start), Some(now)) => {
+                (wall_s - now.saturating_sub(start) as f64 / 1_000.0).max(0.0)
+            }
+            _ => self.wall_s,
+        }
+    }
+}
+
+/// The wall and boot clocks of one status publication; tests script both.
+fn status_clocks() -> (f64, Option<u64>) {
+    #[cfg(test)]
+    if let Some(wall_ms) = operations::identity::test_clock::wall_ms() {
+        return (
+            wall_ms as f64 / 1_000.0,
+            operations::identity::test_clock::boot_ms(),
+        );
+    }
+    (epoch_secs(), operations::identity::monotonic_boot_ms().ok())
 }
 
 fn json_escape(input: &str) -> String {
@@ -15445,14 +15481,15 @@ mod tests {
         transport_probe_control_allows_start, transport_probe_interval_s,
         transport_probe_route_identities, transport_probe_runtime_required,
         transport_result_matches_route, uplink_error_code, validated_conservative_samples,
-        wait_for_runtime_topology, AdaptiveCapacityStatusContext, AdaptiveCeilingDirection,
-        AutotuneSpeedtestRateMonitor, AutotuneTransportCaptureKey, AutotuneTransportControl,
-        AutotuneTransportFlight, AutotuneTransportReadiness, AutotuneTransportSettlement,
-        CakeLinkLayer, CakeQdiscKind, Config, Controller, MemoryInfo, PrivateIngressState,
-        PrivateRootState, RateMonitor, RateSample, RatingCaptureWindow, ReflectorHealth,
-        ReflectorState, RouteSnapshot, Sample, SpeedtestCounterRateMonitor, SqmRecoveryError,
-        SqmTopologyErrorKind, ThroughputGuardInput, TransportLatencyTracker, TransportProbeResult,
-        UplinkState, AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE, CAKE_GROWTH_UPDATE_MIN_INTERVAL,
+        wait_for_runtime_topology, write_bootstrap_status, AdaptiveCapacityStatusContext,
+        AdaptiveCeilingDirection, AutotuneSpeedtestRateMonitor, AutotuneTransportCaptureKey,
+        AutotuneTransportControl, AutotuneTransportFlight, AutotuneTransportReadiness,
+        AutotuneTransportSettlement, CakeLinkLayer, CakeQdiscKind, Config, Controller, MemoryInfo,
+        PrivateIngressState, PrivateRootState, RateMonitor, RateSample, RatingCaptureWindow,
+        ReflectorHealth, ReflectorState, RouteSnapshot, Sample, SpeedtestCounterRateMonitor,
+        SqmRecoveryError, SqmTopologyErrorKind, StartStamp, ThroughputGuardInput,
+        TransportLatencyTracker, TransportProbeResult, UplinkState,
+        AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE, CAKE_GROWTH_UPDATE_MIN_INTERVAL,
         CALIBRATIONCTL_SCHEDULER_STATUS_USAGE, CALIBRATION_CAPABILITIES_V3,
         STATUS_PUBLISH_INTERVAL, TERMINATE, TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
     };
@@ -20002,6 +20039,110 @@ esac\n",
     fn status_publication_is_bounded_independently_of_control_samples() {
         assert!(!status_publish_due(Duration::from_millis(249)));
         assert!(status_publish_due(STATUS_PUBLISH_INTERVAL));
+    }
+
+    const THREE_YEARS_MS: u64 = 3 * 365 * 86_400_000;
+
+    #[test]
+    fn a_start_stamp_follows_steps_of_the_wall_clock() {
+        let three_years = THREE_YEARS_MS as f64 / 1_000.0;
+        // Taken at boot second 10 on a clock three years ahead.
+        let start = StartStamp {
+            wall_s: 1_900_000_010.0,
+            boot_ms: Some(10_000),
+        };
+        // A minute later, nothing stepped: the same start.
+        assert_eq!(
+            start.on_wall_clock(1_900_000_070.0, Some(70_000)),
+            1_900_000_010.0
+        );
+        // Stepped back three years, or an hour ahead: the start moves with
+        // the wall clock, as the kernel's process start does.
+        assert_eq!(
+            start.on_wall_clock(1_900_000_070.0 - three_years, Some(70_000)),
+            1_900_000_010.0 - three_years
+        );
+        assert_eq!(
+            start.on_wall_clock(1_900_003_670.0, Some(70_000)),
+            1_900_003_610.0
+        );
+        // Without the boot clock it stays the wall time it was taken at.
+        assert_eq!(start.on_wall_clock(1_900_003_670.0, None), 1_900_000_010.0);
+    }
+
+    #[test]
+    fn a_status_published_after_a_wall_clock_step_states_the_start_on_the_new_clock() {
+        use crate::operations::identity::test_clock::ScriptedClocks;
+
+        let _guard = HELPER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cake-status-clock-step-{}-{unique}",
+            std::process::id()
+        ));
+        let counters = root.join("counters");
+        fs::create_dir_all(&counters).unwrap();
+        fs::write(counters.join("rx_bytes"), "0\n").unwrap();
+        fs::write(counters.join("tx_bytes"), "0\n").unwrap();
+        let previous_run_root = env::var_os("CAKE_AUTORATE_RUN_ROOT");
+        env::set_var("CAKE_AUTORATE_RUN_ROOT", root.join("run"));
+        let mut cfg = Config::defaults("clock_step".to_string());
+        cfg.rx_bytes_path = counters.join("rx_bytes").to_string_lossy().into_owned();
+        cfg.tx_bytes_path = counters.join("tx_bytes").to_string_lossy().into_owned();
+        cfg.log_to_file = false;
+        let published = || {
+            let text = fs::read_to_string(root.join("run/clock_step/status.json")).unwrap();
+            let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+            (
+                status["started_at"].as_f64().unwrap(),
+                status["updated_at"].as_f64().unwrap(),
+            )
+        };
+
+        // Boot second 10 on a clock three years ahead (sysfixtime).
+        let clocks = ScriptedClocks::install(10_000, 1_900_000_010_000);
+        let waiting = StartStamp::now();
+        let mut controller = Controller::new(cfg.clone()).unwrap();
+        controller.write_initial_status(&[], None).unwrap();
+        assert_eq!(published(), (1_900_000_010.0, 1_900_000_010.0));
+
+        // A minute later NTP steps the clock back three years.
+        clocks.advance(60_000);
+        clocks.step_wall_back(THREE_YEARS_MS);
+        controller.last_status_publish = Instant::now() - STATUS_PUBLISH_INTERVAL;
+        controller.write_initial_status(&[], None).unwrap();
+        let three_years = THREE_YEARS_MS as f64 / 1_000.0;
+        assert_eq!(
+            published(),
+            (1_900_000_010.0 - three_years, 1_900_000_070.0 - three_years)
+        );
+        // The status of the start-up wait states its start the same way.
+        write_bootstrap_status(
+            &cfg,
+            "WAITING_LINK",
+            "WAITING_LINK",
+            "link down",
+            0,
+            waiting,
+        )
+        .unwrap();
+        assert_eq!(
+            published(),
+            (1_900_000_010.0 - three_years, 1_900_000_070.0 - three_years)
+        );
+
+        drop(controller);
+        drop(clocks);
+        match previous_run_root {
+            Some(value) => env::set_var("CAKE_AUTORATE_RUN_ROOT", value),
+            None => env::remove_var("CAKE_AUTORATE_RUN_ROOT"),
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
