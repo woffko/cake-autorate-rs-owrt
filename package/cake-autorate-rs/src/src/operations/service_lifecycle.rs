@@ -1953,11 +1953,19 @@ fn observe_controller_start(
                 "controller status belongs to a prior process for {instance}"
             )));
         }
+        if updated_at < started_at {
+            return Err(format!("controller status clock is invalid for {instance}"));
+        }
+        // A status published before the wall clock stepped back is ahead of
+        // it until the next publication states the start on the current
+        // clock: a running controller publishes four times a second, one
+        // that waits for its link at its poll interval (at most 10 s).
         if started_at > now_epoch + CONTROLLER_STATUS_FUTURE_SKEW
-            || updated_at < started_at
             || updated_at > now_epoch + CONTROLLER_STATUS_FUTURE_SKEW
         {
-            return Err(format!("controller status clock is invalid for {instance}"));
+            return Ok(ControllerStartReadiness::Waiting(format!(
+                "controller status is ahead of the clock for {instance}"
+            )));
         }
         if now_epoch - updated_at > CONTROLLER_STATUS_MAX_AGE {
             return Ok(ControllerStartReadiness::Waiting(format!(
@@ -9533,69 +9541,119 @@ esac
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn controller_readiness_binds_process_status_state_and_freshness() {
-        let _terminate = terminate_flag_guard();
-        let root = test_root("controller-readiness");
-        let proc_root = root.join("proc");
-        let runtime_root = root.join("run");
-        fs::create_dir(&proc_root).unwrap();
-        fs::create_dir(&runtime_root).unwrap();
-        fs::write(proc_root.join("stat"), b"cpu 1 2 3 4\nbtime 100\n").unwrap();
-        let ticks_per_second = sys::clock_ticks_per_second() as u64;
-        assert!(ticks_per_second > 0);
-        let process = proc_root.join("100");
-        fs::create_dir(&process).unwrap();
-        fs::write(
-            process.join("cmdline"),
-            b"/usr/sbin/cake-autorated\0--instance\0wan\0",
-        )
-        .unwrap();
-        fs::write(
-            process.join("stat"),
-            format!(
-                "100 (cake) S 1 100 100 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 {}\n",
-                ticks_per_second * 10
-            ),
-        )
-        .unwrap();
-        let status_dir = runtime_root.join("wan");
-        fs::create_dir(&status_dir).unwrap();
-        let status = status_dir.join("status.json");
-        let write_status = |state: &str, started_at: f64, updated_at: f64| {
+    /// One controller "wan" whose process the kernel started 10 s after a
+    /// boot at btime 100, so at 110 on the wall clock.
+    struct ControllerStatusFixture {
+        root: PathBuf,
+        proc_root: PathBuf,
+        process: PathBuf,
+        status: PathBuf,
+        paths: ServicePaths,
+    }
+
+    impl ControllerStatusFixture {
+        fn new(name: &str) -> Self {
+            let root = test_root(name);
+            let proc_root = root.join("proc");
+            let runtime_root = root.join("run");
+            fs::create_dir(&proc_root).unwrap();
+            fs::create_dir(&runtime_root).unwrap();
+            fs::write(proc_root.join("stat"), b"cpu 1 2 3 4\nbtime 100\n").unwrap();
+            let process = proc_root.join("100");
+            fs::create_dir(&process).unwrap();
             fs::write(
-                &status,
+                process.join("cmdline"),
+                b"/usr/sbin/cake-autorated\0--instance\0wan\0",
+            )
+            .unwrap();
+            fs::write(
+                process.join("stat"),
+                format!(
+                    "100 (cake) S 1 100 100 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 {}\n",
+                    Self::ticks_per_second() * 10
+                ),
+            )
+            .unwrap();
+            let status_dir = runtime_root.join("wan");
+            fs::create_dir(&status_dir).unwrap();
+            let paths = ServicePaths {
+                config_root: root.join("config"),
+                uci: root.join("uci"),
+                tc: root.join("tc"),
+                ubus: root.join("ubus"),
+                proc_root: proc_root.clone(),
+                runtime_root: runtime_root.clone(),
+                runtime_lock_root: root.join("locks"),
+                bridger_init: root.join("bridger"),
+                bridger_config: root.join("bridger-config"),
+                uci_workspace_root: root.join("uci-work"),
+                sqm_state_root: root.join("sqm-state"),
+            };
+            Self {
+                status: status_dir.join("status.json"),
+                root,
+                proc_root,
+                process,
+                paths,
+            }
+        }
+
+        fn ticks_per_second() -> u64 {
+            let ticks_per_second = sys::clock_ticks_per_second() as u64;
+            assert!(ticks_per_second > 0);
+            ticks_per_second
+        }
+
+        fn write_status(&self, state: &str, started_at: f64, updated_at: f64) {
+            fs::write(
+                &self.status,
                 format!(
                     "{{\"instance\":\"wan\",\"state\":\"{state}\",\"started_at\":{started_at},\"updated_at\":{updated_at}}}"
                 ),
             )
             .unwrap();
-            fs::set_permissions(&status, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::set_permissions(&self.status, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        /// The kernel's boot time on the wall clock, as a step moves it.
+        fn set_btime(&self, btime: u64) {
+            fs::write(
+                self.proc_root.join("stat"),
+                format!("cpu 1 2 3 4\nbtime {btime}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for ControllerStatusFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn controller_readiness_binds_process_status_state_and_freshness() {
+        let _terminate = terminate_flag_guard();
+        let fixture = ControllerStatusFixture::new("controller-readiness");
+        let ticks_per_second = ControllerStatusFixture::ticks_per_second();
+        let proc_root = fixture.proc_root.clone();
+        let process = fixture.process.clone();
+        let status = fixture.status.clone();
+        let write_status = |state: &str, started_at: f64, updated_at: f64| {
+            fixture.write_status(state, started_at, updated_at)
         };
-        let paths = ServicePaths {
-            config_root: root.join("config"),
-            uci: root.join("uci"),
-            tc: root.join("tc"),
-            ubus: root.join("ubus"),
-            proc_root: proc_root.clone(),
-            runtime_root: runtime_root.clone(),
-            runtime_lock_root: root.join("locks"),
-            bridger_init: root.join("bridger"),
-            bridger_config: root.join("bridger-config"),
-            uci_workspace_root: root.join("uci-work"),
-            sqm_state_root: root.join("sqm-state"),
-        };
+        let paths = &fixture.paths;
         let expected = vec!["wan".to_string()];
 
         write_status("WAITING_OPERATION", 111.0, 121.0);
         assert!(matches!(
-            observe_controller_start(&paths, &expected, 121.0).unwrap(),
+            observe_controller_start(paths, &expected, 121.0).unwrap(),
             ControllerStartReadiness::Waiting(reason) if reason.contains("WAITING_OPERATION")
         ));
 
         write_status("RUNNING", 111.0, 121.0);
         assert_eq!(
-            observe_controller_start(&paths, &expected, 121.0).unwrap(),
+            observe_controller_start(paths, &expected, 121.0).unwrap(),
             ControllerStartReadiness::Ready
         );
 
@@ -9615,37 +9673,78 @@ esac
         )
         .unwrap();
         assert!(matches!(
-            observe_controller_start(&paths, &expected, 121.0).unwrap(),
+            observe_controller_start(paths, &expected, 121.0).unwrap(),
             ControllerStartReadiness::Waiting(reason) if reason.contains("observed 2")
         ));
         fs::remove_dir_all(replacement).unwrap();
 
         write_status("RUNNING", 100.0, 121.0);
         assert!(matches!(
-            observe_controller_start(&paths, &expected, 121.0).unwrap(),
+            observe_controller_start(paths, &expected, 121.0).unwrap(),
             ControllerStartReadiness::Waiting(reason) if reason.contains("prior process")
         ));
 
         write_status("RUNNING", 111.0, 121.0);
         assert!(matches!(
-            observe_controller_start(&paths, &expected, 200.0).unwrap(),
+            observe_controller_start(paths, &expected, 200.0).unwrap(),
             ControllerStartReadiness::Waiting(reason) if reason.contains("stale")
         ));
 
         write_status("ERROR", 111.0, 121.0);
-        assert!(observe_controller_start(&paths, &expected, 121.0).is_err());
+        assert!(observe_controller_start(paths, &expected, 121.0).is_err());
         fs::set_permissions(&status, fs::Permissions::from_mode(0o666)).unwrap();
         write_status("RUNNING", 111.0, 121.0);
         fs::set_permissions(&status, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(observe_controller_start(&paths, &expected, 121.0).is_err());
+        assert!(observe_controller_start(paths, &expected, 121.0).is_err());
 
         fs::remove_dir_all(&process).unwrap();
         assert_eq!(
-            observe_controller_start(&paths, &[], 121.0).unwrap(),
+            observe_controller_start(paths, &[], 121.0).unwrap(),
             ControllerStartReadiness::Ready
         );
+    }
 
-        fs::remove_dir_all(root).unwrap();
+    #[test]
+    fn controller_readiness_waits_for_a_status_from_before_a_wall_clock_step() {
+        let _terminate = terminate_flag_guard();
+        let fixture = ControllerStatusFixture::new("controller-readiness-clock-step");
+        let expected = vec!["wan".to_string()];
+        let readiness = |now| observe_controller_start(&fixture.paths, &expected, now);
+
+        // sysfixtime set the clock three years ahead at boot; the controller
+        // started and published on that clock, then NTP stepped it back.
+        const AHEAD: f64 = 3.0 * 365.0 * 86_400.0;
+        fixture.write_status("RUNNING", 111.0 + AHEAD, 121.0 + AHEAD);
+        assert!(matches!(
+            readiness(122.0).unwrap(),
+            ControllerStartReadiness::Waiting(reason) if reason.contains("ahead of the clock")
+        ));
+        // Started after the step, last published before it.
+        fixture.write_status("RUNNING", 111.0, 121.0 + AHEAD);
+        assert!(matches!(
+            readiness(122.0).unwrap(),
+            ControllerStartReadiness::Waiting(reason) if reason.contains("ahead of the clock")
+        ));
+        // The next publication states the start on the current clock.
+        fixture.write_status("RUNNING", 111.0, 122.0);
+        assert_eq!(readiness(122.0).unwrap(), ControllerStartReadiness::Ready);
+
+        // Stepped an hour ahead: the kernel's boot time moves with the wall
+        // clock, and a status published before the step reads as a prior
+        // process's until the next publication.
+        fixture.set_btime(3_700);
+        assert!(matches!(
+            readiness(3_723.0).unwrap(),
+            ControllerStartReadiness::Waiting(reason) if reason.contains("prior process")
+        ));
+        fixture.write_status("RUNNING", 3_711.0, 3_723.0);
+        assert_eq!(readiness(3_723.0).unwrap(), ControllerStartReadiness::Ready);
+
+        // A status updated before it started contradicts itself.
+        fixture.write_status("RUNNING", 3_715.0, 3_712.0);
+        assert!(readiness(3_723.0)
+            .unwrap_err()
+            .contains("controller status clock is invalid"));
     }
 
     #[test]
