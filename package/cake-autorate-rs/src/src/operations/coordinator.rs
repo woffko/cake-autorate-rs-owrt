@@ -53,8 +53,8 @@ use super::{
         validate_scheduler_instance, SchedulerGates, SchedulerGenerations, SchedulerObservation,
     },
     scheduler_config::{
-        load_scheduled_instances, scheduled_configuration_committed, ScheduledInstanceConfig,
-        SchedulerConfigSnapshot,
+        ScheduledInstanceConfig, SchedulerConfigReader, SchedulerConfigSnapshot, UCI_CONFIG_DIR,
+        UCI_DELTA_DIR,
     },
     scheduler_owner::{SchedulerOwnerLock, PRODUCTION_SCHEDULER_OWNER_LOCK},
     scheduler_runtime::{
@@ -525,6 +525,7 @@ where
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: options.lab_rust_scheduler,
         });
     }
@@ -3457,6 +3458,7 @@ struct NativeSchedulerRuntime {
     waiting: BTreeMap<String, &'static str>,
     accounting_blocks: BTreeMap<String, u64>,
     status_cache: NativeSchedulerStatusCache,
+    config: SchedulerConfigReader,
     lab_mode: bool,
 }
 
@@ -3877,9 +3879,9 @@ impl CalibrationDaemon {
         events.watch_tree(&self.state_dir, 4, true)?;
         if let Some(scheduler) = self.native_scheduler.as_ref() {
             events.watch_tree(scheduler.store.root(), 0, true)?;
-            events.watch_tree(Path::new("/etc/config"), 0, true)?;
+            events.watch_tree(Path::new(UCI_CONFIG_DIR), 0, true)?;
 
-            let uci_delta = Path::new("/tmp/.uci");
+            let uci_delta = Path::new(UCI_DELTA_DIR);
             if uci_delta.exists() {
                 events.watch_tree(uci_delta, 1, true)?;
             } else {
@@ -4127,8 +4129,7 @@ impl CalibrationDaemon {
             &calendar.month,
         )?;
 
-        let configuration_committed = scheduled_configuration_committed()?;
-        let snapshot = load_scheduled_instances()?;
+        let (configuration_committed, snapshot) = scheduler.config.read()?;
         let auto_apply_instances = snapshot
             .instances
             .iter()
@@ -12019,6 +12020,61 @@ mod tests {
     }
 
     #[test]
+    fn ticks_read_an_unchanged_scheduler_policy_through_uci_only_once() {
+        use crate::operations::scheduler_config::test_uci;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        let root = temp_path("sched-policy-reads");
+        let state_dir = root.join("state");
+        let config_dir = root.join("config");
+        let delta_dir = root.join("uci-delta");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&delta_dir).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            config_dir.join("cake-autorate"),
+            "cake-autorate.wan_sqm=cake_autorate\n\
+             cake-autorate.wan_sqm.enabled='1'\n\
+             cake-autorate.wan_sqm.scheduled_autotune_enabled='0'\n\
+             cake-autorate.wan_sqm.sqm_interface='eth1'\n\
+             cake-autorate.wan_sqm.capacity_learning_policy='scheduled_active'\n",
+        )
+        .unwrap();
+        fs::write(config_dir.join("sqm"), "sqm.eth1=queue\n").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+        daemon.native_scheduler = Some(NativeSchedulerRuntime {
+            store: SchedulerStore::open(&root.join("scheduler")).unwrap(),
+            quiet: BTreeMap::new(),
+            errors: BTreeMap::new(),
+            auto_apply_errors: BTreeMap::new(),
+            auto_apply_warnings: BTreeMap::new(),
+            waiting: BTreeMap::new(),
+            accounting_blocks: BTreeMap::new(),
+            status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::with_sources(
+                &config_dir,
+                &delta_dir,
+                test_uci::counting(config_dir.clone(), delta_dir.clone(), calls.clone()),
+            ),
+            lab_mode: false,
+        });
+
+        // The loop ticks on every event it watches: controller status
+        // publications, the scheduler store, any package's commit. None of
+        // those five changed the policy, so only the first reads it.
+        for _ in 0..5 {
+            daemon.tick();
+        }
+        let scheduler = daemon.native_scheduler.as_ref().unwrap();
+        assert!(scheduler.errors.is_empty(), "{:?}", scheduler.errors);
+        assert!(scheduler.status_cache.response().is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn an_unset_wall_clock_stops_the_scheduler_pass_before_it_reads_any_state() {
         use crate::operations::identity::test_clock::ScriptedClocks;
         let root = temp_path("sched-unset-clock");
@@ -12035,6 +12091,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         };
         let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
@@ -12078,6 +12135,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         };
         let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
@@ -12162,6 +12220,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         };
         let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
@@ -12258,6 +12317,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         };
         let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
@@ -12630,6 +12690,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: true,
         });
         let status_request = SchedulerStatusRequest {
@@ -12961,6 +13022,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: true,
         });
         let (_, missing_ack) = daemon.dispatch_control_request(
@@ -13078,6 +13140,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::from([("wan_sqm".to_string(), 4_000)]),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         });
         daemon
@@ -13103,6 +13166,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         };
         let mut daemon = CalibrationDaemon::bind(&state_dir).unwrap();
@@ -13194,6 +13258,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         };
         let mut daemon = CalibrationDaemon::bind(&state_dir).unwrap();
@@ -13256,6 +13321,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         };
         let mut daemon = CalibrationDaemon::bind(&state_dir).unwrap();
@@ -13309,6 +13375,7 @@ mod tests {
                 ("wan_b".to_string(), 4_000),
             ]),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         };
         let mut daemon = CalibrationDaemon::bind(&state_dir).unwrap();
@@ -13358,6 +13425,7 @@ mod tests {
             waiting: BTreeMap::new(),
             accounting_blocks: BTreeMap::from([("wan_sqm".to_string(), 4_000)]),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: false,
         };
         let mut daemon = CalibrationDaemon::bind(&state_dir).unwrap();
@@ -16752,6 +16820,7 @@ mod tests {
             waiting: BTreeMap::from([("wan".to_string(), "quiet-window-pending")]),
             accounting_blocks: BTreeMap::new(),
             status_cache: NativeSchedulerStatusCache::default(),
+            config: SchedulerConfigReader::default(),
             lab_mode: true,
         });
 

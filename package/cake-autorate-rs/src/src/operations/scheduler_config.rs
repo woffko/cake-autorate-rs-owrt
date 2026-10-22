@@ -6,8 +6,12 @@
 //! into a typed launch intent.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::fs;
+use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use super::autotune_request::AutotuneLaunchIntent;
 use super::launch_route::{launch_route_spec, ExplicitLaunchRoute, LaunchRouteFields};
@@ -23,6 +27,16 @@ const MAX_SCHEDULED_INSTANCES: usize = 64;
 const MIB: u64 = 1024 * 1024;
 const MAX_EXACT_BYTES: u64 = 9_007_199_254_740_991;
 const MAX_OPERATION_TRAFFIC_BUDGET_BYTES: u64 = 1 << 40;
+
+/// Where `uci` reads the committed packages and the changes staged for them
+/// with `uci set`. The calibration loop watches both directories.
+pub(crate) const UCI_CONFIG_DIR: &str = "/etc/config";
+pub(crate) const UCI_DELTA_DIR: &str = "/tmp/.uci";
+
+/// Packages whose staged changes hold the scheduler.
+const POLICY_PACKAGES: [&str; 2] = ["cake-autorate", "sqm"];
+
+type UciQuery = Box<dyn Fn(&[&str], &str) -> Result<String, String> + Send>;
 
 const RELEVANT_OPTIONS: &[&str] = &[
     "enabled",
@@ -140,22 +154,157 @@ struct RawSection {
     unknown_scheduler_options: Vec<String>,
 }
 
-pub fn load_scheduled_instances() -> Result<SchedulerConfigSnapshot, String> {
-    let raw = run_uci(
+/// What a file looked like when it was inspected. `uci commit` replaces the
+/// committed file and empties the staged one in place, `uci set` appends to
+/// the staged file and `uci revert` empties it: each changes this. Only two
+/// writes in place of one size within one tick of the file clock would not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl FileIdentity {
+    /// `None` for a file that does not exist.
+    fn inspect(path: &Path) -> io::Result<Option<Self>> {
+        match fs::metadata(path) {
+            Ok(metadata) => Ok(Some(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.size(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+            })),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// The committed file and the staged changes of each policy package.
+const POLICY_FILES: usize = 2 * POLICY_PACKAGES.len();
+
+/// Reads the scheduler's policy, and whether `cake-autorate` and `sqm` have
+/// staged changes, through `uci`.
+pub struct SchedulerConfigReader {
+    files: [PathBuf; POLICY_FILES],
+    uci: UciQuery,
+    /// The last policy read, with the files it was read from.
+    last: Option<(
+        [Option<FileIdentity>; POLICY_FILES],
+        bool,
+        Arc<SchedulerConfigSnapshot>,
+    )>,
+}
+
+impl Default for SchedulerConfigReader {
+    fn default() -> Self {
+        Self::with_sources(
+            Path::new(UCI_CONFIG_DIR),
+            Path::new(UCI_DELTA_DIR),
+            Box::new(run_uci),
+        )
+    }
+}
+
+impl SchedulerConfigReader {
+    pub(crate) fn with_sources(config_dir: &Path, delta_dir: &Path, uci: UciQuery) -> Self {
+        let [cake, sqm] = POLICY_PACKAGES;
+        Self {
+            files: [
+                config_dir.join(cake),
+                delta_dir.join(cake),
+                config_dir.join(sqm),
+                delta_dir.join(sqm),
+            ],
+            uci,
+            last: None,
+        }
+    }
+
+    /// Whether both packages are committed, and the scheduled instances.
+    ///
+    /// The calibration loop ticks on every event it watches, mostly
+    /// controller status publications. `uci` runs again only after a file it
+    /// reads the policy from has changed, or when one cannot be inspected.
+    pub fn read(&mut self) -> Result<(bool, Arc<SchedulerConfigSnapshot>), String> {
+        // Inspected before the read: a file that changes during the read no
+        // longer matches what is recorded, so the next pass reads again.
+        let inputs = self.inputs();
+        if let (Some(inputs), Some((last, committed, snapshot))) = (&inputs, &self.last) {
+            if inputs == last {
+                return Ok((*committed, Arc::clone(snapshot)));
+            }
+        }
+        self.last = None;
+        let committed = configuration_committed(&self.uci)?;
+        let snapshot = Arc::new(scheduled_instances(&self.uci)?);
+        if let Some(inputs) = inputs {
+            self.last = Some((inputs, committed, Arc::clone(&snapshot)));
+        }
+        Ok((committed, snapshot))
+    }
+
+    fn inputs(&self) -> Option<[Option<FileIdentity>; POLICY_FILES]> {
+        let mut inputs = [None; POLICY_FILES];
+        for (input, path) in inputs.iter_mut().zip(&self.files) {
+            *input = FileIdentity::inspect(path).ok()?;
+        }
+        Some(inputs)
+    }
+}
+
+fn scheduled_instances(uci: &UciQuery) -> Result<SchedulerConfigSnapshot, String> {
+    let raw = uci(
         &["-q", "show", "cake-autorate"],
         "CAKE Autorate configuration",
     )?;
     parse_scheduled_instances(&raw)
 }
 
-pub fn scheduled_configuration_committed() -> Result<bool, String> {
-    for package in ["cake-autorate", "sqm"] {
-        let output = run_uci(&["-q", "changes", package], "pending UCI changes")?;
+fn configuration_committed(uci: &UciQuery) -> Result<bool, String> {
+    for package in POLICY_PACKAGES {
+        let output = uci(&["-q", "changes", package], "pending UCI changes")?;
         if !output.trim().is_empty() {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// A stand-in for `uci` over fixture files: `show` returns the package file
+/// as it is (written in `uci show` form), `changes` the staged file or
+/// nothing. Every query is counted.
+#[cfg(test)]
+pub(crate) mod test_uci {
+    use super::UciQuery;
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    pub(crate) fn counting(
+        config_dir: PathBuf,
+        delta_dir: PathBuf,
+        calls: Arc<AtomicUsize>,
+    ) -> UciQuery {
+        Box::new(move |args, _label| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let read = |path: PathBuf| fs::read_to_string(path).map_err(|error| error.to_string());
+            match args {
+                ["-q", "show", package] => read(config_dir.join(package)),
+                ["-q", "changes", package] => match fs::metadata(delta_dir.join(package)) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+                    _ => read(delta_dir.join(package)),
+                },
+                _ => Err(format!("unexpected uci query {args:?}")),
+            }
+        })
+    }
 }
 
 pub fn parse_scheduled_instances(input: &str) -> Result<SchedulerConfigSnapshot, String> {
@@ -516,6 +665,10 @@ fn run_uci(args: &[&str], label: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime};
 
     fn valid_instance(extra: &str) -> String {
         format!(
@@ -704,5 +857,253 @@ mod tests {
         let snapshot = parse_scheduled_instances(&unrelated).unwrap();
         assert_eq!(snapshot.instances.len(), 1);
         assert!(snapshot.issues.is_empty());
+    }
+
+    /// `/etc/config` and `/tmp/.uci` for the reader, with `uci` replaced by
+    /// a counting stand-in.
+    struct Fixture {
+        root: PathBuf,
+        config: PathBuf,
+        delta: PathBuf,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let root = std::env::temp_dir().join(format!(
+                "cake-scheduler-config-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let config = root.join("config");
+            let delta = root.join("uci-delta");
+            fs::create_dir_all(&config).unwrap();
+            fs::create_dir_all(&delta).unwrap();
+            fs::write(config.join("cake-autorate"), valid_instance("")).unwrap();
+            fs::write(config.join("sqm"), "sqm.eth1=queue\n").unwrap();
+            Self {
+                root,
+                config,
+                delta,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn reader(&self) -> SchedulerConfigReader {
+            SchedulerConfigReader::with_sources(
+                &self.config,
+                &self.delta,
+                test_uci::counting(
+                    self.config.clone(),
+                    self.delta.clone(),
+                    Arc::clone(&self.calls),
+                ),
+            )
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        /// What `uci commit` does (libuci of OpenWrt 25.12): the package is
+        /// written to a new file that replaces the old one, and its staged
+        /// file is emptied in place.
+        fn commit(&self, package: &str, text: &str) {
+            let next = self.config.join(format!(".{package}.next"));
+            fs::write(&next, text).unwrap();
+            fs::rename(&next, self.config.join(package)).unwrap();
+            if self.delta.join(package).exists() {
+                self.revert(package);
+            }
+        }
+
+        /// What `uci set` does: the change is appended to the package's
+        /// staged file.
+        fn stage(&self, package: &str, line: &str) {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.delta.join(package))
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+        }
+
+        /// What `uci revert` does: the staged file is emptied in place.
+        fn revert(&self, package: &str) {
+            OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(self.delta.join(package))
+                .unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn interval_hours(snapshot: &SchedulerConfigSnapshot) -> u64 {
+        snapshot.instances[0].interval_s / 3_600
+    }
+
+    #[test]
+    fn the_policy_is_read_again_only_after_one_of_its_files_changes() {
+        let fixture = Fixture::new("changes");
+        let mut reader = fixture.reader();
+        let (committed, snapshot) = reader.read().unwrap();
+        assert!(committed);
+        assert_eq!(interval_hours(&snapshot), 24);
+        assert_eq!(fixture.calls(), 3);
+        for _ in 0..3 {
+            let (committed, again) = reader.read().unwrap();
+            assert!(committed);
+            assert!(Arc::ptr_eq(&snapshot, &again));
+        }
+        assert_eq!(fixture.calls(), 3);
+
+        fixture.commit(
+            "cake-autorate",
+            &valid_instance("cake-autorate.wan_sqm.scheduled_autotune_interval_hours='12'\n"),
+        );
+        let (committed, snapshot) = reader.read().unwrap();
+        assert!(committed);
+        assert_eq!(interval_hours(&snapshot), 12);
+        assert_eq!(fixture.calls(), 6);
+        reader.read().unwrap();
+        assert_eq!(fixture.calls(), 6);
+
+        fixture.commit("sqm", "sqm.eth1=queue\nsqm.eth1.enabled='1'\n");
+        reader.read().unwrap();
+        assert_eq!(fixture.calls(), 9);
+
+        // Written in place, as an editor may: the same file, another size.
+        fs::write(
+            fixture.config.join("cake-autorate"),
+            valid_instance("cake-autorate.wan_sqm.scheduled_autotune_interval_hours='6'\n"),
+        )
+        .unwrap();
+        let (_, snapshot) = reader.read().unwrap();
+        assert_eq!(interval_hours(&snapshot), 6);
+        assert_eq!(fixture.calls(), 12);
+
+        // The same file and size with other times.
+        fs::File::options()
+            .write(true)
+            .open(fixture.config.join("cake-autorate"))
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(3_600))
+            .unwrap();
+        reader.read().unwrap();
+        assert_eq!(fixture.calls(), 15);
+        reader.read().unwrap();
+        assert_eq!(fixture.calls(), 15);
+    }
+
+    #[test]
+    fn staged_changes_hold_the_scheduler_until_they_are_committed_or_reverted() {
+        let fixture = Fixture::new("staged");
+        let mut reader = fixture.reader();
+        assert!(reader.read().unwrap().0);
+
+        fixture.stage("sqm", "sqm.eth1.enabled='0'\n");
+        assert!(!reader.read().unwrap().0);
+        let calls = fixture.calls();
+        assert!(!reader.read().unwrap().0);
+        assert_eq!(fixture.calls(), calls);
+
+        // A second `uci set` grows the staged file.
+        fixture.stage("sqm", "sqm.eth1.download='1000'\n");
+        assert!(!reader.read().unwrap().0);
+        assert!(fixture.calls() > calls);
+
+        fixture.commit("sqm", "sqm.eth1=queue\nsqm.eth1.enabled='0'\n");
+        assert!(reader.read().unwrap().0);
+        // The emptied staged file grows again with the next `uci set`.
+        fixture.stage("sqm", "sqm.eth1.enabled='1'\n");
+        assert!(!reader.read().unwrap().0);
+        fixture.revert("sqm");
+        assert!(reader.read().unwrap().0);
+
+        fixture.stage("cake-autorate", "cake-autorate.wan_sqm.enabled='0'\n");
+        assert!(!reader.read().unwrap().0);
+        fixture.revert("cake-autorate");
+        assert!(reader.read().unwrap().0);
+        let calls = fixture.calls();
+        assert!(reader.read().unwrap().0);
+        assert_eq!(fixture.calls(), calls);
+    }
+
+    #[test]
+    fn a_change_made_while_the_policy_is_read_is_read_on_the_next_pass() {
+        let fixture = Fixture::new("during-read");
+        let counting = test_uci::counting(
+            fixture.config.clone(),
+            fixture.delta.clone(),
+            Arc::clone(&fixture.calls),
+        );
+        let staged_file = fixture.delta.join("sqm");
+        let staged = AtomicBool::new(false);
+        let uci: UciQuery = Box::new(move |args, label| {
+            let output = counting(args, label);
+            // `uci set sqm...` lands after this pass asked for changes.
+            if args[1] == "show" && !staged.swap(true, Ordering::SeqCst) {
+                fs::write(&staged_file, "sqm.eth1.enabled='0'\n").unwrap();
+            }
+            output
+        });
+        let mut reader = SchedulerConfigReader::with_sources(&fixture.config, &fixture.delta, uci);
+        assert!(reader.read().unwrap().0);
+        assert!(!reader.read().unwrap().0);
+    }
+
+    #[test]
+    fn files_that_cannot_be_inspected_are_read_through_uci_on_every_pass() {
+        let fixture = Fixture::new("uninspectable");
+        let policy = valid_instance("");
+        let calls = Arc::clone(&fixture.calls);
+        let uci: UciQuery = Box::new(move |args, _label| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if args[1] == "show" {
+                policy.clone()
+            } else {
+                String::new()
+            })
+        });
+        let mut reader = SchedulerConfigReader::with_sources(&fixture.config, &fixture.delta, uci);
+        reader.read().unwrap();
+        reader.read().unwrap();
+        assert_eq!(fixture.calls(), 3);
+
+        // Not absent but unreadable: the staged-changes directory is a file.
+        fs::remove_dir(&fixture.delta).unwrap();
+        fs::write(&fixture.delta, "").unwrap();
+        reader.read().unwrap();
+        reader.read().unwrap();
+        assert_eq!(fixture.calls(), 9);
+
+        fs::remove_file(&fixture.delta).unwrap();
+        fs::create_dir(&fixture.delta).unwrap();
+        reader.read().unwrap();
+        reader.read().unwrap();
+        assert_eq!(fixture.calls(), 12);
+    }
+
+    #[test]
+    fn a_failed_read_is_tried_again_on_the_next_pass() {
+        let fixture = Fixture::new("failed");
+        let mut reader = fixture.reader();
+        reader.read().unwrap();
+        fs::remove_file(fixture.config.join("cake-autorate")).unwrap();
+        assert!(reader.read().is_err());
+        assert!(reader.read().is_err());
+        assert_eq!(fixture.calls(), 9);
+        fixture.commit("cake-autorate", &valid_instance(""));
+        assert!(reader.read().unwrap().0);
+        reader.read().unwrap();
+        assert_eq!(fixture.calls(), 12);
     }
 }
