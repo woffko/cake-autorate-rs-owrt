@@ -48,6 +48,12 @@ Evidence:
   runs); the admission checks of the run ran uci 23 times, once. LuCI Save &
   Apply: shown after 1.29 s, with six uci runs from the daemon (384 before).
   Service checks 33 of 33; Speed Test completed in 24.5 s.
+- The owner's router (x86_64, two instances), with the owner's permission,
+  ten minutes each: the calibration daemon and the children it reaped used
+  11.0% of one core with r321 (71.4 s of CPU in 648 s, 50.0 s of it in the
+  children; 83 forks a second on the router) and 0.9% with the build of gate
+  213 (5.9 s in 650 s, none in children; 56 forks a second). The router was
+  put back on the published r321 afterwards, its two controllers healthy.
 - Found on the way and not changed: LuCI never shows the options of scheduled
   calibration (interval, quiet time, window hours, daily and monthly budgets,
   Auto-Apply). They depend on `runtime_learning_mode`, which is not a field of
