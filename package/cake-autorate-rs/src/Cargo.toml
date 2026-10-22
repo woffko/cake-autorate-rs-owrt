@@ -19,7 +19,7 @@ libc = "0.2"
 ring = { version = "0.17.14", optional = true }
 serde_json = { version = "1.0.151" }
 sha2 = { version = "0.10.9", default-features = false }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 socket2 = { version = "0.6.4", features = ["all"], optional = true }
 tungstenite = { version = "0.29.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
 webpki-roots = { version = "0.26.11", optional = true }
