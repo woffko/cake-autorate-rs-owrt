@@ -6,6 +6,63 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
+## Changes after RC27 r321/r129: reload after a wall clock step (unreleased)
+
+From the audit of 2026-10-21 (second plan, goal T).
+
+The controller wrote its start into status.json once, as the wall time it was
+taken at. The readiness check of start, restart and reload compares it with
+the process start the kernel reports (btime plus starttime), which moves with
+every step of the wall clock. When a router boots with its clock ahead
+(sysfixtime takes the newest time in /etc, here a file dated three years
+ahead) and NTP then steps it back, the start is years ahead of the clock: the
+first reload after the step failed with "controller status clock is invalid"
+and left its batch pending, and the second reload finished it. LuCI's probe
+warning takes the controller's runtime from the same start and stayed silent
+while it was ahead.
+
+The start is now kept on the boot clock, and every publication (four a second
+while the controller runs, at its poll interval while it waits for its link)
+states it on the wall clock of that moment, the way the kernel derives the
+process start. The readiness check waits for a status whose start or update
+time is ahead of the clock until the next publication, as it waits for a stale
+one; a status updated before it started still fails. The format of status.json
+is unchanged.
+
+Evidence:
+
+- Source gate 214 (59 commands); packages built and verified for x86_64,
+  aarch64_cortex-a76 and aarch64_generic.
+- Tests: the start across no step, three years back and an hour ahead; a
+  running controller and a start-up wait publishing after a step back state
+  the start on the new clock; the readiness check waits for a status from
+  before a step (its start or only its update ahead, and after a step ahead)
+  and refuses one updated before it started. Each of six mutations fails at
+  least one test.
+- VM, before (daemon e7e1d87a), booting on a clock three years ahead that NTP
+  stepped back: the published start was 94,607,962 s after the process start,
+  LuCI computed a runtime of -94.6 million seconds, and the first reload with
+  a changed setting failed with "controller status clock is invalid" (2 of 2).
+  With the clock stepped an hour back and ahead while running, the published
+  start moved by the step (3,604 s and -7,201 s from the process start); the
+  reloads there still passed, as a reload with a change replaces the
+  controller.
+- VM, after (daemon d5aa0d0c): the same boot three times: the published start
+  within 0.6 to 1.6 s of the process start, LuCI's runtime 49 to 56 s, and the
+  first reload succeeded every time. Stepped an hour back and ahead: the start
+  kept its distance to the process start (10.63 to 10.71 s, 0.71 to 0.90 s),
+  and the reload and the restart after each step succeeded. The acceptance of
+  goals K to M repeated: start race 0 of 29 failed, start during an SQM
+  restart storm 0 of 5, reload during a hotplug restart 0 of 26, a reload that
+  failed after its publication recovered by each of the five ways, power loss
+  after a killed reload recovered at boot 4 of 4, ten reboots, ten with a
+  restart storm and two with the global lock held all running. Service checks
+  33 of 33; Speed Test completed in 25.2 s.
+- The file dated ahead was removed afterwards and no file in /etc is newer
+  than the clock. The hour-ahead step had left the configuration written during
+  it dated up to an hour ahead until the clock caught up; the test driver now
+  resets such files after its steps.
+
 ## Changes after RC27 r321/r129: the scheduler reads its policy only after a change (unreleased)
 
 From the audit of 2026-10-21 (second plan, goal U).
