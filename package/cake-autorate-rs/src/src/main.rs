@@ -12103,6 +12103,7 @@ impl PingerRuntime {
             .arg(interval_ms.to_string())
             .arg("--timeout")
             .arg(policy.pinger_timeout_ms().to_string())
+            .arg("--")
             .args(&active_reflectors)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -12316,7 +12317,10 @@ fn spawn_fping(
         cmd.arg("--icmp-timestamp");
     }
 
-    cmd.args(targets)
+    // Targets come after "--": a reflector list is external input, and
+    // nothing in it may ever be read as an fping option.
+    cmd.arg("--")
+        .args(targets)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -12350,6 +12354,7 @@ fn spawn_tsping(
         .arg(sleep_ms.to_string())
         .arg("--target-spacing")
         .arg(spacing_ms.to_string())
+        .arg("--")
         .args(targets)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -12395,7 +12400,8 @@ fn spawn_ping_child(
     cmd.args(bound_args);
     plan.append_ping_arguments(&mut cmd);
 
-    cmd.arg(target)
+    cmd.arg("--")
+        .arg(target)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -12425,6 +12431,7 @@ fn spawn_irtt(
             .arg(&interval)
             .arg("-d")
             .arg(&duration)
+            .arg("--")
             .arg(irtt_target_arg(target))
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -12743,7 +12750,20 @@ fn safe_extra_args(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Upper bound for a fetched reflector list. A list of a few thousand hosts
+/// is well under 100 KiB; anything larger is not a reflector list.
+const REFLECTORS_URL_MAX_BYTES: u64 = 1024 * 1024;
+
 fn fetch_url_text(url: &str) -> Result<String, String> {
+    // The URL is operator input that reaches a command line: only plain
+    // http(s) URLs, and always behind "--" so it can never become an option.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("reflectors_url must start with http:// or https://".to_string());
+    }
+    if url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return Err("reflectors_url contains whitespace or control characters".to_string());
+    }
+
     let commands: &[(&str, &[&str])] = &[
         ("curl", &["-fsSL", "--max-time", "20"]),
         ("uclient-fetch", &["-q", "-O", "-", "--timeout=20"]),
@@ -12753,16 +12773,52 @@ fn fetch_url_text(url: &str) -> Result<String, String> {
     let mut last_error = String::new();
     for (bin, args) in commands {
         let mut cmd = Command::new(bin);
-        cmd.args(*args).arg(url);
+        cmd.args(*args)
+            .arg("--")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
 
-        match cmd.output() {
-            Ok(output) if output.status.success() => {
-                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-            }
-            Ok(output) => {
-                last_error = format!("{bin} exited with {}", output.status);
-            }
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                last_error = format!("{bin}: {e}");
+                continue;
+            }
+        };
+
+        // Read at most the bound plus one byte: the extra byte tells an
+        // oversized response from one that fits exactly.
+        let mut body = Vec::new();
+        let read_result = match child.stdout.take() {
+            Some(stdout) => stdout
+                .take(REFLECTORS_URL_MAX_BYTES + 1)
+                .read_to_end(&mut body)
+                .map(|_| ()),
+            None => Err(io::Error::other("stdout not captured")),
+        };
+        let too_large = body.len() as u64 > REFLECTORS_URL_MAX_BYTES;
+        if too_large {
+            let _ = child.kill();
+        }
+        let status = child.wait();
+
+        if let Err(e) = read_result {
+            last_error = format!("{bin}: {e}");
+            continue;
+        }
+        if too_large {
+            return Err(format!(
+                "reflectors_url response exceeds {REFLECTORS_URL_MAX_BYTES} bytes"
+            ));
+        }
+        match status {
+            Ok(status) if status.success() => {
+                return Ok(String::from_utf8_lossy(&body).into_owned());
+            }
+            Ok(status) => last_error = format!("{bin} exited with {status}"),
             Err(e) => last_error = format!("{bin}: {e}"),
         }
     }
@@ -12796,7 +12852,7 @@ fn parse_reflector_candidates(data: &str, skip_lines: usize) -> Vec<String> {
 }
 
 fn is_valid_reflector_candidate(value: &str) -> bool {
-    if value.is_empty() || value.len() > 253 || value.contains("://") {
+    if value.is_empty() || value.len() > 253 || value.starts_with('-') || value.contains("://") {
         return false;
     }
 
@@ -12807,7 +12863,7 @@ fn is_valid_reflector_candidate(value: &str) -> bool {
 
 #[cfg(feature = "calibration")]
 fn is_valid_irtt_server_candidate(value: &str) -> bool {
-    if value.is_empty() || value.len() > 253 || value.contains("://") {
+    if value.is_empty() || value.len() > 253 || value.starts_with('-') || value.contains("://") {
         return false;
     }
 
@@ -15417,6 +15473,8 @@ fn load_controller_configuration(
 
 #[cfg(all(test, feature = "calibration"))]
 mod tests {
+    #[cfg(feature = "calibration")]
+    use super::is_valid_irtt_server_candidate;
     use super::routing::RouteIdentity;
     use super::{
         adaptive_capacity_status_json, attest_cake_direction, attest_download_redirect,
@@ -15457,6 +15515,7 @@ mod tests {
         CALIBRATIONCTL_SCHEDULER_STATUS_USAGE, CALIBRATION_CAPABILITIES_V3,
         STATUS_PUBLISH_INTERVAL, TERMINATE, TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
     };
+    use super::{fetch_url_text, is_valid_reflector_candidate};
     use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -15759,6 +15818,31 @@ mod tests {
             parse_reflector_candidates(data, 1),
             vec!["1.1.1.1", "9.9.9.9"]
         );
+    }
+
+    #[test]
+    fn reflector_candidates_never_look_like_options() {
+        // A fetched list must not be able to smuggle pinger options.
+        let data = "host\n-Ilo\n--period\n-b65500 1.0.0.1\n2606:4700::1111\n";
+        assert_eq!(
+            parse_reflector_candidates(data, 1),
+            vec!["1.0.0.1", "2606:4700::1111"]
+        );
+        assert!(!is_valid_reflector_candidate("-"));
+        assert!(!is_valid_reflector_candidate("-1.1.1.1"));
+        assert!(is_valid_reflector_candidate("example-host.net"));
+        #[cfg(feature = "calibration")]
+        {
+            assert!(!is_valid_irtt_server_candidate("-p2112"));
+            assert!(is_valid_irtt_server_candidate("[2606:4700::1111]:2112"));
+        }
+    }
+
+    #[test]
+    fn fetch_url_text_rejects_non_http_urls() {
+        assert!(fetch_url_text("ftp://example.net/list").is_err());
+        assert!(fetch_url_text("-K/etc/passwd").is_err());
+        assert!(fetch_url_text("http://example.net/list a").is_err());
     }
 
     #[test]
