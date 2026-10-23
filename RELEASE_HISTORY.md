@@ -1,20 +1,20 @@
 # Release history
 
 The current supported build is
-[`v1.0-rc27-r321-r129`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r321-r129).
-It contains daemon r321, Full LuCI r129, the manual-only Lite r321/r9 pair,
+[`v1.0-rc27-r322-r130`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r322-r130).
+It contains daemon r322, Full LuCI r130, the manual-only Lite r322/r10 pair,
 the `speedtest-go` 1.7.10-r6 backend for every ABI, the 12-ABI package matrix,
 checksums, and machine-readable release manifests.
 
-This release keeps the service running while the SQM scripts restart a queue
-under it: at boot, during Save & Apply, and after a Save & Apply that failed.
-It also adds MQTT over TLS, moves the time limits of Speed Test, Rating and
-Auto-Tune to the boot clock, makes automatic Rating work on dual-stack routers
-with refusals of test traffic counted by reason, and ships a `speedtest-go`
-backend with current TLS defaults.
+This release fixes what the code audit of 2026-10-21 found: a reload after a
+step of the wall clock, races between the service's process scans and
+exiting processes, Speed Test and Auto-Tune from the instance editor with the
+default probe routing, a scheduler that ran `uci` on every tick, and the
+options of scheduled calibration that LuCI never showed. It also updates the
+TLS libraries.
 
 The previous maintenance release
-[`v1.0-rc27-r320-r128`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r320-r128)
+[`v1.0-rc27-r321-r129`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r321-r129)
 is superseded. Its tag remains; install a complete matching set from one
 release and never mix revisions.
 
@@ -68,6 +68,47 @@ must not be read as current CLI, package, schema, or installation instructions.
 - Put all current installation, operation, dependency, and troubleshooting
   instructions in `README.md` and the feature guides without obsolete version
   branches.
+
+## RC27 r322/r130 release notes
+
+This release is **RC27 r322/r130**: daemon package r322 and Full LuCI package
+r130, with the parallel manual-only Lite pair r322/r10 and this project's
+`speedtest-go` 1.7.10-r6 backend (CLI only, unchanged) for every ABI.
+Upgrades keep all configured instances.
+
+Service and controllers:
+
+- After the wall clock steps (a router that booted with its clock ahead and
+  was corrected by NTP, or `date -s`), Save & Apply no longer fails with
+  "controller status clock is invalid": the controller states its start on
+  the current clock in every status, and the readiness check waits for a
+  status written before the step.
+- Stop, reload and the readiness check no longer fail when a process exits
+  while they scan for controllers. Locks are released explicitly; the
+  rollback of a reload preparation holds the SQM run lock as Stop does.
+- A refused readiness confirmation is logged with its reason.
+- With graph history enabled, the controller no longer runs `uci` every 30
+  seconds.
+
+Scheduled calibration and LuCI:
+
+- The calibration daemon reads the scheduler's settings through `uci` only
+  after one of their files changes; it used to start three `uci` processes on
+  every tick (about 11% of one core on a router with two instances).
+- LuCI shows the options of scheduled calibration (interval, quiet time,
+  window hours, budgets, Auto-Apply) when Runtime capacity learning is
+  "Bounded + scheduled active calibration".
+- Run speed test and Re-run Auto-Tune work with the default probe routing
+  'auto' and over an explicit policy route; Get rating says when it cannot
+  use an explicit route. A Get rating stopped by `quiet-window-timeout`
+  explains why.
+- Config-import candidates and the qdisc capability proof are dated on the
+  boot clock, so a step of the wall clock no longer refuses an import.
+
+Dependencies:
+
+- rustls 0.23.46, rustls-webpki 0.103.16 and webpki-roots 1.0.10, which
+  resolve the RustSec advisories of the earlier versions.
 
 ## RC27 r321/r129 release notes
 
