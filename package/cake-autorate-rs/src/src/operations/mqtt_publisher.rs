@@ -1782,7 +1782,10 @@ impl AsRawFd for MonotonicTimer {
 fn duration_timespec(value: Duration) -> libc::timespec {
     libc::timespec {
         tv_sec: value.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
-        tv_nsec: libc::c_long::from(value.subsec_nanos()),
+        // c_long is 32 bits on some targets: a fallible conversion there.
+        #[allow(clippy::unnecessary_fallible_conversions)]
+        tv_nsec: libc::c_long::try_from(value.subsec_nanos())
+            .expect("a normalized Duration nanosecond field fits in c_long"),
     }
 }
 
