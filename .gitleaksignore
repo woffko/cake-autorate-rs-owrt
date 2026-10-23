@@ -19,3 +19,6 @@ package/cake-autorate-rs/src/src/main.rs:generic-api-key:15633
 # The same two fixtures after the controller's start stamp moved them (r322).
 package/cake-autorate-rs/src/src/main.rs:generic-api-key:15557
 package/cake-autorate-rs/src/src/main.rs:generic-api-key:15669
+# The same two fixtures after the merged pinger argument checks moved them (r323).
+package/cake-autorate-rs/src/src/main.rs:generic-api-key:15616
+package/cake-autorate-rs/src/src/main.rs:generic-api-key:15728
