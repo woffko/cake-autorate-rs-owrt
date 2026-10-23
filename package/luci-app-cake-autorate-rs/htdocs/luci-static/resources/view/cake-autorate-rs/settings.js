@@ -7907,21 +7907,21 @@ function addQualityOptions(section) {
 	describe(o, 'autotune_calibration_strategy');
 
 	o = value(section, 'testing', 'scheduled_autotune_interval_hours', _('Retune interval'), 'and(uinteger,min(1),max(8760))', '24');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 	o = value(section, 'testing', 'scheduled_autotune_idle_window_s', _('Required quiet time'), 'and(uinteger,min(30),max(3600))', '60');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 	o = value(section, 'testing', 'scheduled_autotune_window_start_hour', _('Window starts'), 'and(uinteger,min(0),max(23))', '2');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 	o = value(section, 'testing', 'scheduled_autotune_window_end_hour', _('Window ends'), 'and(uinteger,min(0),max(23))', '5');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 	o = value(section, 'testing', 'scheduled_autotune_max_traffic_mb_day', _('Daily traffic budget'), 'and(uinteger,min(100),max(1048576))', '4096');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 	describe(o, 'scheduled_autotune_max_traffic_mb_day');
 	o = value(section, 'testing', 'scheduled_autotune_max_traffic_mb_month', _('Monthly traffic budget'), 'and(uinteger,min(100),max(1048576))', '16384');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 	describe(o, 'scheduled_autotune_max_traffic_mb_month');
 	o = flag(section, 'testing', 'scheduled_autotune_auto_apply', _('Apply validated proposal automatically'), '0');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 }
 
 function addSpeedtestOptions(section) {
