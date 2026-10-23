@@ -80,16 +80,25 @@ lets the backend choose the server, failed that way on dual-stack routers. With
 an IPv4 source both sockets now consider only the server's IPv4 addresses.
 Offline tests check the binding and that the dialers refuse an IPv6 target.
 
+Patch 150 (revision 7) bounds what a server can make the backend do. Redirects
+follow at most 10 hops, stay on http and https, never move from https to http,
+and go to a host other than the listed one only when it has a public address;
+the resolved upload endpoint is reported as `resolved_upload_url`. The TCP
+control connection reads lines through a 4 KiB buffer, with a deadline on every
+command. This patch has no offline tests of its own; the package builds and the
+Speed Test, Auto-Tune and Rating runs of the release acceptance check it.
+
 SDK integration must select this package instead of the stock feed package,
 inside a disposable SDK only. Preserve the package name and executable path.
 Verify the resulting speedtest-go APK version, binary hash and Full daemon
 dependency separately. Passing these offline tests does not establish physical
 throughput, server qualification or traffic-budget acceptance.
 
-The Full daemon package requires `speedtest-go >= 1.7.10-r6`; Lite does not
+The Full daemon package requires `speedtest-go >= 1.7.10-r7`; Lite does not
 depend on the calibration backend. An installed r1 must not satisfy a new Full
-installation, and neither may an r2 to r5 build, which has the legacy TLS
-defaults and is not a PIE. Supply the verified patched APK together with the Full package
+installation, neither may an r2 to r5 build, which has the legacy TLS defaults
+and is not a PIE, nor r6, which follows redirects and reads control lines
+without bounds. Supply the verified patched APK together with the Full package
 and test the package-manager transaction before installation. The version floor
 prevents the known r1 dependency from being silently reused; it is not a proof
 that an arbitrary third-party package carrying a newer version has this patch.

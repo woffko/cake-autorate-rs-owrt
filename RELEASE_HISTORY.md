@@ -1,20 +1,19 @@
 # Release history
 
 The current supported build is
-[`v1.0-rc27-r322-r130`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r322-r130).
-It contains daemon r322, Full LuCI r130, the manual-only Lite r322/r10 pair,
-the `speedtest-go` 1.7.10-r6 backend for every ABI, the 12-ABI package matrix,
+[`v1.0-rc27-r323-r131`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r323-r131).
+It contains daemon r323, Full LuCI r131, the manual-only Lite r323/r11 pair,
+the `speedtest-go` 1.7.10-r7 backend for every ABI, the 12-ABI package matrix,
 checksums, and machine-readable release manifests.
 
-This release fixes what the code audit of 2026-10-21 found: a reload after a
-step of the wall clock, races between the service's process scans and
-exiting processes, Speed Test and Auto-Tune from the instance editor with the
-default probe routing, a scheduler that ran `uci` on every tick, and the
-options of scheduled calibration that LuCI never showed. It also updates the
-TLS libraries.
+This release adds the fixes of a security audit of the router firmware to
+r322: reflector names that look like options never reach a pinger, the
+reflector list is fetched only over http(s) and within a size limit, and
+`speedtest-go` r7 bounds the redirects and control lines a server can send.
+The Full daemon requires that backend.
 
 The previous maintenance release
-[`v1.0-rc27-r321-r129`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r321-r129)
+[`v1.0-rc27-r322-r130`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r322-r130)
 is superseded. Its tag remains; install a complete matching set from one
 release and never mix revisions.
 
@@ -68,6 +67,24 @@ must not be read as current CLI, package, schema, or installation instructions.
 - Put all current installation, operation, dependency, and troubleshooting
   instructions in `README.md` and the feature guides without obsolete version
   branches.
+
+## RC27 r323/r131 release notes
+
+This release is **RC27 r323/r131**: daemon package r323 and Full LuCI package
+r131, with the parallel manual-only Lite pair r323/r11 and this project's
+`speedtest-go` 1.7.10-r7 backend (CLI only) for every ABI. It contains
+everything in r322/r130 and the fixes below. Upgrades keep all configured
+instances.
+
+- A reflector or irtt server name that starts with "-" is refused, and every
+  pinger (fping, tsping, ping, irtt) gets "--" before its targets, so a name
+  from the configuration or from `reflectors_url` can never become an option.
+- `reflectors_url` accepts only http and https and reads at most 1 MiB.
+- `speedtest-go` r7 follows at most 10 redirects, stays on http and https,
+  never moves from https to http, and goes to another host than the listed
+  one only when it has a public address; its control connection reads lines
+  of at most 4 KiB, with a deadline on every command. The Full daemon requires
+  r7.
 
 ## RC27 r322/r130 release notes
 

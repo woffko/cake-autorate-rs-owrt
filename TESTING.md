@@ -6,6 +6,37 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
+## Changes after RC27 r322/r130: pinger arguments and backend redirects (unreleased)
+
+From a security audit of the router firmware (branch `security/audit-2026-10`,
+merged for r323).
+
+**Pinger arguments (CA-CAKE-02).** A reflector or irtt server name from the
+configuration or from `reflectors_url` that started with "-" reached the
+pinger's command line, where it could act as an option. Such names are now
+refused, every pinger (fping, tsping, ping, irtt and the capture of the
+bootstrap owner) gets "--" before its targets, and the `reflectors_url` fetch
+accepts only http and https URLs, passes the URL after "--" and reads at most
+1 MiB.
+
+**speedtest-go 1.7.10-r7 (CA-CAKE-03, CA-CAKE-05).** Redirects follow at most
+10 hops, stay on http and https, never move from https to http, and go to a
+host other than the listed one only when it has a public address; the resolved
+upload endpoint is reported as `resolved_upload_url`. The TCP control
+connection reads lines through a 4 KiB buffer, with a deadline on every
+command. The Full daemon requires r7.
+
+Evidence:
+
+- Rust tests from the branch: candidates that look like options are refused
+  for reflectors and irtt servers, and the list fetch refuses URLs that are not
+  http(s) and arguments that look like options.
+- The branch's own build of these changes (daemon and r7 backend) runs in the
+  OpenWrt 25.12.6 firmware of the two x86_64 test routers since 2026-10-23.
+- The r7 patch has no offline tests of its own; the release acceptance of
+  r323/r131 builds it for all ABIs and runs Speed Test, Auto-Tune and Rating
+  with it.
+
 ## RC27 r322/r130 release acceptance
 
 This summary covers the RC27 r322/r130 release candidate (daemon r322, Full
