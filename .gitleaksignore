@@ -16,3 +16,6 @@ package/luci-app-cake-autorate-rs/tests/candidate.test.js:generic-api-key:82
 d15cdbe3c2b8bf8033ecf866ec519354c36aea7a:package/cake-autorate-rs/src/src/main.rs:generic-api-key:15545
 package/cake-autorate-rs/src/src/main.rs:generic-api-key:15521
 package/cake-autorate-rs/src/src/main.rs:generic-api-key:15633
+# The same two fixtures after the controller's start stamp moved them (r322).
+package/cake-autorate-rs/src/src/main.rs:generic-api-key:15557
+package/cake-autorate-rs/src/src/main.rs:generic-api-key:15669
