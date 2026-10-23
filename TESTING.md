@@ -6,7 +6,57 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
-## Changes after RC27 r322/r130: pinger arguments and backend redirects (unreleased)
+## RC27 r323/r131 release acceptance
+
+This summary covers the RC27 r323/r131 release candidate (daemon r323, Full
+LuCI r131, Lite r323/r11, speedtest-go 1.7.10-r7): r322/r130 with the fixes
+of the security audit of the router firmware. Those fixes and their evidence
+are in the section "Changes after RC27 r322/r130" below; everything else is in
+the r322/r130 acceptance and the sections before it.
+
+### Source gate
+
+Source gate 219 of 60 commands: Full (1,873) and Lite (432) Rust tests, the
+Full tests also with the default threads, formatting, clippy with
+undocumented `unsafe` blocks denied, LuCI JavaScript tests, TypeScript checks,
+a real-Chromium DOM text-safety test, shell tests, real-UCI tests and a hash
+of all sources before and after the run, which did not change. The package
+compatibility test requires `speedtest-go` 1.7.10-r7 and its patch 150.
+
+### Package matrix
+
+The Full and Lite daemon packages and both LuCI packages were built in the
+OpenWrt 25.12 SDK for all 12 ABIs and verified for payload, metadata,
+dependencies (the Full daemon on `speedtest-go>=1.7.10-r7`) and ELF
+interpreter/ABI, with integer overflow checks on in every daemon build; the
+LuCI payloads are identical across all SDKs. `speedtest-go` 1.7.10-r7 was
+built and verified for the same 12 ABIs: the r6 checks (TLS defaults, PIE
+where Go supports it) and the messages of the bounded redirects and control
+lines in every binary.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+The candidate's own packages (backend r7, daemon and Full LuCI) were installed
+over r322/r130 in one transaction; the configuration was unchanged.
+
+- Service checks: 33 of 33, before and after the tests below. Full → Lite →
+  Full replacement restored services, UCI, qdiscs and the apk world.
+- Five reboots, each with an SQM hotplug restart during the start: running.
+  Eleven reloads during a hotplug restart: 0 failed. A reload made to fail
+  after its publication was recovered by Save & Apply of the old setting, and
+  after a power cut at boot.
+- With nothing changing, the calibration daemon ran no `uci` in 130 s. Booted
+  on a clock three years ahead that NTP stepped back: the first reload
+  succeeded, the published start was 1.79 s after the kernel's process start,
+  and LuCI read a runtime of 31 s. LuCI showed the options of scheduled
+  calibration, and a change of Window ends with Save & Apply reached the
+  scheduler status.
+- With the r7 backend: Full Raw Auto-Tune reached Review in 642 s; Get rating
+  with an emulated dual-stack uplink completed (A+), and the three refusals of
+  test traffic, provoked on purpose, each ended with its own code; Speed Test
+  (capped, current topology) completed in 25.8 s.
+
+## Changes after RC27 r322/r130: pinger arguments and backend redirects (in r323/r131)
 
 From a security audit of the router firmware (branch `security/audit-2026-10`,
 merged for r323).
@@ -34,8 +84,8 @@ Evidence:
 - The branch's own build of these changes (daemon and r7 backend) runs in the
   OpenWrt 25.12.6 firmware of the two x86_64 test routers since 2026-10-23.
 - The r7 patch has no offline tests of its own; the release acceptance of
-  r323/r131 builds it for all ABIs and runs Speed Test, Auto-Tune and Rating
-  with it.
+  r323/r131 below builds it for all ABIs and runs Speed Test, Auto-Tune and
+  Rating with it.
 
 ## RC27 r322/r130 release acceptance
 
