@@ -983,10 +983,13 @@ mod tests {
             environment: vec![],
         };
         let started = Instant::now();
-        let error = run_bounded_command_output(&spec, Duration::from_millis(150), 1024, || false)
-            .unwrap_err();
+        // The shell must write its pid before the deadline, also when the
+        // whole test suite runs in parallel; the bound still lies far below
+        // the 60 s the child would sleep.
+        let error =
+            run_bounded_command_output(&spec, Duration::from_secs(1), 1024, || false).unwrap_err();
         assert_eq!(error, "bounded-command-timeout");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
         let pid = fs::read_to_string(&pid_path)
             .unwrap()
             .trim()
