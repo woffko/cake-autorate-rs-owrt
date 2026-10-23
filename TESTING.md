@@ -6,6 +6,38 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
+## Changes after RC27 r321/r129: the options of scheduled calibration in LuCI (unreleased)
+
+From the audit of 2026-10-21 (second plan, goal V).
+
+LuCI never showed the options of scheduled calibration (interval, quiet time,
+window hours, daily and monthly budgets, Auto-Apply). They depended on
+`runtime_learning_mode`, which is no field of the form, only a value the
+write handler of Runtime capacity learning stores, and LuCI takes a
+dependency's value from a field. Scheduled calibration could be turned on, but
+its schedule kept the defaults unless it was set with uci. The options now
+depend on Runtime capacity learning being "Bounded + scheduled active
+calibration", the choice that turns scheduled calibration on; what the form
+writes is unchanged.
+
+Evidence:
+
+- Source gate 215 (60 commands, with the new LuCI test); packages built and
+  verified for x86_64, aarch64_cortex-a76 and aarch64_generic.
+- The LuCI test runs the declarations of those options and of the capacity
+  policy against a recording stand-in and checks that every dependency key in
+  the form names a field it declares (`runtime_learning_mode` was the only one
+  that did not). It fails with the old dependency, with another policy, and
+  with any dependency on an undeclared field.
+- VM, before (the LuCI of gate 214): with scheduled active calibration chosen
+  in the Variable link profile, all seven options hidden.
+- VM, after (daemon 4b8c645d), in a real browser: the seven options shown on
+  Testing & Auto-Tune; Window ends changed from 7 to 8 with Save & Apply was
+  committed, and the scheduler status showed the new hour 1.31 s after the
+  click; with Validated ceiling only the options are hidden, and with the Best
+  overall profile the capacity choice and the options are hidden. Both
+  packages' configuration was put back by its bytes; service checks 33 of 33.
+
 ## Changes after RC27 r321/r129: reload after a wall clock step (unreleased)
 
 From the audit of 2026-10-21 (second plan, goal T).
@@ -118,7 +150,7 @@ Evidence:
   stay hidden even when that option is `periodic_active`. Scheduled
   calibration can be switched on in LuCI (Runtime capacity learning, with the
   Variable link profile), but its schedule keeps the defaults unless it is
-  set with uci.
+  set with uci. Fixed afterwards (goal V, above).
 
 ## Changes after RC27 r321/r129: probe routing in LuCI, frozen history budget, boot clock, cleanup (unreleased)
 
