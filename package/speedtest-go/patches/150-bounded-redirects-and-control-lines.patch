@@ -1,0 +1,173 @@
+Redirects are server-controlled input (CA-CAKE-03): follow at most 10, stay on
+http/https, never downgrade https to http, and off the listed host only to a
+public address. The upload endpoint reached after redirects is reported as
+"resolved_upload_url" so the caller can see where the transfer really went.
+
+The TCP control connection (CA-CAKE-05) reads lines through a 4 KiB buffer
+instead of growing without bound, and every command gets a deadline so a
+server that stops answering cannot hold the sampler forever.
+
+diff -ruN speedtest-go-1.7.10.orig/speedtest/request.go speedtest-go-1.7.10/speedtest/request.go
+--- speedtest-go-1.7.10.orig/speedtest/request.go	2026-10-22 20:36:56.644106779 +0300
++++ speedtest-go-1.7.10/speedtest/request.go	2026-10-22 20:40:36.488419058 +0300
+@@ -121,6 +121,7 @@
+ 	if final.String() != s.URL {
+ 		dbg.Printf("Upload endpoint redirected: %s -> %s\n", s.URL, final)
+ 		s.resolvedUploadURL = final.String()
++		s.ResolvedUploadURL = s.resolvedUploadURL
+ 	}
+ }
+ 
+diff -ruN speedtest-go-1.7.10.orig/speedtest/server.go speedtest-go-1.7.10/speedtest/server.go
+--- speedtest-go-1.7.10.orig/speedtest/server.go	2026-10-22 20:36:56.644292516 +0300
++++ speedtest-go-1.7.10/speedtest/server.go	2026-10-22 20:40:36.488177635 +0300
+@@ -55,9 +55,11 @@
+ 	PacketLoss   transport.PLoss `json:"packet_loss"`
+ 
+ 	Context *Speedtest `json:"-"`
+-	// Final upload endpoint after a body-less redirect probe. Unexported so
+-	// reported server identity (url/host) never changes.
++	// Final upload endpoint after a body-less redirect probe. Kept out of
++	// the identity fields (url/host) and reported separately so the caller
++	// can see where the upload really went.
+ 	resolvedUploadURL string
++	ResolvedUploadURL string `json:"resolved_upload_url,omitempty"`
+ }
+ 
+ type TestDuration struct {
+diff -ruN speedtest-go-1.7.10.orig/speedtest/speedtest.go speedtest-go-1.7.10/speedtest/speedtest.go
+--- speedtest-go-1.7.10.orig/speedtest/speedtest.go	2024-12-20 17:58:20.000000000 +0200
++++ speedtest-go-1.7.10/speedtest/speedtest.go	2026-10-22 20:42:22.582757659 +0300
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/http"
+@@ -165,6 +166,53 @@
+ 	}
+ 
+ 	s.doer.Transport = s
++	s.doer.CheckRedirect = checkRedirect
++}
++
++// A server may redirect the listed endpoint, typically to HTTPS, but a
++// redirect is server-controlled input: it must stay on a public address and
++// must not drop from HTTPS to HTTP.
++func checkRedirect(req *http.Request, via []*http.Request) error {
++	if len(via) >= 10 {
++		return errors.New("stopped after 10 redirects")
++	}
++	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
++		return fmt.Errorf("redirect to unsupported scheme %q", req.URL.Scheme)
++	}
++	if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme == "http" {
++		return errors.New("redirect downgrades https to http")
++	}
++	host := req.URL.Hostname()
++	if host == "" {
++		return errors.New("redirect without a host")
++	}
++	// The listed host was chosen by the operator or the server directory;
++	// staying on it (for example http -> https) needs no address check.
++	if len(via) > 0 && strings.EqualFold(host, via[0].URL.Hostname()) {
++		return nil
++	}
++	if ip := net.ParseIP(host); ip != nil {
++		if !isPublicIP(ip) {
++			return fmt.Errorf("redirect to non-public address %s", host)
++		}
++		return nil
++	}
++	addrs, err := net.DefaultResolver.LookupIPAddr(req.Context(), host)
++	if err != nil {
++		return err
++	}
++	for _, addr := range addrs {
++		if !isPublicIP(addr.IP) {
++			return fmt.Errorf("redirect to %s resolving to non-public address %s", host, addr.IP)
++		}
++	}
++	return nil
++}
++
++func isPublicIP(ip net.IP) bool {
++	return !(ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() ||
++		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
++		ip.IsInterfaceLocalMulticast() || ip.IsMulticast())
+ }
+ 
+ func (s *Speedtest) RoundTrip(req *http.Request) (*http.Response, error) {
+diff -ruN speedtest-go-1.7.10.orig/speedtest/transport/tcp.go speedtest-go-1.7.10/speedtest/transport/tcp.go
+--- speedtest-go-1.7.10.orig/speedtest/transport/tcp.go	2024-12-20 17:58:20.000000000 +0200
++++ speedtest-go-1.7.10/speedtest/transport/tcp.go	2026-10-22 20:40:36.487960646 +0300
+@@ -21,7 +21,17 @@
+ 	quitFormat = []byte{0x51, 0x55, 0x49, 0x54}
+ )
+ 
++const (
++	// A control line from the server is a few dozen bytes; anything longer
++	// is not this protocol. The reader buffer is the hard bound.
++	maxLineBytes = 4096
++	// Every command is a request/response pair; a server that accepted the
++	// connection but stops answering must not hold the sampler forever.
++	ioTimeout = 10 * time.Second
++)
++
+ var (
++	ErrLineTooLong                 = errors.New("server line exceeds the protocol bound")
+ 	ErrEchoData                    = errors.New("incorrect echo data")
+ 	ErrEmptyConn                   = errors.New("empty conn")
+ 	ErrUnsupported                 = errors.New("unsupported protocol") // Some servers have disabled ip:8080, we return this error.
+@@ -64,10 +74,18 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	client.reader = bufio.NewReader(client.conn)
++	client.reader = bufio.NewReaderSize(client.conn, maxLineBytes)
+ 	return nil
+ }
+ 
++func (client *Client) deadline() time.Time {
++	timeout := ioTimeout
++	if client.dialer != nil && client.dialer.Timeout > 0 && client.dialer.Timeout < timeout {
++		timeout = client.dialer.Timeout
++	}
++	return time.Now().Add(timeout)
++}
++
+ func (client *Client) Disconnect() (err error) {
+ 	_, _ = client.conn.Write(quitFormat)
+ 	client.conn = nil
+@@ -80,6 +98,9 @@
+ 	if client.conn == nil {
+ 		return ErrEmptyConn
+ 	}
++	if err = client.conn.SetWriteDeadline(client.deadline()); err != nil {
++		return err
++	}
+ 	_, err = fmt.Fprintf(client.conn, "%s\n", data)
+ 	return
+ }
+@@ -88,7 +109,18 @@
+ 	if client.conn == nil {
+ 		return nil, ErrEmptyConn
+ 	}
+-	return client.reader.ReadBytes('\n')
++	if err := client.conn.SetReadDeadline(client.deadline()); err != nil {
++		return nil, err
++	}
++	// ReadSlice fails with ErrBufferFull instead of growing without bound.
++	line, err := client.reader.ReadSlice('\n')
++	if errors.Is(err, bufio.ErrBufferFull) {
++		return nil, ErrLineTooLong
++	}
++	if err != nil {
++		return nil, err
++	}
++	return append([]byte(nil), line...), nil
+ }
+ 
+ func (client *Client) Version() string {
