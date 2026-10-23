@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=luci-app-cake-autorate-rs-lite
 PKG_VERSION:=1.0_rc27
-PKG_RELEASE:=9
+PKG_RELEASE:=10
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=Apache-2.0
@@ -21,7 +21,7 @@ define Package/luci-app-cake-autorate-rs-lite
   TITLE:=Minimal manual LuCI support for CAKE Autorate RS
   URL:=https://github.com/woffko/cake-autorate-rs-owrt
   DEPENDS:=+cake-autorate-rs-lite +luci-base +sqm-scripts
-  EXTRA_DEPENDS:=cake-autorate-rs-lite (>=1.0_rc27-r321)
+  EXTRA_DEPENDS:=cake-autorate-rs-lite (>=1.0_rc27-r322)
   PROVIDES:=luci-app-cake-autorate-rs luci-app-sqm
   PKGARCH:=all
 endef
