@@ -6,7 +6,63 @@ traffic; the measurements below describe one test setup and are not a
 universal benchmark. Older release evidence is kept in the
 [testing archive](TESTING_ARCHIVE.md).
 
-## Changes after RC27 r321/r129: the options of scheduled calibration in LuCI (unreleased)
+## RC27 r322/r130 release acceptance
+
+This summary covers the RC27 r322/r130 release candidate (daemon r322, Full
+LuCI r130, Lite r322/r10, speedtest-go 1.7.10-r6), built from the code audit
+of October 2026 and its follow-up. Each change since r321/r129 and its own
+evidence are in the sections "Changes after RC27 r321/r129" below.
+
+### Source gate
+
+Source gate 218 of 60 commands: Full (1,871) and Lite (432) Rust tests, the
+Full tests also with the default threads, formatting, clippy with
+undocumented `unsafe` blocks denied, LuCI JavaScript tests, TypeScript checks,
+a real-Chromium DOM text-safety test, shell tests, real-UCI tests and a hash
+of all sources before and after the run, which did not change. Gate 216 had
+failed on a test that gave a shell 150 ms to write its pid under the load of
+the parallel run and of another build on the host; the test allows 1 s now.
+
+### Package matrix
+
+The Full and Lite daemon packages and both LuCI packages were built in the
+OpenWrt 25.12 SDK for all 12 ABIs and verified for payload, metadata,
+dependencies and ELF interpreter/ABI, with integer overflow checks on in every
+daemon build; the LuCI payloads are identical across all SDKs. The first
+12-ABI build of this release stopped at arm_cortex-a7: one of the mechanical
+clippy rewrites of this cycle had turned a fallible `c_long` conversion into
+an infallible one, which holds only where `c_long` has 64 bits, and the
+builds of the cycle until then had covered 64-bit targets only. The
+conversion is fallible again, and 32-bit ARM and MIPS were built first before
+the full matrix. `speedtest-go` 1.7.10-r6 is unchanged: its 12 packages are
+the ones published with r321/r129.
+
+### VM acceptance (x86_64, OpenWrt 25.12)
+
+The candidate's own packages (daemon and Full LuCI) were installed over the
+previous build; the configuration was unchanged.
+
+- Service checks: 33 of 33, before and after the tests below. Full → Lite →
+  Full replacement restored services, UCI, qdiscs and the apk world.
+- Five reboots, each with an SQM hotplug restart during the start: running.
+  Eleven reloads during a hotplug restart: 0 failed. A reload made to fail
+  after its publication was recovered by Save & Apply of the old setting, and
+  after a power cut at boot.
+- With nothing changing, the calibration daemon ran no `uci` in 130 s. Booted
+  on a clock three years ahead that NTP stepped back: the first reload
+  succeeded, the published start was 0.84 s after the kernel's process start,
+  and LuCI read a runtime of 34 s. A package on the VM rewrote a file in /etc
+  during that boot with the future date; the test driver resets such files.
+  LuCI showed the options of scheduled calibration, and a change of Window
+  ends with Save & Apply reached the scheduler status.
+- Full Raw Auto-Tune reached Review in 696 s.
+- Get rating with an emulated dual-stack uplink completed (A+). The three
+  refusals of test traffic, provoked on purpose, each ended with its own code
+  (`speedtest-accounting-non-ipv4-traffic`, `-wrong-egress`,
+  `-flow-registration-failed`), and the VM was restored after each.
+- Speed Test (capped, current topology): completed in 23.8 s.
+
+## Changes after RC27 r321/r129: the options of scheduled calibration in LuCI (in r322/r130)
 
 From the audit of 2026-10-21 (second plan, goal V).
 
@@ -38,7 +94,7 @@ Evidence:
   overall profile the capacity choice and the options are hidden. Both
   packages' configuration was put back by its bytes; service checks 33 of 33.
 
-## Changes after RC27 r321/r129: reload after a wall clock step (unreleased)
+## Changes after RC27 r321/r129: reload after a wall clock step (in r322/r130)
 
 From the audit of 2026-10-21 (second plan, goal T).
 
@@ -95,7 +151,7 @@ Evidence:
   it dated up to an hour ahead until the clock caught up; the test driver now
   resets such files after its steps.
 
-## Changes after RC27 r321/r129: the scheduler reads its policy only after a change (unreleased)
+## Changes after RC27 r321/r129: the scheduler reads its policy only after a change (in r322/r130)
 
 From the audit of 2026-10-21 (second plan, goal U).
 
@@ -152,7 +208,7 @@ Evidence:
   Variable link profile), but its schedule keeps the defaults unless it is
   set with uci. Fixed afterwards (goal V, above).
 
-## Changes after RC27 r321/r129: probe routing in LuCI, frozen history budget, boot clock, cleanup (unreleased)
+## Changes after RC27 r321/r129: probe routing in LuCI, frozen history budget, boot clock, cleanup (in r322/r130)
 
 From the audit of 2026-10-21.
 
@@ -186,7 +242,8 @@ the Full build has no warnings, clippy `--all-targets` went from 285 to 231
 makes without a change in behaviour (needless borrows, redundant closures,
 collapsible conditions whose second part still runs only when the first
 holds, and the like) took it to 63; the rest needs a restructure (too many
-arguments, large enum variants, type complexity).
+arguments, large enum variants, type complexity). One of these rewrites did
+not build on 32-bit targets; see the RC27 r322/r130 release acceptance.
 
 **Not changed (owner decision, kept as is).** The daemon's UCI reads were to be isolated
 from changes staged with `uci set`. The proposed flags do not do that: the
@@ -239,7 +296,7 @@ Evidence:
   processes in 130 s on the VM, and about 8% of one core on the owner's
   router.
 
-## Changes after RC27 r321/r129: process scans, locks and parallel tests (unreleased)
+## Changes after RC27 r321/r129: process scans, locks and parallel tests (in r322/r130)
 
 The audit of 2026-10-21 found races between our scans and processes that exit,
 locks that outlive their owner for a moment, and a test suite that failed 44
@@ -304,7 +361,7 @@ Evidence:
   next reload completes it (3 of 3). The test VM also had future file times in
   /etc from an earlier clock test; they were reset.
 
-## Changes after RC27 r321/r129: TLS dependencies (unreleased)
+## Changes after RC27 r321/r129: TLS dependencies (in r322/r130)
 
 `cargo audit` reported advisories for rustls 0.23.45 (RUSTSEC-2026-0346 to
 -0349, among them a ServerHello that downgrades later connections to classical
@@ -334,7 +391,7 @@ unchanged.
   stayed trusted (56 samples, none failed); service checks 33 of 33; Speed
   Test completed in 25.9 s.
 
-## Changes after RC27 r321/r129: refused readiness confirmations are logged (unreleased)
+## Changes after RC27 r321/r129: refused readiness confirmations are logged (in r322/r130)
 
 After `procd` starts the controllers or the calibration coordinator, the init
 script asks the daemon to confirm that they are ready. The daemon names the
