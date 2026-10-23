@@ -11,13 +11,13 @@ const full = /define Package\/cake-autorate-rs\n([\s\S]*?)\nendef/.exec(native)[
 const lite = /define Package\/cake-autorate-rs-lite\n([\s\S]*?)\nendef/.exec(native)[1];
 const defaults = /define Package\/cake-autorate-rs\/Default\n([\s\S]*?)\nendef/.exec(native)[1];
 assert.match(full, /DEPENDS\+=.*\+speedtest-go(?:\s|$)/m);
-assert.match(full, /^\s+EXTRA_DEPENDS:=speedtest-go \(>=1\.7\.10-r6\)$/m,
-	'Full must reject the unbounded-request r1 backend and the backends with legacy TLS defaults');
+assert.match(full, /^\s+EXTRA_DEPENDS:=speedtest-go \(>=1\.7\.10-r7\)$/m,
+	'Full must reject the unbounded-request r1 backend, the backends with legacy TLS defaults and the ones with unbounded redirects and control lines');
 assert.doesNotMatch(lite + defaults, /speedtest-go/,
 	'Lite must not acquire the Full calibration backend dependency');
 const backend = fs.readFileSync(path.join(packages, 'speedtest-go/Makefile'), 'utf8');
 assert.match(backend, /^PKG_VERSION:=1\.7\.10$/m);
-assert.match(backend, /^PKG_RELEASE:=6$/m);
+assert.match(backend, /^PKG_RELEASE:=7$/m);
 assert.match(backend, /^PKG_ASLR_PIE_REGULAR:=1$/m, 'the backend must be a PIE where Go supports it');
 assert.match(backend, /^GO_PKG_BUILD_PKG:=\$\(GO_PKG\)$/m,
 	'the backend must ship only the speedtest-go CLI, not the upstream examples');
@@ -28,6 +28,7 @@ for (const setting of ['tls3des=0', 'tlsrsakex=0', 'tlssha1=0', 'tlsunsafeekm=0'
 	'x509negativeserial=0', 'tls10server=0'])
 	assert.ok(tls.includes('\n+//go:debug ' + setting + '\n'), 'the backend must set ' + setting);
 assert.ok(fs.existsSync(path.join(packages, 'speedtest-go/patches/100-bounded-request-failures.patch')));
+assert.ok(fs.existsSync(path.join(packages, 'speedtest-go/patches/150-bounded-redirects-and-control-lines.patch')));
 const loss = fs.readFileSync(path.join(packages, 'speedtest-go/patches/140-loss-analyzer-source.patch'), 'utf8');
 assert.match(loss, /^\+\ttcpSource, udpSource := lossSourceAddrs\(options.SourceInterface\)$/m,
 	'patch 140 must derive the loss analyzer binding from --source');

@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=1.0_rc27
-PKG_RELEASE:=322
+PKG_RELEASE:=323
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later
@@ -45,7 +45,7 @@ $(call Package/cake-autorate-rs/Default)
   DEPENDS+=+nftables-json +speedtest-go
   # Reject the stock r1 backend whose failed requests can retry without bound,
   # and every backend before r6, which runs with the TLS defaults of Go 1.19.
-  EXTRA_DEPENDS:=speedtest-go (>=1.7.10-r6)
+  EXTRA_DEPENDS:=speedtest-go (>=1.7.10-r7)
 endef
 
 define Package/cake-autorate-rs-lite
