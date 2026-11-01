@@ -3689,13 +3689,27 @@ fn speedtest_server_endpoint(
     {
         return Err("speedtest-server-identity-mismatch".into());
     }
-    match server.get("url") {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(value) => super::server_qualification::endpoint_identity(
-            value.as_str().ok_or("speedtest-server-endpoint-invalid")?,
-        )
-        .map(Some),
+    let url = match server.get("url") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(value) => value.as_str().ok_or("speedtest-server-endpoint-invalid")?,
+    };
+    let identity = super::server_qualification::endpoint_identity(url)?;
+    // speedtest-go reports where the upload really went after redirects
+    // (patch 150, "resolved_upload_url"). The attested identity is the
+    // directory entry, so a redirect that leaves its origin is an endpoint
+    // change even though "url" itself did not move.
+    if let Some(value) = server.get("resolved_upload_url") {
+        if !value.is_null() {
+            let resolved = value.as_str().ok_or("speedtest-server-endpoint-invalid")?;
+            if !resolved.is_empty()
+                && super::server_qualification::endpoint_origin(resolved)?
+                    != super::server_qualification::endpoint_origin(url)?
+            {
+                return Err("speedtest-server-endpoint-changed".into());
+            }
+        }
     }
+    Ok(Some(identity))
 }
 
 fn attest_selected_endpoint(expected: &str, actual: Option<&str>) -> Result<(), String> {
@@ -5977,6 +5991,43 @@ mod tests {
             "speedtest-server-endpoint-changed"
         );
         assert!(attest_selected_endpoint("one.example", None).is_err());
+    }
+
+    #[test]
+    fn t1_resolved_upload_url_must_keep_the_origin_of_the_directory_entry() {
+        let entry = |resolved: &str| {
+            format!(
+                "{{\"servers\":[{{\"id\":\"11\",\"sponsor\":\"Provider\",\"url\":\"https://server.example:8080/upload.php\",\"resolved_upload_url\":{resolved}}}]}}"
+            )
+        };
+        // Same origin, another path: the server the directory named.
+        assert!(speedtest_server_endpoint(
+            &entry("\"https://server.example:8080/upload.php/\""),
+            Some(11),
+            "Provider"
+        )
+        .unwrap()
+        .is_some());
+        // Absent or empty: no redirect happened.
+        assert!(speedtest_server_endpoint(&entry("\"\""), Some(11), "Provider").is_ok());
+        assert!(speedtest_server_endpoint(&entry("null"), Some(11), "Provider").is_ok());
+        // Another host, another port or a scheme change is a different endpoint.
+        for other in [
+            "\"https://other.example:8080/upload.php\"",
+            "\"https://server.example:8081/upload.php\"",
+            "\"http://server.example:8080/upload.php\"",
+        ] {
+            assert_eq!(
+                speedtest_server_endpoint(&entry(other), Some(11), "Provider").unwrap_err(),
+                "speedtest-server-endpoint-changed"
+            );
+        }
+        // A malformed resolved URL is reported without echoing it.
+        let error =
+            speedtest_server_endpoint(&entry("\"http://user:pw@x/\""), Some(11), "Provider")
+                .unwrap_err();
+        assert_eq!(error, "speedtest-server-endpoint-invalid");
+        assert!(speedtest_server_endpoint(&entry("7"), Some(11), "Provider").is_err());
     }
 
     #[test]
