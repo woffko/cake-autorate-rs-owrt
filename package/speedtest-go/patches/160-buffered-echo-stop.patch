@@ -1,0 +1,21 @@
+From: OpenWrt cake-autorate build <local>
+Subject: [PATCH] speedtest-go: never block in AccompanyEcho.Stop
+
+Stop() sends on an unbuffered channel. When the echo goroutine has
+already returned (no connection, early error) nobody receives and Stop()
+blocks for the rest of the process lifetime; cake-autorate-rs then has
+to kill the backend on its timeout. A buffer of one lets Stop() return
+whether or not the goroutine is still there; the goroutine still sees the
+value when it is.
+
+--- a/speedtest.go
++++ b/speedtest.go
+@@ -258,7 +258,7 @@
+ 	return &AccompanyEcho{
+ 		server:   server,
+ 		interval: interval,
+-		stopEcho: make(chan bool),
++		stopEcho: make(chan bool, 1),
+ 	}
+ }
+ 
