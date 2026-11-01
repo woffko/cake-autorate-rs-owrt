@@ -5219,6 +5219,7 @@ fn run_transport_probe(
             .arg(&route_spec.expected_device)
             .arg("-o")
             .arg("/dev/null")
+            .arg("--")
             .arg(endpoint);
         match curl.stdout(Stdio::null()).stderr(Stdio::null()).status() {
             Ok(status) if status.success() => return Ok(()),
@@ -5238,6 +5239,7 @@ fn run_transport_probe(
         .arg(timeout_s.to_string())
         .arg("-O")
         .arg("/dev/null")
+        .arg("--")
         .arg(endpoint)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -12500,7 +12502,7 @@ fn parse_sample_line(
     ping_reflector: &str,
     observed_epoch_secs: f64,
 ) -> Option<Sample> {
-    match cfg.pinger_method.as_str() {
+    let sample = match cfg.pinger_method.as_str() {
         "ping" => parse_ping_line(line, ping_reflector, observed_epoch_secs),
         #[cfg(feature = "calibration")]
         "irtt" => {
@@ -12511,7 +12513,22 @@ fn parse_sample_line(
         "fping-ts" => parse_fping_ts_line(line),
         "tsping" => parse_tsping_line(line),
         _ => parse_fping_line(line),
-    }
+    }?;
+    // Every pinger output is parsed with the same gate: a NaN, infinite or
+    // negative value must not leave the stall state or feed reflector
+    // health before the controller rejects it.
+    sample_values_are_usable(&sample).then_some(sample)
+}
+
+fn sample_values_are_usable(sample: &Sample) -> bool {
+    [
+        sample.timestamp,
+        sample.rtt_ms,
+        sample.dl_owd_us,
+        sample.ul_owd_us,
+    ]
+    .iter()
+    .all(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn pinger_line_is_timeout(method: &str, line: &str) -> bool {
@@ -15515,7 +15532,7 @@ mod tests {
         CALIBRATIONCTL_SCHEDULER_STATUS_USAGE, CALIBRATION_CAPABILITIES_V3,
         STATUS_PUBLISH_INTERVAL, TERMINATE, TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
     };
-    use super::{fetch_url_text, is_valid_reflector_candidate};
+    use super::{fetch_url_text, is_valid_reflector_candidate, sample_values_are_usable};
     use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -15879,6 +15896,44 @@ mod tests {
         assert!(pinger_line_is_timeout("fping", line));
         assert!(pinger_line_is_timeout("fping-ts", line));
         assert!(!pinger_line_is_timeout("tsping", line));
+    }
+
+    #[test]
+    fn rejects_non_finite_or_negative_sample_values() {
+        let good = || {
+            parse_fping_line(
+                "[1783743970.24147] 1.1.1.1 : [0], 64 bytes, 3.80 ms (3.80 avg, 0% loss)",
+            )
+            .expect("expected fping sample")
+        };
+        assert!(sample_values_are_usable(&good()));
+        assert!(!sample_values_are_usable(&Sample {
+            timestamp: f64::NAN,
+            ..good()
+        }));
+        assert!(!sample_values_are_usable(&Sample {
+            rtt_ms: f64::INFINITY,
+            ..good()
+        }));
+        assert!(!sample_values_are_usable(&Sample {
+            dl_owd_us: -1.0,
+            ..good()
+        }));
+        assert!(!sample_values_are_usable(&Sample {
+            ul_owd_us: f64::NEG_INFINITY,
+            ..good()
+        }));
+        for value in ["NaN", "inf", "-inf", "-3.80"] {
+            let line = format!(
+                "[1783743970.24147] 1.1.1.1 : [0], 64 bytes, {value} ms (3.80 avg, 0% loss)"
+            );
+            if let Some(sample) = parse_fping_line(&line) {
+                assert!(
+                    !sample_values_are_usable(&sample),
+                    "{value} must not pass the gate"
+                );
+            }
+        }
     }
 
     #[test]
