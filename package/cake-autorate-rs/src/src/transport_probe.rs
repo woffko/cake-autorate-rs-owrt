@@ -1238,6 +1238,7 @@ fn probe_legacy_http(
         .arg(timeout.as_secs().max(1).to_string())
         .arg("-O")
         .arg("/dev/null")
+        .arg("--")
         .arg(endpoint)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
