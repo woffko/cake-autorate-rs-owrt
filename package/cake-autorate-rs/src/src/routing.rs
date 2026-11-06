@@ -1004,6 +1004,7 @@ fn external_ip_command(
         .arg(timeout_s.clamp(1, 30).to_string())
         .arg("-O")
         .arg("-")
+        .arg("--")
         .arg(endpoint);
     Ok(crate::operations::process::SpawnSpec {
         program: if command.get_program() == "mwan3" {
@@ -2704,7 +2705,7 @@ mwan3.default_rule_v4.use_policy='wan_then_wan2'\n";
             } else {
                 assert_eq!(command.program.to_str(), Some("/bin/uclient-fetch"));
             }
-            expected.extend(["-q", "-4", "-T", "5", "-O", "-", endpoint]);
+            expected.extend(["-q", "-4", "-T", "5", "-O", "-", "--", endpoint]);
             assert_eq!(
                 command.arguments,
                 expected

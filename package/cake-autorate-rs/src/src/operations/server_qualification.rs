@@ -90,7 +90,16 @@ pub(crate) fn endpoint_host(url: &str) -> Result<String, &'static str> {
     Ok(host)
 }
 
-pub(crate) fn endpoint_identity(url: &str) -> Result<(String, String), String> {
+/// Scheme, host and port of an endpoint URL in canonical form, with the
+/// default port filled in. Two URLs with the same origin may still differ
+/// in their path; a redirect that keeps the origin stays with the server
+/// the directory named, a redirect to another origin does not.
+pub(crate) fn endpoint_origin(url: &str) -> Result<String, String> {
+    let (scheme, host, port, _) = endpoint_parts(url)?;
+    Ok(format!("{scheme}://{host}:{port}"))
+}
+
+fn endpoint_parts(url: &str) -> Result<(String, String, u16, String), String> {
     let host = endpoint_host(url)?;
     let (scheme, rest) = url
         .split_once("://")
@@ -106,7 +115,12 @@ pub(crate) fn endpoint_identity(url: &str) -> Result<(String, String), String> {
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
     let path_query = rest[end..].split('#').next().unwrap_or_default();
     let slash = if path_query.starts_with('/') { "" } else { "/" };
-    let canonical = format!("{scheme}://{host}:{port}{slash}{path_query}");
+    Ok((scheme, host, port, format!("{slash}{path_query}")))
+}
+
+pub(crate) fn endpoint_identity(url: &str) -> Result<(String, String), String> {
+    let (scheme, host, port, path_query) = endpoint_parts(url)?;
+    let canonical = format!("{scheme}://{host}:{port}{path_query}");
     let digest = format!("{:x}", Sha256::digest(canonical.as_bytes()));
     Ok((host, digest))
 }
